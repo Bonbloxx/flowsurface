@@ -584,11 +584,17 @@ async fn fetch_intraday_trades(
     Ok(trades)
 }
 
+/// Hard cap per archive read. A single BTCUSDT futures day can be millions of
+/// rows — materializing the whole day OOMs the process with no panic log.
+const MAX_ARCHIVE_TRADES_PER_FETCH: usize = 50_000;
+
 async fn get_hist_trades_with_client(
     client: &reqwest::Client,
     ticker_info: TickerInfo,
     date: chrono::NaiveDate,
     base_path: PathBuf,
+    from_time: UnixMs,
+    limit: usize,
 ) -> Result<Vec<Trade>, AdapterError> {
     let ticker = ticker_info.ticker;
     let (symbol, market_type) = ticker.to_full_symbol_and_type();
@@ -612,6 +618,25 @@ async fn get_hist_trades_with_client(
 
     let zip_path = format!("{market_subpath}/{zip_file_name}");
     let base_zip_path = base_path.join(&zip_file_name);
+    // Negative cache: Binance often lags 1 day publishing daily zips. Without
+    // this marker, paging re-requests the same 404 on every REST page and can
+    // hang/crash the app in a download storm.
+    let missing_marker_path = base_path.join(format!("{zip_file_name}.missing"));
+
+    if missing_marker_path.exists() {
+        // Re-check periodically — Binance often publishes yesterday's zip later.
+        let marker_is_fresh = std::fs::metadata(&missing_marker_path)
+            .ok()
+            .and_then(|meta| meta.modified().ok())
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age < std::time::Duration::from_secs(12 * 60 * 60));
+        if marker_is_fresh {
+            return Err(AdapterError::InvalidRequest(format!(
+                "Archive previously unavailable (404): {zip_path}"
+            )));
+        }
+        let _ = std::fs::remove_file(&missing_marker_path);
+    }
 
     if std::fs::metadata(&base_zip_path).is_ok() {
         log::info!("Using cached {}", zip_path);
@@ -621,6 +646,17 @@ async fn get_hist_trades_with_client(
         log::info!("Downloading from {}", url);
 
         let resp = client.get(&url).send().await.map_err(AdapterError::from)?;
+
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            // Remember the miss for this session's data dir so paging does not
+            // hammer data.binance.vision for the same missing day.
+            if let Err(e) = std::fs::write(&missing_marker_path, b"") {
+                log::warn!("Failed to write missing-archive marker {missing_marker_path:?}: {e}");
+            }
+            return Err(AdapterError::InvalidRequest(format!(
+                "Archive not found (404): {url}"
+            )));
+        }
 
         if !resp.status().is_success() {
             return Err(AdapterError::InvalidRequest(format!(
@@ -635,6 +671,8 @@ async fn get_hist_trades_with_client(
         std::fs::write(&base_zip_path, &body).map_err(|e| {
             AdapterError::ParseError(format!("Failed to write zip file: {e}, {base_zip_path:?}"))
         })?;
+        // Successful download supersedes any stale miss marker.
+        let _ = std::fs::remove_file(&missing_marker_path);
     }
 
     let file = std::fs::File::open(&base_zip_path)
@@ -649,8 +687,16 @@ async fn get_hist_trades_with_client(
         raw_qty_unit_from_market_type(market_type),
     );
 
-    let mut trades = Vec::new();
+    // Stream the CSV and keep only a bounded page starting at `from_time`.
+    // Never materialize a full BTCUSDT day in memory.
+    let mut trades = Vec::with_capacity(limit.min(MAX_ARCHIVE_TRADES_PER_FETCH));
+    let from_ms = from_time.as_u64();
+
     for i in 0..archive.len() {
+        if trades.len() >= limit {
+            break;
+        }
+
         let csv_file = archive
             .by_index(i)
             .map_err(|e| AdapterError::ParseError(format!("Failed to read csv: {e}")))?;
@@ -659,23 +705,41 @@ async fn get_hist_trades_with_client(
             .has_headers(false)
             .from_reader(BufReader::new(csv_file));
 
-        trades.extend(csv_reader.records().filter_map(|record| {
-            record.ok().and_then(|record| {
-                let time = record[5].parse::<u64>().ok()?;
-                let is_sell = record[6].parse::<bool>().ok()?;
-                let price_f64 = record[1].parse::<f64>().ok()?;
+        for record in csv_reader.records() {
+            let Ok(record) = record else {
+                continue;
+            };
+            let Ok(time) = record[5].parse::<u64>() else {
+                continue;
+            };
+            if time < from_ms {
+                continue;
+            }
 
-                let price = Price::from_f64(price_f64).round_to_min_tick(ticker_info.min_ticksize);
-                let qty = qty_norm.normalize_qty(record[2].parse::<f64>().ok()?, price_f64);
+            let Ok(is_sell) = record[6].parse::<bool>() else {
+                continue;
+            };
+            let Ok(price_f64) = record[1].parse::<f64>() else {
+                continue;
+            };
+            let Ok(qty_f64) = record[2].parse::<f64>() else {
+                continue;
+            };
 
-                Some(Trade {
-                    time: time.into(),
-                    is_sell,
-                    price,
-                    qty,
-                })
-            })
-        }));
+            let price = Price::from_f64(price_f64).round_to_min_tick(ticker_info.min_ticksize);
+            let qty = qty_norm.normalize_qty(qty_f64, price_f64);
+
+            trades.push(Trade {
+                time: time.into(),
+                is_sell,
+                price,
+                qty,
+            });
+
+            if trades.len() >= limit {
+                break;
+            }
+        }
     }
 
     Ok(trades)
@@ -693,8 +757,8 @@ pub(super) async fn fetch_trades(
         ));
     };
 
-    let today_midnight = chrono::Utc::now()
-        .date_naive()
+    let today_date = chrono::Utc::now().date_naive();
+    let today_midnight = today_date
         .and_hms_opt(0, 0, 0)
         .ok_or_else(|| {
             AdapterError::ParseError("Failed to construct UTC midnight timestamp".to_string())
@@ -708,33 +772,53 @@ pub(super) async fn fetch_trades(
         return fetch_intraday_trades(hub, ticker_info, from_time).await;
     }
 
-    let from_date = chrono::DateTime::from_timestamp_millis(from_time_ms)
+    let mut cursor_time = from_time;
+    let mut cursor_date = chrono::DateTime::from_timestamp_millis(from_time_ms)
         .ok_or_else(|| AdapterError::ParseError("Invalid timestamp".into()))?
         .date_naive();
 
     let client = hub.client().clone();
 
-    match get_hist_trades_with_client(&client, ticker_info, from_date, data_path).await {
-        Ok(mut trades) => {
-            if let Some(latest_trade) = trades.last().copied() {
-                match fetch_intraday_trades(hub, ticker_info, latest_trade.time).await {
-                    Ok(intraday_trades) => {
-                        trades.extend(intraday_trades);
-                    }
-                    Err(e) => {
-                        log::error!("Failed to fetch intraday trades: {}", e);
-                    }
-                }
+    // Walk completed UTC days until we produce a non-empty page or reach today.
+    // Each page is capped so BTCUSDT archives cannot OOM the process.
+    //
+    // Missing archives (Binance often lags ~1 day) are skipped — we do NOT try
+    // to REST-page an entire missing day. Today is filled via REST after the
+    // archive walk.
+    while cursor_date < today_date {
+        match get_hist_trades_with_client(
+            &client,
+            ticker_info,
+            cursor_date,
+            data_path.clone(),
+            cursor_time,
+            MAX_ARCHIVE_TRADES_PER_FETCH,
+        )
+        .await
+        {
+            Ok(batch) if !batch.is_empty() => {
+                return Ok(batch);
             }
+            Ok(_) => {
+                // Archive day fully behind the cursor — advance to next midnight.
+            }
+            Err(e) => {
+                log::warn!(
+                    "Historical trades unavailable for {cursor_date}: {e}; skipping day"
+                );
+            }
+        }
 
-            Ok(trades)
-        }
-        Err(e) => {
-            log::warn!(
-                "Historical trades fetch failed: {}, falling back to intraday fetch",
-                e
-            );
-            fetch_intraday_trades(hub, ticker_info, from_time).await
-        }
+        cursor_date = cursor_date
+            .checked_add_signed(chrono::Duration::days(1))
+            .ok_or_else(|| AdapterError::ParseError("Date overflow while paging trades".into()))?;
+        let next_midnight_ms = cursor_date
+            .and_hms_opt(0, 0, 0)
+            .ok_or_else(|| AdapterError::ParseError("Failed to construct day boundary".into()))?
+            .and_utc()
+            .timestamp_millis();
+        cursor_time = UnixMs::new(u64::try_from(next_midnight_ms).unwrap_or(u64::MAX));
     }
+
+    fetch_intraday_trades(hub, ticker_info, cursor_time).await
 }

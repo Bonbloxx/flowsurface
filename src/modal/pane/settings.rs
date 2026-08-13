@@ -636,6 +636,271 @@ pub fn kline_cfg_view<'a>(
                 ; spacing = 12, align_x = Alignment::Start
             ]
         }
+        KlineChartKind::Renko { config } => {
+            let brick_size = pick_list(
+                data::chart::kline::RenkoConfig::BRICK_SIZE_PRESETS,
+                Some(config.brick_size),
+                move |brick_size| {
+                    Message::PaneEvent(
+                        pane,
+                        Event::RenkoConfigChanged(data::chart::kline::RenkoConfig {
+                            brick_size,
+                            ..*config
+                        }),
+                    )
+                },
+            );
+
+            let reversal = pick_list([1_u8, 2, 3, 4, 5], Some(config.reversal), move |reversal| {
+                Message::PaneEvent(
+                    pane,
+                    Event::RenkoConfigChanged(data::chart::kline::RenkoConfig {
+                        reversal,
+                        ..*config
+                    }),
+                )
+            });
+
+            let normalization = pick_list(
+                data::chart::kline::RenkoConfig::NORMALIZATION_PRESETS_MS,
+                Some(config.normalization_ms),
+                move |normalization_ms| {
+                    Message::PaneEvent(
+                        pane,
+                        Event::RenkoConfigChanged(data::chart::kline::RenkoConfig {
+                            normalization_ms,
+                            ..*config
+                        }),
+                    )
+                },
+            );
+
+            let wicks = tooltip(
+                checkbox(cfg.show_renko_wicks)
+                    .label("Show traded high/low wicks")
+                    .on_toggle(move |value| {
+                        Message::VisualConfigChanged(
+                            pane,
+                            VisualConfig::Kline(data::chart::kline::Config {
+                                show_renko_wicks: value,
+                                ..cfg
+                            }),
+                            false,
+                        )
+                    }),
+                Some("Show price excursions beyond each fixed Renko body"),
+                TooltipPosition::Top,
+            );
+
+            split_column![
+                display_readout_section,
+                column![
+                    text("Renko construction").size(crate::style::text_size::SECTION),
+                    text("Built directly from executed trades; time does not close a brick."),
+                    row![text("Brick size (ticks)"), space::horizontal(), brick_size]
+                        .align_y(Alignment::Center),
+                    row![text("Reversal boxes"), space::horizontal(), reversal]
+                        .align_y(Alignment::Center),
+                    row![text("Minimum lifetime (ms)"), space::horizontal(), normalization]
+                        .align_y(Alignment::Center),
+                    wicks,
+                ]
+                .spacing(8),
+                row![
+                    space::horizontal(),
+                    sync_all_button(pane, VisualConfig::Kline(cfg))
+                ],
+                ; spacing = 12, align_x = Alignment::Start
+            ]
+        }
+        KlineChartKind::Tpo { config } => {
+            use data::chart::tpo::{BlockSize, DisplayStyle, ProfilePeriod, SessionStart};
+
+            let profile_period = pick_list(
+                ProfilePeriod::ALL,
+                Some(config.profile_period),
+                move |profile_period| {
+                    Message::PaneEvent(
+                        pane,
+                        Event::TpoConfigChanged(data::chart::tpo::Config {
+                            profile_period,
+                            ..*config
+                        }),
+                    )
+                },
+            );
+            let block_size =
+                pick_list(BlockSize::ALL, Some(config.block_size), move |block_size| {
+                    Message::PaneEvent(
+                        pane,
+                        Event::TpoConfigChanged(data::chart::tpo::Config {
+                            block_size,
+                            ..*config
+                        }),
+                    )
+                });
+            let row_size = pick_list(
+                data::chart::tpo::Config::TICKS_PER_ROW_PRESETS,
+                Some(config.ticks_per_row),
+                move |ticks_per_row| {
+                    Message::PaneEvent(
+                        pane,
+                        Event::TpoConfigChanged(data::chart::tpo::Config {
+                            ticks_per_row,
+                            ..*config
+                        }),
+                    )
+                },
+            );
+            let session_start = pick_list(
+                SessionStart::half_hour_presets(),
+                Some(SessionStart(config.session_start_minutes_utc)),
+                move |SessionStart(session_start_minutes_utc)| {
+                    Message::PaneEvent(
+                        pane,
+                        Event::TpoConfigChanged(data::chart::tpo::Config {
+                            session_start_minutes_utc,
+                            ..*config
+                        }),
+                    )
+                },
+            );
+            let value_area = pick_list(
+                data::chart::tpo::Config::VALUE_AREA_PRESETS,
+                Some(config.value_area_percent),
+                move |value_area_percent| {
+                    Message::PaneEvent(
+                        pane,
+                        Event::TpoConfigChanged(data::chart::tpo::Config {
+                            value_area_percent,
+                            ..*config
+                        }),
+                    )
+                },
+            );
+            let initial_balance = pick_list(
+                data::chart::tpo::Config::INITIAL_BALANCE_PRESETS,
+                Some(config.initial_balance_blocks),
+                move |initial_balance_blocks| {
+                    Message::PaneEvent(
+                        pane,
+                        Event::TpoConfigChanged(data::chart::tpo::Config {
+                            initial_balance_blocks,
+                            ..*config
+                        }),
+                    )
+                },
+            );
+            let history = pick_list(
+                data::chart::tpo::Config::HISTORY_PROFILE_PRESETS,
+                Some(config.profiles_to_load),
+                move |profiles_to_load| {
+                    Message::PaneEvent(
+                        pane,
+                        Event::TpoConfigChanged(data::chart::tpo::Config {
+                            profiles_to_load,
+                            ..*config
+                        }),
+                    )
+                },
+            );
+            let display = pick_list(
+                DisplayStyle::ALL,
+                Some(config.display_style),
+                move |display_style| {
+                    Message::PaneEvent(
+                        pane,
+                        Event::TpoConfigChanged(data::chart::tpo::Config {
+                            display_style,
+                            ..*config
+                        }),
+                    )
+                },
+            );
+
+            let poc = checkbox(config.show_poc)
+                .label("Point of control (POC)")
+                .on_toggle(move |show_poc| {
+                    Message::PaneEvent(
+                        pane,
+                        Event::TpoConfigChanged(data::chart::tpo::Config {
+                            show_poc,
+                            ..*config
+                        }),
+                    )
+                });
+            let value_area_toggle = checkbox(config.show_value_area)
+                .label("Value area high / low")
+                .on_toggle(move |show_value_area| {
+                    Message::PaneEvent(
+                        pane,
+                        Event::TpoConfigChanged(data::chart::tpo::Config {
+                            show_value_area,
+                            ..*config
+                        }),
+                    )
+                });
+            let initial_balance_toggle = checkbox(config.show_initial_balance)
+                .label("Initial balance range")
+                .on_toggle(move |show_initial_balance| {
+                    Message::PaneEvent(
+                        pane,
+                        Event::TpoConfigChanged(data::chart::tpo::Config {
+                            show_initial_balance,
+                            ..*config
+                        }),
+                    )
+                });
+            let singles = checkbox(config.show_single_prints)
+                .label("Highlight single-print excess")
+                .on_toggle(move |show_single_prints| {
+                    Message::PaneEvent(
+                        pane,
+                        Event::TpoConfigChanged(data::chart::tpo::Config {
+                            show_single_prints,
+                            ..*config
+                        }),
+                    )
+                });
+
+            split_column![
+                display_readout_section,
+                column![
+                    text("TPO construction").size(crate::style::text_size::SECTION),
+                    text("Letters mark each bracket high–low from time bars (Sierra/Quantower style)."),
+                    row![text("Profile period"), space::horizontal(), profile_period]
+                        .align_y(Alignment::Center),
+                    row![text("Letter / block period"), space::horizontal(), block_size]
+                        .align_y(Alignment::Center),
+                    row![text("Ticks per row"), space::horizontal(), row_size]
+                        .align_y(Alignment::Center),
+                    row![text("Session start"), space::horizontal(), session_start]
+                        .align_y(Alignment::Center),
+                    row![text("Value area (%)"), space::horizontal(), value_area]
+                        .align_y(Alignment::Center),
+                    row![text("Initial balance blocks"), space::horizontal(), initial_balance]
+                        .align_y(Alignment::Center),
+                    row![text("History profiles"), space::horizontal(), history]
+                        .align_y(Alignment::Center),
+                    row![text("Display"), space::horizontal(), display]
+                        .align_y(Alignment::Center),
+                ]
+                .spacing(8),
+                column![
+                    text("Profile levels").size(crate::style::text_size::SECTION),
+                    poc,
+                    value_area_toggle,
+                    initial_balance_toggle,
+                    singles,
+                ]
+                .spacing(8),
+                row![
+                    space::horizontal(),
+                    sync_all_button(pane, VisualConfig::Kline(cfg))
+                ],
+                ; spacing = 12, align_x = Alignment::Start
+            ]
+        }
         KlineChartKind::Footprint {
             clusters,
             scaling,
@@ -717,6 +982,7 @@ pub fn kline_cfg_view<'a>(
 
             let mut content = split_column![
                 display_readout_section,
+                text("Executed market sells × buys are grouped at every traded price."),
                 column![text("Footprint summary").size(crate::style::text_size::SECTION), footprint_summary_checkbox].spacing(8),
                 column![text("Cluster type").size(crate::style::text_size::SECTION), cluster_picklist].spacing(8),
                 ; spacing = 12, align_x = Alignment::Start

@@ -261,6 +261,8 @@ pub enum FetchUpdate {
     Status {
         pane_id: Uuid,
         status: FetchTaskStatus,
+        /// Present for trade fetches so the chart can finalize the request.
+        req_id: Option<Uuid>,
     },
     Data {
         layout_id: Uuid,
@@ -409,6 +411,7 @@ pub fn request_fetch(
                         Ok(true) => FetchUpdate::Status {
                             pane_id,
                             status: FetchTaskStatus::Completed,
+                            req_id: Some(req_id),
                         },
                         Ok(false) => {
                             // Source returned no data for this range. Produce
@@ -483,6 +486,7 @@ pub fn oi_fetch_task(
     let update_status = Task::done(FetchUpdate::Status {
         pane_id,
         status: FetchTaskStatus::Loading(InfoKind::FetchingOI),
+        req_id,
     });
 
     let fetch_task = match stream {
@@ -536,6 +540,7 @@ pub fn kline_fetch_task(
     let update_status = Task::done(FetchUpdate::Status {
         pane_id,
         status: FetchTaskStatus::Loading(InfoKind::FetchingKlines),
+        req_id,
     });
 
     let fetch_task = match stream {
@@ -593,8 +598,22 @@ pub fn fetch_trades_paged(
     sipper(async move |mut progress| {
         let mut cursor = from_time;
         let mut had_data = false;
+        let mut pages: usize = 0;
+        // Hard stop so BTCUSDT cannot crawl REST for hours under rate limits.
+        // 40 × 1k REST ≈ 40k trades; 2 × 50k archive ≈ 100k trades.
+        const MAX_PAGES: usize = 40;
+        let mut total_trades: usize = 0;
+        const MAX_TOTAL_TRADES: usize = 80_000;
 
         while cursor < to_time {
+            if pages >= MAX_PAGES || total_trades >= MAX_TOTAL_TRADES {
+                log::info!(
+                    "Trade fetch page/trade cap reached (pages={pages}, trades={total_trades}); stopping seed"
+                );
+                break;
+            }
+            pages += 1;
+
             let prev_cursor = cursor;
 
             if let Some(ref client) = server {
@@ -608,6 +627,7 @@ pub fn fetch_trades_paged(
                     cursor = parsed.last_ts.map_or(cursor, |t| t.saturating_add(1));
                 }
                 if !parsed.trades.is_empty() {
+                    total_trades = total_trades.saturating_add(parsed.trades.len());
                     progress.send(parsed.trades).await;
                 }
                 if is_empty {
@@ -624,6 +644,9 @@ pub fn fetch_trades_paged(
 
                 had_data = true;
                 cursor = batch.last().map_or(cursor, |t| t.time.saturating_add(1));
+                total_trades = total_trades.saturating_add(batch.len());
+
+                // Batch is already bounded by the exchange adapter (≤50k).
                 progress.send(batch).await;
             }
 

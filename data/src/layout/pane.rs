@@ -200,6 +200,8 @@ pub enum ContentKind {
     HeatmapChart,
     ShaderHeatmap,
     FootprintChart,
+    RenkoChart,
+    TpoChart,
     CandlestickChart,
     ComparisonChart,
     TimeAndSales,
@@ -207,11 +209,13 @@ pub enum ContentKind {
 }
 
 impl ContentKind {
-    pub const ALL: [ContentKind; 8] = [
+    pub const ALL: [ContentKind; 10] = [
         ContentKind::Starter,
         ContentKind::HeatmapChart,
         ContentKind::ShaderHeatmap,
         ContentKind::FootprintChart,
+        ContentKind::RenkoChart,
+        ContentKind::TpoChart,
         ContentKind::CandlestickChart,
         ContentKind::ComparisonChart,
         ContentKind::TimeAndSales,
@@ -225,7 +229,9 @@ impl std::fmt::Display for ContentKind {
             ContentKind::Starter => "Starter Pane",
             ContentKind::HeatmapChart => "Heatmap Chart (Legacy)",
             ContentKind::ShaderHeatmap => "Heatmap Chart",
-            ContentKind::FootprintChart => "Footprint Chart",
+            ContentKind::FootprintChart => "Footprint · Executed Trades",
+            ContentKind::RenkoChart => "Renko Chart",
+            ContentKind::TpoChart => "TPO · Market Profile",
             ContentKind::CandlestickChart => "Candlestick Chart",
             ContentKind::ComparisonChart => "Comparison Chart",
             ContentKind::TimeAndSales => "Time&Sales",
@@ -284,6 +290,9 @@ impl PaneSetup {
                         Basis::default_kline_time(Some(base_ticker), Timeframe::M5)
                     }))
                 }
+                ContentKind::RenkoChart | ContentKind::TpoChart => {
+                    Some(Basis::Tick(crate::aggr::TickCount(1)))
+                }
                 ContentKind::CandlestickChart | ContentKind::ComparisonChart => {
                     let current = current_basis.and_then(|b| match b {
                         Basis::Time(tf) if exchange.supports_kline_timeframe(tf) => Some(b),
@@ -313,6 +322,7 @@ impl PaneSetup {
             ContentKind::FootprintChart => {
                 Some(current_tick_multiplier.unwrap_or(TickMultiplier(50)))
             }
+            ContentKind::RenkoChart | ContentKind::TpoChart => None,
             ContentKind::CandlestickChart
             | ContentKind::ComparisonChart
             | ContentKind::TimeAndSales

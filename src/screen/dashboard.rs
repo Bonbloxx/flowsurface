@@ -45,6 +45,9 @@ use std::{collections::HashMap, time::Instant, vec};
 pub enum Message {
     Pane(window::Id, pane::Message),
     ChangePaneStatus(uuid::Uuid, pane::Status),
+    /// Trade history fetch finished successfully — clear in-flight flags and
+    /// mark the request completed so further gap fills can run.
+    TradeFetchCompleted(uuid::Uuid, Option<uuid::Uuid>),
     SavePopoutSpecs(HashMap<window::Id, WindowSpec>),
     ErrorOccurred(Option<uuid::Uuid>, DashboardError),
     Notification(Toast),
@@ -420,6 +423,21 @@ impl Dashboard {
                         c.reset_trade_fetch_state();
                     }
                     pane_state.status = status;
+                }
+            }
+            Message::TradeFetchCompleted(pane_id, req_id) => {
+                if let Some(pane_state) = self.get_mut_pane_state_by_uuid(main_window.id, pane_id) {
+                    if let pane::Content::Kline { chart: Some(c), .. } = &mut pane_state.content {
+                        c.reset_trade_fetch_state();
+                        if let Some(req_id) = req_id {
+                            // mark_completed is private to chart via request_handler —
+                            // reuse the public path that also clears trade flags.
+                            c.finalize_trade_fetch(req_id);
+                        }
+                    }
+                    if matches!(pane_state.status, pane::Status::Loading(..)) {
+                        pane_state.status = pane::Status::Ready;
+                    }
                 }
             }
             Message::DistributeFetchedData {
@@ -1412,12 +1430,20 @@ impl Dashboard {
 impl From<fetcher::FetchUpdate> for Message {
     fn from(update: fetcher::FetchUpdate) -> Self {
         match update {
-            fetcher::FetchUpdate::Status { pane_id, status } => match status {
+            fetcher::FetchUpdate::Status {
+                pane_id,
+                status,
+                req_id,
+            } => match status {
                 fetcher::FetchTaskStatus::Loading(info) => {
                     Message::ChangePaneStatus(pane_id, pane::Status::Loading(info))
                 }
                 fetcher::FetchTaskStatus::Completed => {
-                    Message::ChangePaneStatus(pane_id, pane::Status::Ready)
+                    // Finalize trade-fetch bookkeeping even when no batch crossed
+                    // `until_time` (common for footprint gap fills). Without this,
+                    // the request stays Pending forever and further trade backfills
+                    // are blocked by has_pending / fetching_trades.
+                    Message::TradeFetchCompleted(pane_id, req_id)
                 }
             },
             fetcher::FetchUpdate::Data {

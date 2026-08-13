@@ -2,6 +2,7 @@ pub mod comparison;
 pub mod heatmap;
 pub mod indicator;
 pub mod kline;
+pub mod tpo;
 
 use exchange::UnixMs;
 use exchange::{Timeframe, unit::Price};
@@ -76,6 +77,19 @@ impl PlotData<KlineDataPoint> {
                 .min_max_footprint_price_in_range(start_interval as usize, end_interval as usize),
             PlotData::TimeBased(timeseries) => timeseries
                 .min_max_footprint_price_in_range(UnixMs(start_interval), UnixMs(end_interval)),
+        }
+    }
+
+    pub fn visible_tpo_price_range(
+        &self,
+        start_interval: u64,
+        end_interval: u64,
+    ) -> Option<(Price, Price)> {
+        match self {
+            PlotData::TickBased(tick_aggr) => {
+                tick_aggr.min_max_tpo_price_in_range(start_interval as usize, end_interval as usize)
+            }
+            PlotData::TimeBased(_) => None,
         }
     }
 }

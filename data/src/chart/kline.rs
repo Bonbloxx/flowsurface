@@ -324,6 +324,14 @@ impl FootprintSummary {
 pub enum KlineChartKind {
     #[default]
     Candles,
+    Renko {
+        #[serde(default)]
+        config: RenkoConfig,
+    },
+    Tpo {
+        #[serde(default)]
+        config: super::tpo::Config,
+    },
     Footprint {
         clusters: ClusterKind,
         #[serde(default)]
@@ -336,57 +344,120 @@ impl KlineChartKind {
     pub fn allows_indicator(&self, indicator: KlineIndicator) -> bool {
         !matches!(
             (self, indicator),
-            (KlineChartKind::Candles, KlineIndicator::BarAnalysis)
+            (
+                KlineChartKind::Candles | KlineChartKind::Renko { .. },
+                KlineIndicator::BarAnalysis
+            ) | (KlineChartKind::Tpo { .. }, _)
         )
     }
 
     pub fn min_scaling(&self) -> f32 {
         match self {
-            KlineChartKind::Footprint { .. } => 0.4,
-            KlineChartKind::Candles => 0.6,
+            KlineChartKind::Footprint { .. } | KlineChartKind::Tpo { .. } => 0.4,
+            KlineChartKind::Candles | KlineChartKind::Renko { .. } => 0.6,
         }
     }
 
     pub fn max_scaling(&self) -> f32 {
         match self {
+            // TPO needs deeper overall zoom so letter cells can reach readable px.
+            KlineChartKind::Tpo { .. } => 2.5,
             KlineChartKind::Footprint { .. } => 1.2,
-            KlineChartKind::Candles => 2.5,
+            KlineChartKind::Candles | KlineChartKind::Renko { .. } => 2.5,
         }
     }
 
     pub fn max_cell_width(&self) -> f32 {
         match self {
             KlineChartKind::Footprint { .. } => 360.0,
-            KlineChartKind::Candles => 16.0,
+            // Allow a single day profile to fill most of the pane when zoomed in.
+            KlineChartKind::Tpo { .. } => 520.0,
+            KlineChartKind::Candles | KlineChartKind::Renko { .. } => 16.0,
         }
     }
 
     pub fn min_cell_width(&self) -> f32 {
         match self {
             KlineChartKind::Footprint { .. } => 80.0,
-            KlineChartKind::Candles => 1.0,
+            KlineChartKind::Tpo { .. } => 18.0,
+            KlineChartKind::Candles | KlineChartKind::Renko { .. } => 1.0,
         }
     }
 
     pub fn max_cell_height(&self) -> f32 {
         match self {
             KlineChartKind::Footprint { .. } => 90.0,
-            KlineChartKind::Candles => 8.0,
+            // Per-tick height; visual TPO row = cell_height * ticks_per_row.
+            // Higher cap so Y zoom can produce readable letter rows.
+            KlineChartKind::Tpo { .. } => 28.0,
+            KlineChartKind::Candles | KlineChartKind::Renko { .. } => 8.0,
         }
     }
 
     pub fn min_cell_height(&self) -> f32 {
         match self {
             KlineChartKind::Footprint { .. } => 1.0,
-            KlineChartKind::Candles => 0.001,
+            KlineChartKind::Tpo { .. } => 0.02,
+            KlineChartKind::Candles | KlineChartKind::Renko { .. } => 0.001,
         }
     }
 
     pub fn default_cell_width(&self) -> f32 {
         match self {
             KlineChartKind::Footprint { .. } => 80.0,
-            KlineChartKind::Candles => 4.0,
+            // Reference-style: several day profiles visible without endless panning.
+            KlineChartKind::Tpo { .. } => 72.0,
+            KlineChartKind::Candles | KlineChartKind::Renko { .. } => 4.0,
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct RenkoConfig {
+    /// Size of one brick in exchange minimum-price ticks.
+    pub brick_size: u32,
+    /// Number of bricks price must travel before a reversal is confirmed.
+    pub reversal: u8,
+    /// Minimum lifetime of a developing brick. Zero disables rate limiting.
+    pub normalization_ms: u32,
+}
+
+impl RenkoConfig {
+    pub const MIN_BRICK_SIZE: u32 = 1;
+    pub const MAX_BRICK_SIZE: u32 = 10_000;
+    pub const MIN_REVERSAL: u8 = 1;
+    pub const MAX_REVERSAL: u8 = 5;
+    pub const BRICK_SIZE_PRESETS: [u32; 14] = [
+        5, 10, 20, 50, 100, 150, 200, 300, 350, 500, 1_000, 2_000, 5_000, 10_000,
+    ];
+    pub const NORMALIZATION_PRESETS_MS: [u32; 8] = [0, 100, 250, 500, 1_000, 2_000, 5_000, 10_000];
+
+    pub fn normalized(self) -> Self {
+        Self {
+            brick_size: self
+                .brick_size
+                .clamp(Self::MIN_BRICK_SIZE, Self::MAX_BRICK_SIZE),
+            reversal: self.reversal.clamp(Self::MIN_REVERSAL, Self::MAX_REVERSAL),
+            normalization_ms: self.normalization_ms.min(10_000),
+        }
+    }
+}
+
+impl Default for RenkoConfig {
+    fn default() -> Self {
+        // Match common liquid-perp defaults (e.g. 350-tick brick, 2-box reversal).
+        Self {
+            brick_size: 350,
+            reversal: 2,
+            normalization_ms: 0,
+        }
+    }
+}
+
+impl std::fmt::Display for RenkoConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Renko {}×{}", self.brick_size, self.reversal)
     }
 }
 
@@ -420,7 +491,7 @@ impl ClusterKind {
 impl std::fmt::Display for ClusterKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ClusterKind::BidAsk => write!(f, "Bid/Ask"),
+            ClusterKind::BidAsk => write!(f, "Bid × Ask"),
             ClusterKind::VolumeProfile => write!(f, "Volume Profile"),
             ClusterKind::DeltaProfile => write!(f, "Delta Profile"),
             ClusterKind::Table => write!(f, "Table"),
@@ -428,7 +499,7 @@ impl std::fmt::Display for ClusterKind {
     }
 }
 
-#[derive(Default, Debug, Copy, Clone, PartialEq, Deserialize, Serialize)]
+#[derive(Debug, Copy, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
     // Whether to show last value labels on top right/left when not hovering
@@ -436,6 +507,18 @@ pub struct Config {
     pub data_labels_always_visible: bool,
     // Whether to show the footprint per-bar summary below each candle.
     pub show_footprint_summary: bool,
+    // Whether Renko candles show the traded high/low beyond their fixed body.
+    pub show_renko_wicks: bool,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            data_labels_always_visible: false,
+            show_footprint_summary: false,
+            show_renko_wicks: true,
+        }
+    }
 }
 
 #[derive(Default, Clone, Copy, Debug, PartialEq, Deserialize, Serialize)]

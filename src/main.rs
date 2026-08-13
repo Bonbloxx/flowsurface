@@ -66,10 +66,19 @@ fn main() {
         .scale_factor(Flowsurface::scale_factor)
         .subscription(Flowsurface::subscription);
 
-    if let Err(err) = daemon.run() {
-        let message = format!("Runtime error: {err}");
-        log::error!("{message}");
-        logger::report_stderr(&message);
+    log::info!("starting iced daemon");
+    log::logger().flush();
+
+    match daemon.run() {
+        Ok(()) => {
+            log::info!("iced daemon returned Ok (clean runtime shutdown)");
+            log::logger().flush();
+        }
+        Err(err) => {
+            let message = format!("Runtime error: {err}");
+            log::error!("{message}");
+            logger::report_stderr(&message);
+        }
     }
 }
 
@@ -100,6 +109,8 @@ enum Message {
         event: dashboard::Message,
     },
     Tick(std::time::Instant),
+    /// Periodic health log so silent exits leave a last-known-alive timestamp.
+    Heartbeat(std::time::Instant),
     WindowEvent(window::Event),
     ExitRequested(HashMap<window::Id, WindowSpec>),
     RestartRequested(Option<HashMap<window::Id, WindowSpec>>),
@@ -254,8 +265,23 @@ impl Flowsurface {
                         event: msg,
                     });
             }
+            Message::Heartbeat(_now) => {
+                let panes = self
+                    .layout_manager
+                    .active_layout_id()
+                    .and_then(|id| self.layout_manager.get(id.unique))
+                    .map(|l| l.dashboard.panes.len())
+                    .unwrap_or(0);
+                log::info!(
+                    "heartbeat panes={panes} main_window={:?}",
+                    self.main_window.id
+                );
+                log::logger().flush();
+            }
             Message::WindowEvent(event) => match event {
                 window::Event::CloseRequested(window) => {
+                    log::info!("window close requested: {window:?} (main={:?})", self.main_window.id);
+                    log::logger().flush();
                     let main_window = self.main_window.id;
                     let dashboard = self.active_dashboard_mut();
 
@@ -275,7 +301,11 @@ impl Flowsurface {
                 }
             },
             Message::ExitRequested(windows) => {
+                log::info!("exit requested ({} window specs); saving state", windows.len());
+                log::logger().flush();
                 self.save_state_to_disk(&windows);
+                log::info!("state save finished; calling iced::exit()");
+                log::logger().flush();
                 return iced::exit();
             }
             Message::SaveStateRequested(windows) => {
@@ -806,6 +836,10 @@ impl Flowsurface {
 
         let tick = iced::window::frames().map(Message::Tick);
 
+        // Every 30s so a silent death leaves a last-alive line in the log.
+        let heartbeat = iced::time::every(std::time::Duration::from_secs(30))
+            .map(Message::Heartbeat);
+
         let hotkeys = keyboard::listen().filter_map(|event| {
             let keyboard::Event::KeyPressed { key, .. } = event else {
                 return None;
@@ -821,6 +855,7 @@ impl Flowsurface {
             sidebar,
             window_events,
             tick,
+            heartbeat,
             hotkeys,
         ])
     }

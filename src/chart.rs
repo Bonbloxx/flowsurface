@@ -412,10 +412,14 @@ pub fn update<T: Chart>(chart: &mut T, message: &Message) {
                         state.interval_to_x(cursor_time)
                     }
                     Basis::Tick(_) => {
-                        let tick_index = cursor_chart_x / state.cell_width;
-                        state.cell_width = new_width;
-
-                        tick_index * state.cell_width
+                        let w = state.cell_width.max(1e-3);
+                        let tick_index = cursor_chart_x / w;
+                        state.cell_width = new_width.max(1e-3);
+                        if !tick_index.is_finite() {
+                            state.cell_width
+                        } else {
+                            tick_index * state.cell_width
+                        }
                     }
                 };
 
@@ -434,25 +438,31 @@ pub fn update<T: Chart>(chart: &mut T, message: &Message) {
 
             let state = chart.mut_state();
 
-            if state.layout.autoscale == Some(Autoscale::FitToVisible) {
-                state.layout.autoscale = None;
-            }
+            // Always leave fit-mode so the next invalidate does not overwrite
+            // the user's vertical zoom (TPO used FitToVisible by default).
+            state.layout.autoscale = None;
 
-            if *delta < 0.0 && state.cell_height > min_cell_height
-                || *delta > 0.0 && state.cell_height < max_cell_height
+            if (*delta < 0.0 && state.cell_height > min_cell_height)
+                || (*delta > 0.0 && state.cell_height < max_cell_height)
             {
                 let (old_scaling, old_translation_y) = { (state.scaling, state.translation.y) };
 
                 let zoom_factor = if *is_wheel_scroll {
                     ZOOM_SENSITIVITY
                 } else {
-                    ZOOM_SENSITIVITY * 3.0
+                    // Drag on the price axis: slightly snappier than wheel.
+                    ZOOM_SENSITIVITY * 2.0
                 };
 
                 let new_height = (state.cell_height * (1.0 + delta / zoom_factor))
                     .clamp(min_cell_height, max_cell_height);
 
-                let cursor_chart_y = cursor_to_center_y / old_scaling - old_translation_y;
+                let cursor_chart_y = if cursor_to_center_y.abs() > f32::EPSILON {
+                    cursor_to_center_y / old_scaling - old_translation_y
+                } else {
+                    // Axis drag passes 0 for cursor offset — zoom around view center.
+                    -old_translation_y
+                };
 
                 let cursor_price = state.y_to_price(cursor_chart_y);
 
@@ -461,10 +471,6 @@ pub fn update<T: Chart>(chart: &mut T, message: &Message) {
                 let new_cursor_y = state.price_to_y(cursor_price);
 
                 state.translation.y -= new_cursor_y - cursor_chart_y;
-
-                if *is_wheel_scroll {
-                    state.layout.autoscale = None;
-                }
             }
         }
         Message::BoundsChanged(bounds) => {
@@ -770,8 +776,12 @@ impl ViewState {
                 }
             }
             Basis::Tick(_) => {
-                let tick = -(x / self.cell_width);
-                tick.round() as u64
+                let w = self.cell_width.max(1e-3);
+                let tick = -(x / w);
+                if !tick.is_finite() {
+                    return 0;
+                }
+                tick.round().max(0.0) as u64
             }
         }
     }
@@ -1125,12 +1135,20 @@ impl ViewState {
 }
 
 fn request_fetch(handler: &mut RequestHandler, range: FetchRange) -> Option<Action> {
+    request_fetch_with_stream(handler, range, None)
+}
+
+fn request_fetch_with_stream(
+    handler: &mut RequestHandler,
+    range: FetchRange,
+    stream: Option<exchange::adapter::StreamKind>,
+) -> Option<Action> {
     match handler.add_request(range) {
         Ok(Some(req_id)) => {
             let fetch_spec = FetchSpec {
                 req_id,
                 fetch: range,
-                stream: None,
+                stream,
             };
             Some(Action::RequestFetch(vec![fetch_spec]))
         }

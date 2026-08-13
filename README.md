@@ -22,7 +22,9 @@ An open-source native desktop charting application for crypto markets. Supports 
 - Multiple chart/panel types:
     - **Heatmap (Historical DOM):** Uses live trades and L2 orderbook to create a time-series heatmap chart. Supports customizable price grouping, different time aggregations, fixed or visible range volume profile.
     - **Candlestick:** Traditional kline chart supporting both time-based and custom tick-based intervals.
-    - **Footprint:** Price grouped and interval aggregated views for trades on top of a candlestick chart. Supports different clustering methods, configurable imbalance and naked-POC studies.
+    - **Renko:** True trade-driven fixed-size bricks with configurable tick size, reversal boxes, minimum brick lifetime, optional traded-range wicks, and CVD support.
+    - **TPO (Market Profile):** Session-aligned time-price-opportunity profiles built like Sierra/Quantower — letter high–low from time bars (not raw trade backfill), live trades refine the developing session, with configurable profile/bracket periods, ticks per row, value area, initial balance, and multi-day history.
+    - **Footprint (Executed Trades):** Bid × ask market executions at every traded price, with volume, delta, imbalance, naked-POC, and bar-analysis views.
     - **Time & Sales:** Scrollable list of live trades.
     - **DOM (Depth of Market) / Ladder:** Displays current L2 orderbook alongside recent trade volumes on grouped price levels.
     - **Comparison:** Line graph for comparing multiple data sources, normalized by kline `close` prices on a percentage scale
@@ -33,11 +35,11 @@ An open-source native desktop charting application for crypto markets. Supports 
 
 #
 
-#### Historical Trades on Footprint Charts:
+#### Historical Trades on Footprint, Renko, and TPO Charts:
 
 By default, Flowsurface captures and plots live trades in real time via WebSocket.
 
-To backfill the visible time range on footprint charts, enable **trade fetching**
+To backfill footprint charts and seed new Renko or TPO charts, enable **trade fetching**
 in Settings → Network. Three modes are available:
 
 - **Exchange**: Fetches directly from Binance's public REST API and bulk data

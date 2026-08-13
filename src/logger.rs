@@ -214,12 +214,14 @@ pub fn install_panic_hook() {
         std::panic::set_hook(Box::new(move |panic_info| {
             let report = format_panic_report(panic_info);
 
-            log::error!(target: "panic", "{report}");
-            log::logger().flush();
-
-            if let Err(err) = append_stderr_log_line(&report) {
+            // Direct file write first — background logger may not flush before
+            // abort / process teardown after a panic on a non-main thread.
+            if let Err(err) = append_stderr_log_line(&format!("PANIC: {report}")) {
                 eprintln!("Failed to persist panic report: {err}");
             }
+
+            log::error!(target: "panic", "{report}");
+            log::logger().flush();
 
             previous(panic_info);
         }));

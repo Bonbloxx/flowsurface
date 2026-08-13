@@ -150,8 +150,8 @@ fn cleanup_directory(data_path: &PathBuf) -> usize {
         return 0;
     }
 
-    let re =
-        regex::Regex::new(r".*-(\d{4}-\d{2}-\d{2})\.zip$").expect("Cleanup regex pattern is valid");
+    let re = regex::Regex::new(r".*-(\d{4}-\d{2}-\d{2})\.zip(?:\.missing)?$")
+        .expect("Cleanup regex pattern is valid");
     let today = chrono::Local::now().date_naive();
     let mut deleted_files = Vec::new();
 

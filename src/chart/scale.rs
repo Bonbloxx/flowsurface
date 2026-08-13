@@ -631,7 +631,13 @@ impl canvas::Program<Message> for AxisLabelsY<'_> {
                         if difference_y.abs() > 1.0 {
                             *last_position = cursor_position;
 
-                            let message = Message::YScaling(difference_y * 0.4, 0.0, false);
+                            // Anchor zoom to the price under the cursor when possible.
+                            let cursor_to_center_y = cursor
+                                .position_from(bounds.center())
+                                .map(|p| p.y)
+                                .unwrap_or(0.0);
+                            let message =
+                                Message::YScaling(difference_y * 0.55, cursor_to_center_y, false);
 
                             return Some(canvas::Action::publish(message).and_capture());
                         }

@@ -99,6 +99,8 @@ pub enum Event {
     ReorderIndicator(column_drag::DragEvent),
     ClusterKindSelected(data::chart::kline::ClusterKind),
     ClusterScalingSelected(data::chart::kline::ClusterScaling),
+    RenkoConfigChanged(data::chart::kline::RenkoConfig),
+    TpoConfigChanged(data::chart::tpo::Config),
     StudyConfigurator(modal::pane::settings::study::StudyMessage),
     StreamModifierChanged(modal::stream::Message),
     ComparisonChartInteraction(super::chart::comparison::Message),
@@ -234,6 +236,18 @@ impl State {
                         },
                         || vec![trades_stream(&derived_plan)],
                     );
+
+                    (content, streams)
+                }
+                ContentKind::RenkoChart | ContentKind::TpoChart => {
+                    let content = Content::new_kline(
+                        kind,
+                        &self.content,
+                        derived_plan.ticker_info,
+                        &self.settings,
+                        derived_plan.price_step,
+                    );
+                    let streams = vec![trades_stream(&derived_plan)];
 
                     (content, streams)
                 }
@@ -443,7 +457,9 @@ impl State {
                 };
 
                 if let Some(id) = req_id {
-                    if chart.basis() != Basis::Time(timeframe) {
+                    let accepts_time = chart.basis() == Basis::Time(timeframe);
+                    let accepts_tpo_seed = chart.accepts_tpo_kline_seed(timeframe);
+                    if !accepts_time && !accepts_tpo_seed {
                         log::warn!(
                             "Ignoring stale kline fetch for timeframe {:?}; chart basis = {:?}",
                             timeframe,
@@ -952,6 +968,20 @@ impl State {
 
                             top_left_buttons = top_left_buttons.push(modifiers);
                         }
+                        data::chart::KlineChartKind::Renko { config } => {
+                            top_left_buttons = top_left_buttons.push(renko_modifier(
+                                id,
+                                *config,
+                                self.modal == Some(Modal::Settings),
+                            ));
+                        }
+                        data::chart::KlineChartKind::Tpo { config } => {
+                            top_left_buttons = top_left_buttons.push(tpo_modifier(
+                                id,
+                                *config,
+                                self.modal == Some(Modal::Settings),
+                            ));
+                        }
                         data::chart::KlineChartKind::Candles => {
                             let selected_basis = chart.basis();
                             let kind = ModifierKind::Candlestick(selected_basis);
@@ -1000,6 +1030,8 @@ impl State {
                 } else {
                     let content_kind = match chart_kind {
                         data::chart::KlineChartKind::Candles => ContentKind::CandlestickChart,
+                        data::chart::KlineChartKind::Renko { .. } => ContentKind::RenkoChart,
+                        data::chart::KlineChartKind::Tpo { .. } => ContentKind::TpoChart,
                         data::chart::KlineChartKind::Footprint { .. } => {
                             ContentKind::FootprintChart
                         }
@@ -1231,6 +1263,22 @@ impl State {
                     && let Some(c) = chart
                 {
                     c.set_cluster_scaling(scaling);
+                    *kind = c.kind.clone();
+                }
+            }
+            Event::RenkoConfigChanged(config) => {
+                if let Content::Kline { chart, kind, .. } = &mut self.content
+                    && let Some(c) = chart
+                {
+                    c.set_renko_config(config);
+                    *kind = c.kind.clone();
+                }
+            }
+            Event::TpoConfigChanged(config) => {
+                if let Content::Kline { chart, kind, .. } = &mut self.content
+                    && let Some(c) = chart
+                {
+                    c.set_tpo_config(config);
                     *kind = c.kind.clone();
                 }
             }
@@ -1991,6 +2039,23 @@ impl Content {
             (None, None, None)
         };
 
+        let preserve_indicators = matches!(
+            (content_kind, prev_kind_opt.as_ref()),
+            (
+                ContentKind::FootprintChart,
+                Some(data::chart::KlineChartKind::Footprint { .. })
+            ) | (
+                ContentKind::RenkoChart,
+                Some(data::chart::KlineChartKind::Renko { .. })
+            ) | (
+                ContentKind::TpoChart,
+                Some(data::chart::KlineChartKind::Tpo { .. })
+            ) | (
+                ContentKind::CandlestickChart,
+                Some(data::chart::KlineChartKind::Candles)
+            )
+        );
+
         let (default_tf, determined_chart_kind) = match content_kind {
             ContentKind::FootprintChart => (
                 Timeframe::M5,
@@ -2002,6 +2067,22 @@ impl Content {
                         studies: vec![],
                     }),
             ),
+            ContentKind::RenkoChart => (
+                Timeframe::M15,
+                prev_kind_opt
+                    .filter(|k| matches!(k, data::chart::KlineChartKind::Renko { .. }))
+                    .unwrap_or_else(|| data::chart::KlineChartKind::Renko {
+                        config: data::chart::kline::RenkoConfig::default(),
+                    }),
+            ),
+            ContentKind::TpoChart => (
+                Timeframe::M30,
+                prev_kind_opt
+                    .filter(|k| matches!(k, data::chart::KlineChartKind::Tpo { .. }))
+                    .unwrap_or_else(|| data::chart::KlineChartKind::Tpo {
+                        config: data::chart::tpo::Config::default(),
+                    }),
+            ),
             ContentKind::CandlestickChart => (Timeframe::M15, data::chart::KlineChartKind::Candles),
             _ => unreachable!("invalid content kind for kline chart"),
         };
@@ -2010,8 +2091,17 @@ impl Content {
 
         let enabled_indicators = {
             let available = KlineIndicator::for_market(ticker_info.market_type());
-            prev_indis.map_or_else(
-                || vec![KlineIndicator::Volume],
+            prev_indis.filter(|_| preserve_indicators).map_or_else(
+                || match &determined_chart_kind {
+                    data::chart::KlineChartKind::Footprint { .. } => {
+                        vec![KlineIndicator::BarAnalysis]
+                    }
+                    data::chart::KlineChartKind::Renko { .. } => {
+                        vec![KlineIndicator::CumulativeDelta]
+                    }
+                    data::chart::KlineChartKind::Tpo { .. } => vec![],
+                    data::chart::KlineChartKind::Candles => vec![KlineIndicator::Volume],
+                },
                 |indis| {
                     indis
                         .into_iter()
@@ -2085,9 +2175,31 @@ impl Content {
                     autoscale: Some(data::chart::Autoscale::FitToVisible),
                 },
             },
+            ContentKind::RenkoChart => Content::Kline {
+                chart: None,
+                indicators: vec![KlineIndicator::CumulativeDelta],
+                kind: data::chart::KlineChartKind::Renko {
+                    config: data::chart::kline::RenkoConfig::default(),
+                },
+                layout: ViewConfig {
+                    splits: vec![0.8],
+                    autoscale: Some(data::chart::Autoscale::FitToVisible),
+                },
+            },
+            ContentKind::TpoChart => Content::Kline {
+                chart: None,
+                indicators: vec![],
+                kind: data::chart::KlineChartKind::Tpo {
+                    config: data::chart::tpo::Config::default(),
+                },
+                layout: ViewConfig {
+                    splits: vec![],
+                    autoscale: Some(data::chart::Autoscale::FitToVisible),
+                },
+            },
             ContentKind::FootprintChart => Content::Kline {
                 chart: None,
-                indicators: vec![KlineIndicator::Volume],
+                indicators: vec![KlineIndicator::BarAnalysis],
                 kind: data::chart::KlineChartKind::Footprint {
                     clusters: data::chart::kline::ClusterKind::default(),
                     scaling: data::chart::kline::ClusterScaling::default(),
@@ -2319,6 +2431,8 @@ impl Content {
             Content::Heatmap { .. } => ContentKind::HeatmapChart,
             Content::Kline { kind, .. } => match kind {
                 data::chart::KlineChartKind::Footprint { .. } => ContentKind::FootprintChart,
+                data::chart::KlineChartKind::Renko { .. } => ContentKind::RenkoChart,
+                data::chart::KlineChartKind::Tpo { .. } => ContentKind::TpoChart,
                 data::chart::KlineChartKind::Candles => ContentKind::CandlestickChart,
             },
             Content::TimeAndSales(_) => ContentKind::TimeAndSales,
@@ -2468,6 +2582,30 @@ fn basis_modifier<'a>(
     button(text(selected_basis.to_string()).align_y(Alignment::Center))
         .style(move |theme, status| style::button::modifier(theme, status, !is_active))
         .on_press(Message::PaneEvent(id, Event::ShowModal(modifier_modal)))
+        .height(widget::PANE_CONTROL_BTN_HEIGHT)
+        .into()
+}
+
+fn renko_modifier(
+    id: pane_grid::Pane,
+    config: data::chart::kline::RenkoConfig,
+    is_active: bool,
+) -> Element<'static, Message> {
+    button(text(config.to_string()).align_y(Alignment::Center))
+        .style(move |theme, status| style::button::modifier(theme, status, !is_active))
+        .on_press(Message::PaneEvent(id, Event::ShowModal(Modal::Settings)))
+        .height(widget::PANE_CONTROL_BTN_HEIGHT)
+        .into()
+}
+
+fn tpo_modifier(
+    id: pane_grid::Pane,
+    config: data::chart::tpo::Config,
+    is_active: bool,
+) -> Element<'static, Message> {
+    button(text(config.to_string()).align_y(Alignment::Center))
+        .style(move |theme, status| style::button::modifier(theme, status, !is_active))
+        .on_press(Message::PaneEvent(id, Event::ShowModal(Modal::Settings)))
         .height(widget::PANE_CONTROL_BTN_HEIGHT)
         .into()
 }
