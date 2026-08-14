@@ -16,6 +16,7 @@ pub enum KlineIndicator {
     BarAnalysis,
     CumulativeDelta,
     OpenInterest,
+    FootprintHistory,
 }
 
 impl Indicator for KlineIndicator {
@@ -31,17 +32,19 @@ impl KlineIndicator {
     // Indicator togglers on UI menus depend on these arrays.
     // Every variant needs to be in either SPOT, PERPS or both.
     /// Indicators that can be used with spot market tickers
-    const FOR_SPOT: [KlineIndicator; 3] = [
+    const FOR_SPOT: [KlineIndicator; 4] = [
         KlineIndicator::Volume,
         KlineIndicator::BarAnalysis,
         KlineIndicator::CumulativeDelta,
+        KlineIndicator::FootprintHistory,
     ];
     /// Indicators that can be used with perpetual swap market tickers
-    const FOR_PERPS: [KlineIndicator; 4] = [
+    const FOR_PERPS: [KlineIndicator; 5] = [
         KlineIndicator::Volume,
         KlineIndicator::BarAnalysis,
         KlineIndicator::CumulativeDelta,
         KlineIndicator::OpenInterest,
+        KlineIndicator::FootprintHistory,
     ];
 }
 
@@ -52,6 +55,7 @@ impl Display for KlineIndicator {
             KlineIndicator::BarAnalysis => write!(f, "Bar Analysis"),
             KlineIndicator::CumulativeDelta => write!(f, "CVD"),
             KlineIndicator::OpenInterest => write!(f, "Open Interest"),
+            KlineIndicator::FootprintHistory => write!(f, "Footprint History"),
         }
     }
 }

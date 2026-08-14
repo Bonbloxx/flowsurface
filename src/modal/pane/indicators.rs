@@ -13,6 +13,7 @@ pub fn view<'a, I>(
     state: &'a pane::State,
     selected: &[I],
     market_type: Option<exchange::adapter::MarketKind>,
+    footprint_history_sources: &[exchange::TickerInfo],
 ) -> Element<'a, Message>
 where
     I: Indicator + Copy + Into<UiIndicator>,
@@ -25,6 +26,7 @@ where
             selected,
             market,
             content_allows_dragging,
+            footprint_history_sources,
         )
     } else {
         column![].spacing(4).into()
@@ -41,6 +43,7 @@ fn build_indicator_row<'a, I>(
     pane: pane_grid::Pane,
     indicator: &I,
     is_selected: bool,
+    footprint_history_sources: &[exchange::TickerInfo],
 ) -> Element<'a, Message>
 where
     I: Indicator + Copy + Into<UiIndicator>,
@@ -59,7 +62,7 @@ where
     button(content)
         .on_press(Message::PaneEvent(
             pane,
-            pane::Event::ToggleIndicator((*indicator).into()),
+            pane::Event::ToggleIndicator((*indicator).into(), footprint_history_sources.to_vec()),
         ))
         .width(Length::Fill)
         .style(move |theme, status| style::button::modifier(theme, status, is_selected))
@@ -70,6 +73,7 @@ fn selected_list<'a, I>(
     pane: pane_grid::Pane,
     selected: &[I],
     reorderable: bool,
+    footprint_history_sources: &[exchange::TickerInfo],
 ) -> Element<'a, Message>
 where
     I: Indicator + Copy + Into<UiIndicator>,
@@ -77,7 +81,7 @@ where
     let elements: Vec<Element<_>> = selected
         .iter()
         .map(|indicator| {
-            let base = build_indicator_row(pane, indicator, true);
+            let base = build_indicator_row(pane, indicator, true, footprint_history_sources);
             dragger_row(base, reorderable)
         })
         .collect();
@@ -97,14 +101,18 @@ where
     }
 }
 
-fn available_list<'a, I>(pane: pane_grid::Pane, available: &[I]) -> Element<'a, Message>
+fn available_list<'a, I>(
+    pane: pane_grid::Pane,
+    available: &[I],
+    footprint_history_sources: &[exchange::TickerInfo],
+) -> Element<'a, Message>
 where
     I: Indicator + Copy + Into<UiIndicator>,
 {
     let elements: Vec<Element<_>> = available
         .iter()
         .map(|indicator| {
-            let base = build_indicator_row(pane, indicator, false);
+            let base = build_indicator_row(pane, indicator, false, footprint_history_sources);
             dragger_row(base, false)
         })
         .collect();
@@ -120,6 +128,7 @@ fn content_row<'a, I>(
     selected: &[I],
     market: exchange::adapter::MarketKind,
     allows_drag: bool,
+    footprint_history_sources: &[exchange::TickerInfo],
 ) -> Element<'a, Message>
 where
     I: Indicator + Copy + Into<UiIndicator>,
@@ -133,7 +142,12 @@ where
         .collect();
 
     let selected_list = if !selected.is_empty() {
-        Some(selected_list(pane, &selected, reorderable))
+        Some(selected_list(
+            pane,
+            &selected,
+            reorderable,
+            footprint_history_sources,
+        ))
     } else {
         None
     };
@@ -146,7 +160,7 @@ where
         .cloned()
         .collect();
     let available_list = if !available.is_empty() {
-        Some(available_list(pane, &available))
+        Some(available_list(pane, &available, footprint_history_sources))
     } else {
         None
     };

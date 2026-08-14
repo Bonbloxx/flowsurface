@@ -394,7 +394,11 @@ impl Flowsurface {
                             let resolved_streams =
                                 streams.into_iter().try_fold(vec![], |mut acc, persist| {
                                     let resolver = |t: &exchange::Ticker| {
-                                        tickers_info.get(t).and_then(|opt| *opt)
+                                        tickers_info.get(t).and_then(|opt| *opt).or_else(|| {
+                                            tickers_info.iter().find_map(|(candidate, info)| {
+                                                t.same_market(candidate).then_some(*info).flatten()
+                                            })
+                                        })
                                     };
 
                                     match persist.into_stream_kinds(resolver) {
@@ -692,11 +696,21 @@ impl Flowsurface {
                                     .map(|feed| {
                                         feed.source_tickers()
                                             .filter_map(|ticker| {
-                                                self.sidebar
-                                                    .tickers_info()
+                                                let tickers_info = self.sidebar.tickers_info();
+                                                tickers_info
                                                     .get(&ticker)
                                                     .copied()
                                                     .flatten()
+                                                    .or_else(|| {
+                                                        tickers_info.iter().find_map(
+                                                            |(candidate, info)| {
+                                                                ticker
+                                                                    .same_market(candidate)
+                                                                    .then_some(*info)
+                                                                    .flatten()
+                                                            },
+                                                        )
+                                                    })
                                             })
                                             .collect::<Vec<_>>()
                                     })

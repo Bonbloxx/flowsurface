@@ -106,6 +106,10 @@ pub struct Settings {
     /// Explicit aggregate-source selection. `None` means every available
     /// source; a non-empty list supports both mixed and single-venue views.
     pub aggregate_sources: Option<Vec<Ticker>>,
+    /// Venue sources used by the independent Footprint History indicator.
+    pub footprint_history_sources: Option<Vec<Ticker>>,
+    /// Combine selected Footprint History venues into one composite footprint.
+    pub footprint_history_aggregate: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
@@ -383,14 +387,20 @@ mod tests {
         let settings = Settings {
             aggregate_feed: Some(AggregateFeedId::BtcUsdtPerpetual),
             aggregate_sources: Some(selected.clone()),
+            footprint_history_sources: Some(selected.clone()),
+            footprint_history_aggregate: true,
             ..Settings::default()
         };
 
         let encoded = serde_json::to_string(&settings).expect("settings serialize");
         let decoded: Settings = serde_json::from_str(&encoded).expect("settings deserialize");
-        assert_eq!(decoded.aggregate_sources, Some(selected));
+        assert_eq!(decoded.aggregate_sources, Some(selected.clone()));
+        assert_eq!(decoded.footprint_history_sources, Some(selected));
+        assert!(decoded.footprint_history_aggregate);
 
         let legacy: Settings = serde_json::from_str("{}").expect("legacy settings deserialize");
         assert_eq!(legacy.aggregate_sources, None);
+        assert_eq!(legacy.footprint_history_sources, None);
+        assert!(!legacy.footprint_history_aggregate);
     }
 }

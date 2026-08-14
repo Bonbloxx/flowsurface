@@ -3,8 +3,9 @@ use super::{
     indicator, request_fetch, request_fetch_with_stream, scale::linear::PriceInfoLabel,
 };
 use crate::chart::indicator::kline::KlineIndicatorImpl;
-use crate::connector::fetcher::is_trade_fetch_enabled;
-use crate::connector::fetcher::{FetchRange, RequestHandler};
+use crate::connector::fetcher::{
+    FetchRange, FetchSpec, RequestHandler, TradeFetchMode, is_trade_fetch_enabled, trade_fetch_mode,
+};
 use crate::{modal::pane::settings::study, style};
 use data::aggr::ticks::TickAggr;
 use data::aggr::time::TimeSeries;
@@ -15,16 +16,16 @@ use data::chart::kline::{
     KlineTrades, NPoc, PointOfControl, RenkoConfig,
 };
 use data::chart::tpo::{
-    Config as TpoConfig, DisplayStyle as TpoDisplayStyle, Profile as TpoProfile, block_letter,
-    price_to_row,
+    Config as TpoConfig, DisplayStyle as TpoDisplayStyle, Profile as TpoProfile,
+    ProfilePeriod as TpoProfilePeriod, block_letter, price_to_row,
 };
 use data::chart::{Autoscale, KlineChartKind, ViewConfig};
 
 use data::config::theme::{composite_color, contrast_ratio, mix_color};
 use data::util::abbr_large_numbers;
-use exchange::adapter::StreamKind;
+use exchange::adapter::{StreamKind, Venue};
 use exchange::unit::{Price, PriceStep, Qty};
-use exchange::{Kline, OpenInterest as OIData, TickerInfo, Trade, UnixMs};
+use exchange::{Kline, OpenInterest as OIData, TickerInfo, Timeframe, Trade, UnixMs};
 
 use iced::task::Handle;
 use iced::theme::palette::Extended;
@@ -32,9 +33,30 @@ use iced::widget::canvas::{self, Event, Geometry, Path, Stroke};
 use iced::{Alignment, Color, Element, Point, Rectangle, Renderer, Size, Theme, Vector, mouse};
 
 use enum_map::EnumMap;
+use rustc_hash::FxHashSet;
 use std::time::Instant;
 
 const MAX_RENKO_SEED_TRADES: usize = 80_000;
+
+struct FootprintHistoryRuntime {
+    sources: Vec<TickerInfo>,
+    aggregate: bool,
+    cutoff: Option<UnixMs>,
+    trade_requests: FxHashSet<uuid::Uuid>,
+    oi_requests: FxHashSet<uuid::Uuid>,
+}
+
+impl FootprintHistoryRuntime {
+    fn new(source: TickerInfo) -> Self {
+        Self {
+            sources: vec![source],
+            aggregate: true,
+            cutoff: None,
+            trade_requests: FxHashSet::default(),
+            oi_requests: FxHashSet::default(),
+        }
+    }
+}
 
 impl Chart for KlineChart {
     type IndicatorKind = KlineIndicator;
@@ -181,6 +203,7 @@ pub struct KlineChart {
     /// OHLC bars used to seed TPO letters (Sierra/Quantower-style high–low).
     tpo_klines: Box<KlineAggregator>,
     indicators: EnumMap<KlineIndicator, Option<Box<dyn KlineIndicatorImpl>>>,
+    footprint_history: Box<FootprintHistoryRuntime>,
     fetching_trades: (bool, Option<Handle>),
     /// Renko: trade seed done. TPO: multi-day bar history done.
     trade_history_loaded: bool,
@@ -285,6 +308,9 @@ impl KlineChart {
                         continue;
                     }
                     let mut indi = indicator::kline::make_empty(i);
+                    if i == KlineIndicator::FootprintHistory {
+                        indi.configure_footprint_history(&[ticker_info], true);
+                    }
                     indi.rebuild_from_source(&data_source);
                     indicators[i] = Some(indi);
                 }
@@ -299,6 +325,7 @@ impl KlineChart {
                     renko_seed_trades: Vec::new(),
                     renko_seed_cutoff: None,
                     indicators,
+                    footprint_history: Box::new(FootprintHistoryRuntime::new(ticker_info)),
                     fetching_trades: (false, None),
                     trade_history_loaded: false,
                     request_handler: RequestHandler::default(),
@@ -366,6 +393,9 @@ impl KlineChart {
                         continue;
                     }
                     let mut indi = indicator::kline::make_empty(i);
+                    if i == KlineIndicator::FootprintHistory {
+                        indi.configure_footprint_history(&[ticker_info], true);
+                    }
                     indi.rebuild_from_source(&data_source);
                     indicators[i] = Some(indi);
                 }
@@ -380,6 +410,7 @@ impl KlineChart {
                     renko_seed_cutoff: None,
                     tpo_klines: Box::new(tpo_klines),
                     indicators,
+                    footprint_history: Box::new(FootprintHistoryRuntime::new(ticker_info)),
                     fetching_trades: (false, None),
                     trade_history_loaded: false,
                     request_handler: RequestHandler::default(),
@@ -404,6 +435,37 @@ impl KlineChart {
         &self.feed
     }
 
+    pub fn configure_footprint_history(&mut self, sources: Vec<TickerInfo>, aggregate: bool) {
+        if sources.is_empty() {
+            return;
+        }
+        self.footprint_history.sources = sources;
+        self.footprint_history.aggregate = aggregate;
+        if let Some(indicator) = self.indicators[KlineIndicator::FootprintHistory].as_mut() {
+            indicator.configure_footprint_history(
+                &self.footprint_history.sources,
+                self.footprint_history.aggregate,
+            );
+        }
+        self.invalidate(Some(Instant::now()));
+    }
+
+    pub fn footprint_history_sources(&self) -> &[TickerInfo] {
+        &self.footprint_history.sources
+    }
+
+    pub fn footprint_history_aggregate(&self) -> bool {
+        self.footprint_history.aggregate
+    }
+
+    fn active_footprint_history_sources(&self) -> &[TickerInfo] {
+        if self.footprint_history.aggregate {
+            &self.footprint_history.sources
+        } else {
+            self.footprint_history.sources.get(..1).unwrap_or(&[])
+        }
+    }
+
     pub fn update_latest_kline(&mut self, kline: &Kline) {
         match self.data_source {
             PlotData::TimeBased(ref mut timeseries) => {
@@ -426,11 +488,80 @@ impl KlineChart {
         }
     }
 
+    fn fetch_footprint_history(&mut self) -> Option<Action> {
+        self.indicators[KlineIndicator::FootprintHistory].as_ref()?;
+
+        let cutoff = *self
+            .footprint_history
+            .cutoff
+            .get_or_insert_with(UnixMs::now);
+        let today = cutoff.as_u64() / (24 * 60 * 60 * 1_000) * (24 * 60 * 60 * 1_000);
+        let from = UnixMs::new(today.saturating_sub(2 * 24 * 60 * 60 * 1_000));
+        let sources = self.active_footprint_history_sources().to_vec();
+        let fetch_mode = trade_fetch_mode();
+        let mut specs = Vec::new();
+
+        for source in sources {
+            let trade_history_available = match fetch_mode {
+                TradeFetchMode::Off => false,
+                TradeFetchMode::Exchange => source.exchange().venue() == Venue::Binance,
+                TradeFetchMode::Server => true,
+            };
+            if trade_history_available {
+                let range = FetchRange::FootprintHistoryTrades(from, cutoff);
+                let stream = StreamKind::Trades {
+                    ticker_info: source,
+                };
+                if let Ok(Some(req_id)) = self.request_handler.add_request(range, Some(stream)) {
+                    self.footprint_history.trade_requests.insert(req_id);
+                    if let Some(indicator) =
+                        self.indicators[KlineIndicator::FootprintHistory].as_mut()
+                    {
+                        indicator.prepare_footprint_history(source, cutoff);
+                    }
+                    specs.push(FetchSpec {
+                        req_id,
+                        fetch: range,
+                        stream: Some(stream),
+                    });
+                }
+            }
+
+            if matches!(source.exchange().venue(), Venue::Binance | Venue::Bybit)
+                && source.is_perps()
+            {
+                let range = FetchRange::FootprintHistoryOpenInterest(from, cutoff);
+                let stream = StreamKind::Kline {
+                    ticker_info: source,
+                    timeframe: Timeframe::H1,
+                };
+                if let Ok(Some(req_id)) = self.request_handler.add_request(range, Some(stream)) {
+                    self.footprint_history.oi_requests.insert(req_id);
+                    specs.push(FetchSpec {
+                        req_id,
+                        fetch: range,
+                        stream: Some(stream),
+                    });
+                }
+            }
+        }
+
+        (!specs.is_empty()).then_some(Action::RequestFetch(specs))
+    }
+
     pub fn kind(&self) -> &KlineChartKind {
         &self.kind
     }
 
     fn fetch_missing_data(&mut self) -> Option<Action> {
+        let can_fetch_footprint_history = match &self.data_source {
+            PlotData::TimeBased(timeseries) => !timeseries.datapoints.is_empty(),
+            PlotData::TickBased(_) => true,
+        };
+        if can_fetch_footprint_history && let Some(action) = self.fetch_footprint_history() {
+            return Some(action);
+        }
+
         match &self.data_source {
             PlotData::TimeBased(timeseries) => {
                 let timeframe_ms = timeseries.interval.to_milliseconds();
@@ -609,6 +740,11 @@ impl KlineChart {
     /// Finish a successful trade-history fetch that did not already finalize
     /// via an `is_batches_done` data page (footprint gap fills often end this way).
     pub fn finalize_trade_fetch(&mut self, req_id: uuid::Uuid) {
+        if self.footprint_history.trade_requests.remove(&req_id) {
+            self.request_handler.mark_completed(req_id);
+            self.invalidate(Some(Instant::now()));
+            return;
+        }
         self.fetching_trades = (false, None);
         self.request_handler.mark_completed(req_id);
         // Renko/TPO only seed once; without this flag the chart re-requests the
@@ -927,7 +1063,32 @@ impl KlineChart {
         self.invalidate(None);
     }
 
-    pub fn insert_trades(&mut self, buffer: &[Trade]) {
+    pub fn insert_trades(&mut self, source: TickerInfo, buffer: &[Trade]) {
+        if let Some(indicator) = self.indicators[KlineIndicator::FootprintHistory].as_mut() {
+            indicator.on_source_trades(source, buffer, false);
+        }
+
+        let source_is_primary = source.ticker.same_market(&self.chart.ticker_info.ticker);
+        let source_is_feed = self
+            .feed
+            .sources()
+            .iter()
+            .any(|candidate| candidate.ticker.same_market(&source.ticker));
+        let main_uses_trades = matches!(
+            self.kind,
+            KlineChartKind::Footprint { .. }
+                | KlineChartKind::Renko { .. }
+                | KlineChartKind::Tpo { .. }
+        ) || matches!(self.data_source, PlotData::TickBased(_));
+        let main_accepts_source = if matches!(self.kind, KlineChartKind::Tpo { .. }) {
+            source_is_feed
+        } else {
+            source_is_primary
+        };
+        if !main_uses_trades || !main_accepts_source {
+            return;
+        }
+
         // Live stream can run for hours — keep a hard ceiling so TPO/Renko
         // rebuilds and re-seeds never OOM from unbounded raw trade retention.
         const MAX_LIVE_RAW_TRADES: usize = 80_000;
@@ -971,10 +1132,22 @@ impl KlineChart {
 
     pub fn insert_raw_trades(
         &mut self,
+        source: TickerInfo,
         raw_trades: Vec<Trade>,
         is_batches_done: bool,
         req_id: Option<uuid::Uuid>,
     ) {
+        if req_id.is_some_and(|id| self.footprint_history.trade_requests.contains(&id)) {
+            if let Some(indicator) = self.indicators[KlineIndicator::FootprintHistory].as_mut() {
+                indicator.on_source_trades(source, &raw_trades, true);
+            }
+            if is_batches_done && let Some(req_id) = req_id {
+                self.request_handler.mark_completed(req_id);
+            }
+            self.invalidate(None);
+            return;
+        }
+
         let is_renko = matches!(
             &self.data_source,
             PlotData::TickBased(tick_aggr) if tick_aggr.is_renko()
@@ -1087,7 +1260,7 @@ impl KlineChart {
             }
 
             // Redraw on completion, or lightly while seeding so the UI stays alive.
-            if is_batches_done || self.raw_trades.len() % 20_000 == 0 {
+            if is_batches_done || self.raw_trades.len().is_multiple_of(20_000) {
                 self.invalidate(Some(Instant::now()));
             }
             return;
@@ -1208,7 +1381,30 @@ impl KlineChart {
         matches!(&self.kind, KlineChartKind::Tpo { config } if config.letter_timeframe() == timeframe)
     }
 
-    pub fn insert_open_interest(&mut self, req_id: Option<uuid::Uuid>, oi_data: &[OIData]) {
+    pub fn insert_open_interest(
+        &mut self,
+        source: TickerInfo,
+        req_id: Option<uuid::Uuid>,
+        oi_data: &[OIData],
+    ) {
+        if req_id.is_some_and(|id| self.footprint_history.oi_requests.contains(&id)) {
+            if let Some(indicator) = self.indicators[KlineIndicator::FootprintHistory].as_mut() {
+                indicator.on_source_open_interest(source, oi_data);
+            }
+            if let Some(req_id) = req_id {
+                if oi_data.is_empty() {
+                    self.request_handler.mark_no_data(req_id);
+                } else {
+                    self.request_handler.mark_completed(req_id);
+                }
+            }
+            self.invalidate(None);
+            return;
+        }
+
+        if !source.ticker.same_market(&self.chart.ticker_info.ticker) {
+            return;
+        }
         if let Some(req_id) = req_id {
             if oi_data.is_empty() {
                 self.request_handler.mark_no_data(req_id);
@@ -1432,6 +1628,14 @@ impl KlineChart {
             self.indicators[indicator] = None;
         } else {
             let mut box_indi = indicator::kline::make_empty(indicator);
+            if indicator == KlineIndicator::FootprintHistory {
+                self.request_handler = RequestHandler::default();
+                self.footprint_history.cutoff = None;
+                box_indi.configure_footprint_history(
+                    &self.footprint_history.sources,
+                    self.footprint_history.aggregate,
+                );
+            }
             box_indi.rebuild_from_source(&self.data_source);
             self.indicators[indicator] = Some(box_indi);
         }
@@ -1813,7 +2017,14 @@ fn draw_tpo_profile(
     // that used to collapse the whole silhouette into a hairline.
     let scale = scaling.max(0.1);
     let min_chart_px = 1.0 / scale;
-    let available_width = (cell_width * 0.92).max(min_chart_px);
+    // Daily profiles use a wide time slot, but retain a compact silhouette so
+    // the extra width becomes a real visual gap instead of wider TPO blocks.
+    let profile_width_fraction = if config.profile_period == TpoProfilePeriod::Day {
+        0.42
+    } else {
+        0.92
+    };
+    let available_width = (cell_width * profile_width_fraction).max(min_chart_px);
     let block_width = (available_width / max_row_count as f32).max(min_chart_px * 0.5);
     if !block_width.is_finite() || block_width <= 0.0 {
         return;

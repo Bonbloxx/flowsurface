@@ -971,6 +971,7 @@ impl Dashboard {
                 req_id,
                 until_time,
             } => {
+                let source = stream_type.ticker_info();
                 if batch.is_empty() {
                     if let Some(pane_state) = self.get_mut_pane_state_by_uuid(main_window, pane_id)
                     {
@@ -990,9 +991,14 @@ impl Dashboard {
                     let last_trade_time = batch.last().map_or(UnixMs::ZERO, |trade| trade.time);
 
                     if last_trade_time < until_time {
-                        if let Err(reason) =
-                            self.insert_fetched_trades(main_window, pane_id, &batch, false, req_id)
-                        {
+                        if let Err(reason) = self.insert_fetched_trades(
+                            main_window,
+                            pane_id,
+                            source,
+                            &batch,
+                            false,
+                            req_id,
+                        ) {
                             return self.handle_error(Some(pane_id), &reason, main_window);
                         }
                     } else {
@@ -1004,6 +1010,7 @@ impl Dashboard {
                         if let Err(reason) = self.insert_fetched_trades(
                             main_window,
                             pane_id,
+                            source,
                             &filtered_batch,
                             true,
                             req_id,
@@ -1030,8 +1037,8 @@ impl Dashboard {
                 if let Some(pane_state) = self.get_mut_pane_state_by_uuid(main_window, pane_id) {
                     pane_state.status = pane::Status::Ready;
 
-                    if let StreamKind::Kline { .. } = stream_type {
-                        pane_state.insert_hist_oi(req_id, &data);
+                    if let StreamKind::Kline { ticker_info, .. } = stream_type {
+                        pane_state.insert_hist_oi(ticker_info, req_id, &data);
                     }
                 }
             }
@@ -1044,6 +1051,7 @@ impl Dashboard {
         &mut self,
         main_window: window::Id,
         pane_id: uuid::Uuid,
+        source: TickerInfo,
         trades: &[Trade],
         is_batches_done: bool,
         req_id: Option<uuid::Uuid>,
@@ -1068,7 +1076,7 @@ impl Dashboard {
         match &mut pane_state.content {
             pane::Content::Kline { chart, .. } => {
                 if let Some(c) = chart {
-                    c.insert_raw_trades(trades.to_owned(), is_batches_done, req_id);
+                    c.insert_raw_trades(source, trades.to_owned(), is_batches_done, req_id);
 
                     if is_batches_done {
                         pane_state.status = pane::Status::Ready;
@@ -1186,7 +1194,7 @@ impl Dashboard {
                         }
                         pane::Content::Kline { chart, .. } => {
                             if let Some(c) = chart {
-                                c.insert_trades(buffer);
+                                c.insert_trades(stream.ticker_info(), buffer);
                             }
                         }
                         pane::Content::TimeAndSales(panel) => {

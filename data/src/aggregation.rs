@@ -1,6 +1,6 @@
 use exchange::{
     Kline, Ticker, TickerInfo, Timeframe, Volume,
-    adapter::{Exchange, StreamKind},
+    adapter::{Exchange, MarketKind, StreamKind, Venue},
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
@@ -26,6 +26,10 @@ impl SourceDefinition {
     pub fn ticker(self) -> Ticker {
         Ticker::new(self.symbol, self.exchange)
     }
+
+    pub fn matches(self, ticker: Ticker) -> bool {
+        self.ticker().same_market(&ticker)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,31 +37,96 @@ pub struct FeedDefinition {
     pub id: AggregateFeedId,
     pub label: &'static str,
     pub sources: &'static [SourceDefinition],
+    /// Shared price-grid precision used by every source combination.
+    pub price_tick_power: i8,
 }
 
 const BTCUSDT_PERPETUAL_SOURCES: &[SourceDefinition] = &[
     SourceDefinition {
         exchange: Exchange::BinanceLinear,
         symbol: "BTCUSDT",
-        label: "Binance",
+        label: "Binance · BTC/USDT",
     },
     SourceDefinition {
         exchange: Exchange::BybitLinear,
         symbol: "BTCUSDT",
-        label: "Bybit",
+        label: "Bybit · BTC/USDT",
     },
     SourceDefinition {
         exchange: Exchange::HyperliquidLinear,
         symbol: "BTC",
-        label: "Hyperliquid",
+        label: "Hyperliquid · BTC/USDC",
     },
 ];
 
 const BTCUSDT_PERPETUAL: FeedDefinition = FeedDefinition {
     id: AggregateFeedId::BtcUsdtPerpetual,
-    label: "BTCUSDT Perpetual",
+    label: "BTC Perpetual",
     sources: BTCUSDT_PERPETUAL_SOURCES,
+    price_tick_power: -1,
 };
+
+/// Resolve equivalent linear perpetuals on Binance, Bybit, and Hyperliquid.
+/// Venue symbols differ (`BTCUSDT` versus Hyperliquid's `BTC`), so matching is
+/// based on the base asset instead of exact ticker text.
+pub fn equivalent_footprint_sources(
+    selected: TickerInfo,
+    candidates: impl IntoIterator<Item = TickerInfo>,
+) -> Vec<TickerInfo> {
+    let Some(base) = canonical_base_asset(selected.ticker) else {
+        return vec![selected];
+    };
+
+    let mut sources = candidates
+        .into_iter()
+        .filter(|candidate| {
+            candidate.market_type() == MarketKind::LinearPerps
+                && matches!(
+                    candidate.exchange().venue(),
+                    Venue::Binance | Venue::Bybit | Venue::Hyperliquid
+                )
+                && canonical_base_asset(candidate.ticker).as_deref() == Some(base.as_str())
+        })
+        .collect::<Vec<_>>();
+
+    if !sources
+        .iter()
+        .any(|source| source.ticker.same_market(&selected.ticker))
+    {
+        sources.push(selected);
+    }
+
+    sources.sort_by_key(|source| {
+        let selected_rank = !source.ticker.same_market(&selected.ticker);
+        let venue_rank = match source.exchange().venue() {
+            Venue::Binance => 0,
+            Venue::Bybit => 1,
+            Venue::Hyperliquid => 2,
+            Venue::Okex | Venue::Mexc => 3,
+        };
+        (selected_rank, venue_rank)
+    });
+    sources.dedup_by(|left, right| left.ticker.same_market(&right.ticker));
+    sources
+}
+
+fn canonical_base_asset(ticker: Ticker) -> Option<String> {
+    let (raw, market) = ticker.to_full_symbol_and_type();
+    if market != MarketKind::LinearPerps {
+        return None;
+    }
+
+    let symbol = raw
+        .rsplit_once(':')
+        .map_or(raw.as_str(), |(_, suffix)| suffix)
+        .to_ascii_uppercase();
+    let base = ["USDT", "USDC", "BUSD", "FDUSD", "USD"]
+        .into_iter()
+        .find_map(|quote| symbol.strip_suffix(quote))
+        .unwrap_or(symbol.as_str());
+
+    (!base.is_empty()).then(|| base.to_string())
+}
 
 impl AggregateFeedId {
     pub fn definition(self) -> &'static FeedDefinition {
@@ -71,7 +140,7 @@ impl AggregateFeedId {
             feed.definition()
                 .sources
                 .iter()
-                .any(|source| source.ticker() == ticker)
+                .any(|source| source.matches(ticker))
         })
     }
 
@@ -86,7 +155,7 @@ impl AggregateFeedId {
         self.definition()
             .sources
             .iter()
-            .find(|source| source.ticker() == ticker)
+            .find(|source| source.matches(ticker))
             .map(|source| source.label)
     }
 }
@@ -119,12 +188,12 @@ impl ResolvedFeed {
         selected: Option<&[Ticker]>,
     ) -> Self {
         let mut available_sources = Vec::new();
-        for wanted in id.source_tickers() {
+        for source in id.definition().sources {
             if let Some(info) = candidates
                 .iter()
                 .copied()
-                .find(|candidate| candidate.ticker == wanted)
-                .or_else(|| (primary.ticker == wanted).then_some(primary))
+                .find(|candidate| source.matches(candidate.ticker))
+                .or_else(|| source.matches(primary.ticker).then_some(primary))
             {
                 available_sources.push(info);
             }
@@ -137,7 +206,13 @@ impl ResolvedFeed {
         let mut sources = available_sources
             .iter()
             .copied()
-            .filter(|source| selected.is_none_or(|wanted| wanted.contains(&source.ticker)))
+            .filter(|source| {
+                selected.is_none_or(|wanted| {
+                    wanted
+                        .iter()
+                        .any(|ticker| ticker.same_market(&source.ticker))
+                })
+            })
             .collect::<Vec<_>>();
 
         if sources.is_empty() {
@@ -167,13 +242,22 @@ impl ResolvedFeed {
         &self.available_sources
     }
 
+    /// Stable base price tick for consumers that combine venue data.
+    /// A logical feed keeps this grid even when only one source is enabled.
+    pub fn price_step(&self) -> exchange::unit::PriceStep {
+        self.id.map_or_else(
+            || self.primary().min_ticksize.into(),
+            |id| exchange::unit::MinTicksize::new(id.definition().price_tick_power).into(),
+        )
+    }
+
     /// Returns the next non-empty source selection in catalog order.
     /// `None` means the requested toggle would disable the final source.
     pub fn toggled_source_tickers(&self, ticker: Ticker, enabled: bool) -> Option<Vec<Ticker>> {
         if !self
             .available_sources
             .iter()
-            .any(|source| source.ticker == ticker)
+            .any(|source| source.ticker.same_market(&ticker))
         {
             return None;
         }
@@ -183,7 +267,7 @@ impl ResolvedFeed {
             .iter()
             .filter_map(|source| {
                 let is_selected = self.sources.contains(source);
-                let keep = if source.ticker == ticker {
+                let keep = if source.ticker.same_market(&ticker) {
                     enabled
                 } else {
                     is_selected
@@ -354,6 +438,14 @@ mod tests {
             definition.sources[2].ticker(),
             Ticker::new("BTC", Exchange::HyperliquidLinear)
         );
+        assert_eq!(
+            AggregateFeedId::for_seed_ticker(Ticker::new_with_display(
+                "BTC",
+                Exchange::HyperliquidLinear,
+                Some("BTCUSDC"),
+            )),
+            Some(AggregateFeedId::BtcUsdtPerpetual)
+        );
         assert!(definition.sources.iter().all(|source| {
             AggregateFeedId::for_seed_ticker(source.ticker())
                 == Some(AggregateFeedId::BtcUsdtPerpetual)
@@ -364,7 +456,12 @@ mod tests {
     fn btc_perpetual_resolves_all_catalog_sources_in_priority_order() {
         let binance = ticker_info(Exchange::BinanceLinear, "BTCUSDT");
         let bybit = ticker_info(Exchange::BybitLinear, "BTCUSDT");
-        let hyperliquid = ticker_info(Exchange::HyperliquidLinear, "BTC");
+        let hyperliquid = TickerInfo::new(
+            Ticker::new_with_display("BTC", Exchange::HyperliquidLinear, Some("BTCUSDC")),
+            0.1,
+            0.001,
+            None,
+        );
 
         let feed = ResolvedFeed::aggregated(
             AggregateFeedId::BtcUsdtPerpetual,
@@ -375,6 +472,18 @@ mod tests {
         assert_eq!(feed.sources(), &[binance, bybit, hyperliquid]);
         assert_eq!(feed.trade_streams().len(), 3);
         assert_eq!(feed.kline_streams(Timeframe::M1).len(), 3);
+    }
+
+    #[test]
+    fn footprint_sources_resolve_selected_symbol_across_venue_symbol_formats() {
+        let binance = ticker_info(Exchange::BinanceLinear, "SOLUSDT");
+        let bybit = ticker_info(Exchange::BybitLinear, "SOLUSDT");
+        let hyperliquid = ticker_info(Exchange::HyperliquidLinear, "SOL");
+        let unrelated = ticker_info(Exchange::BinanceLinear, "BTCUSDT");
+
+        let sources = equivalent_footprint_sources(bybit, [unrelated, hyperliquid, binance, bybit]);
+
+        assert_eq!(sources, vec![bybit, binance, hyperliquid]);
     }
 
     #[test]
@@ -405,6 +514,26 @@ mod tests {
         );
         assert_eq!(bybit_hyperliquid.sources(), &[bybit, hyperliquid]);
         assert_eq!(bybit_hyperliquid.trade_streams().len(), 2);
+
+        let hyperliquid_only = ResolvedFeed::aggregated_selected(
+            AggregateFeedId::BtcUsdtPerpetual,
+            binance,
+            &candidates,
+            Some(&[hyperliquid.ticker]),
+        );
+        let shared_step: exchange::unit::PriceStep = exchange::unit::MinTicksize::new(-1).into();
+        assert_eq!(bybit_only.price_step(), shared_step);
+        assert_eq!(bybit_hyperliquid.price_step(), shared_step);
+        assert_eq!(hyperliquid_only.price_step(), shared_step);
+        assert_eq!(
+            crate::chart::tpo::Config {
+                ticks_per_row: 500,
+                ..crate::chart::tpo::Config::default()
+            }
+            .row_step(hyperliquid_only.price_step())
+            .to_ui_string(),
+            "50"
+        );
     }
 
     #[test]

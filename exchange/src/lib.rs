@@ -359,6 +359,12 @@ impl Ticker {
         }
     }
 
+    /// Whether two ticker values identify the same venue market, ignoring an
+    /// optional display-only symbol alias.
+    pub fn same_market(&self, other: &Self) -> bool {
+        self.exchange == other.exchange && self.as_str() == other.as_str()
+    }
+
     pub fn to_full_symbol_and_type(&self) -> (String, MarketKind) {
         (self.as_str().to_owned(), self.market_type())
     }

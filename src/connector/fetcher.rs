@@ -177,6 +177,10 @@ pub enum FetchRange {
     Kline(UnixMs, UnixMs),
     OpenInterest(UnixMs, UnixMs),
     Trades(UnixMs, UnixMs),
+    /// Three UTC days requested exclusively by the Footprint History indicator.
+    FootprintHistoryTrades(UnixMs, UnixMs),
+    /// Open-interest history requested exclusively by Footprint History.
+    FootprintHistoryOpenInterest(UnixMs, UnixMs),
     /// A trade window where the newest contiguous data is more important than
     /// starting exactly at the requested lower bound (for example, Renko seed).
     TradesRecent(UnixMs, UnixMs),
@@ -210,6 +214,14 @@ impl FetchRequest {
                 e1 == e2 && s1 == s2
             }
             (FetchRange::Trades(s1, e1), FetchRange::Trades(s2, e2)) => e1 == e2 && s1 == s2,
+            (
+                FetchRange::FootprintHistoryTrades(s1, e1),
+                FetchRange::FootprintHistoryTrades(s2, e2),
+            ) => e1 == e2 && s1 == s2,
+            (
+                FetchRange::FootprintHistoryOpenInterest(s1, e1),
+                FetchRange::FootprintHistoryOpenInterest(s2, e2),
+            ) => e1 == e2 && s1 == s2,
             (FetchRange::TradesRecent(s1, e1), FetchRange::TradesRecent(s2, e2)) => {
                 e1 == e2 && s1 == s2
             }
@@ -326,7 +338,7 @@ pub fn request_fetch(
                 );
             }
         }
-        FetchRange::OpenInterest(from, to) => {
+        FetchRange::OpenInterest(from, to) | FetchRange::FootprintHistoryOpenInterest(from, to) => {
             let kline_stream = if let Some(s) = stream {
                 Some((s, pane_id))
             } else {
@@ -350,7 +362,9 @@ pub fn request_fetch(
                 );
             }
         }
-        FetchRange::Trades(from_time, to_time) | FetchRange::TradesRecent(from_time, to_time) => {
+        FetchRange::Trades(from_time, to_time)
+        | FetchRange::FootprintHistoryTrades(from_time, to_time)
+        | FetchRange::TradesRecent(from_time, to_time) => {
             let recent_first = matches!(fetch, FetchRange::TradesRecent(..));
             let trade_info = ready_streams.iter().find_map(|stream| {
                 if let StreamKind::Trades { ticker_info } = stream {

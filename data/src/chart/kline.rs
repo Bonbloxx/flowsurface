@@ -342,6 +342,9 @@ pub enum KlineChartKind {
 
 impl KlineChartKind {
     pub fn allows_indicator(&self, indicator: KlineIndicator) -> bool {
+        if indicator == KlineIndicator::FootprintHistory {
+            return true;
+        }
         !matches!(
             (self, indicator),
             (
@@ -405,7 +408,13 @@ impl KlineChartKind {
     pub fn default_cell_width(&self) -> f32 {
         match self {
             KlineChartKind::Footprint { .. } => 80.0,
-            // Reference-style: several day profiles visible without endless panning.
+            // Give each daily profile a wide time slot so neighboring Market
+            // Profiles remain visually distinct, as on reference TPO charts.
+            KlineChartKind::Tpo { config }
+                if config.profile_period == super::tpo::ProfilePeriod::Day =>
+            {
+                160.0
+            }
             KlineChartKind::Tpo { .. } => 72.0,
             KlineChartKind::Candles | KlineChartKind::Renko { .. } => 4.0,
         }

@@ -11,6 +11,7 @@ use super::plot::AnySeries;
 
 pub mod bar_analysis;
 pub mod cumulative_delta;
+pub mod footprint_history;
 pub mod open_interest;
 pub mod volume;
 
@@ -122,6 +123,30 @@ pub trait KlineIndicatorImpl {
     fn on_basis_change(&mut self, _source: &PlotData<KlineDataPoint>) {}
 
     fn on_open_interest(&mut self, _pairs: &[exchange::OpenInterest]) {}
+
+    /// Configure the independent Footprint History venue set.
+    fn configure_footprint_history(&mut self, _sources: &[exchange::TickerInfo], _aggregate: bool) {
+    }
+
+    /// Set the historical/live boundary before a source backfill begins.
+    fn prepare_footprint_history(&mut self, _source: exchange::TickerInfo, _cutoff: UnixMs) {}
+
+    /// Source-aware trades used only by Footprint History.
+    fn on_source_trades(
+        &mut self,
+        _source: exchange::TickerInfo,
+        _trades: &[Trade],
+        _historical: bool,
+    ) {
+    }
+
+    /// Source-aware open interest used only by Footprint History.
+    fn on_source_open_interest(
+        &mut self,
+        _source: exchange::TickerInfo,
+        _values: &[exchange::OpenInterest],
+    ) {
+    }
 }
 
 pub struct FetchCtx<'a> {
@@ -143,6 +168,9 @@ pub fn make_empty(which: KlineIndicator) -> Box<dyn KlineIndicatorImpl> {
         }
         KlineIndicator::OpenInterest => {
             Box::new(super::kline::open_interest::OpenInterestIndicator::new())
+        }
+        KlineIndicator::FootprintHistory => {
+            Box::new(super::kline::footprint_history::FootprintHistoryIndicator::new())
         }
     }
 }
