@@ -172,7 +172,9 @@ pub struct Config {
 }
 
 impl Config {
-    pub const TICKS_PER_ROW_PRESETS: [u32; 10] = [1, 2, 4, 5, 10, 20, 25, 50, 100, 200];
+    pub const TICKS_PER_ROW_PRESETS: [u32; 18] = [
+        1, 2, 4, 5, 10, 20, 25, 50, 60, 100, 200, 250, 500, 600, 1_000, 2_000, 5_000, 10_000,
+    ];
     pub const VALUE_AREA_PRESETS: [u8; 7] = [50, 60, 68, 70, 75, 80, 90];
     pub const INITIAL_BALANCE_PRESETS: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
     /// How many completed/developing profiles to keep (bar-seeded history).
@@ -374,7 +376,14 @@ impl Profile {
 
     /// Apply a trade without recomputing POC / value area / IB.
     pub fn apply_trade(&mut self, config: Config, row_step: PriceStep, trade: &Trade) {
-        self.apply_price_print(config, row_step, trade.time, trade.price, trade.price, trade.price);
+        self.apply_price_print(
+            config,
+            row_step,
+            trade.time,
+            trade.price,
+            trade.price,
+            trade.price,
+        );
     }
 
     /// Sierra/Quantower-style letter construction from a time bar.
@@ -384,12 +393,7 @@ impl Profile {
     /// sub-period). Volume is intentionally unused — TPO is time-at-price.
     pub fn apply_kline(&mut self, config: Config, row_step: PriceStep, kline: &Kline) {
         self.apply_price_print(
-            config,
-            row_step,
-            kline.time,
-            kline.open,
-            kline.low,
-            kline.high,
+            config, row_step, kline.time, kline.open, kline.low, kline.high,
         );
         // Close tracks the last bar's close (developing session last trade proxy).
         if kline.time >= self.last_time {
@@ -603,19 +607,14 @@ impl Profile {
         self.initial_balance_high = price_to_row(ib_high.unwrap_or(high), row_step);
     }
 
-    /// True when `price` is a single-print excess tail row.
+    /// True when `price` is an interior single-print row.
     ///
-    /// Market Profile singles (excess) are unfinished auctions at the extremes:
-    /// a continuous run of one-TPO rows from the session high or low until the
-    /// first multi-TPO row. Interior single-TPO rows are not treated as excess,
-    /// and a developing one-letter profile (no multi-TPO body yet) is not
-    /// painted entirely as singles.
+    /// Single prints are one-TPO rows surrounded by profile structure. A
+    /// continuous one-TPO run connected to the profile high or low is excess
+    /// (a buying/selling tail), not an interior single print. A developing
+    /// one-letter profile therefore does not paint every row as a single.
     pub fn is_single_print(&self, price: Price) -> bool {
         if self.rows.get(&price).is_none_or(|row| row.count() != 1) {
-            return false;
-        }
-        // Need a multi-TPO body so excess has something to be "excess of".
-        if !self.rows.values().any(|row| row.count() > 1) {
             return false;
         }
 
@@ -625,21 +624,27 @@ impl Profile {
         };
         let is_single = |idx: usize| self.rows[&prices[idx]].count() == 1;
 
-        // Selling excess: contiguous singles from this row up to the high.
-        let top_excess = (index..prices.len()).all(is_single);
-        // Buying excess: contiguous singles from the low up to this row.
-        let bottom_excess = (0..=index).all(is_single);
-        top_excess || bottom_excess
+        let connected_to_high = (index..prices.len()).all(is_single);
+        let connected_to_low = (0..=index).all(is_single);
+        !connected_to_high && !connected_to_low
     }
 }
 
-/// Map a raw price onto its TPO row using floor-to-step grouping.
+/// Map a raw price onto its nearest TPO row increment.
 ///
-/// Each price belongs to exactly one row (Sierra Chart letter/block price
-/// increment). Using floor for both the low and high of a bracket avoids the
-/// off-by-one expansion that floor+ceil causes for prices not on the grid.
+/// Sierra Chart rounds underlying prices to the nearest multiple of the
+/// configured letter/block price increment. Half-step prices round upward.
 pub fn price_to_row(price: Price, row_step: PriceStep) -> Price {
-    price.round_to_side_step(true, row_step)
+    if row_step.units <= 0 {
+        return price;
+    }
+
+    let rounded_units = price
+        .units
+        .saturating_add(row_step.units / 2)
+        .div_euclid(row_step.units)
+        .saturating_mul(row_step.units);
+    Price::from_units(rounded_units)
 }
 
 pub fn block_letter(index: u16) -> char {
@@ -853,12 +858,12 @@ mod tests {
     }
 
     #[test]
-    fn each_price_maps_to_exactly_one_row() {
+    fn each_price_maps_to_the_nearest_row() {
         let step = dollar_step();
-        // Off-grid prices must not expand into two rows.
-        assert_eq!(price_to_row(dollar(100.5), step), dollar(100.0));
+        assert_eq!(price_to_row(dollar(100.49), step), dollar(100.0));
+        assert_eq!(price_to_row(dollar(100.5), step), dollar(101.0));
         assert_eq!(price_to_row(dollar(100.0), step), dollar(100.0));
-        assert_eq!(price_to_row(dollar(100.99), step), dollar(100.0));
+        assert_eq!(price_to_row(dollar(100.99), step), dollar(101.0));
 
         let config = Config {
             profile_period: ProfilePeriod::Hour,
@@ -874,12 +879,12 @@ mod tests {
         };
         let profile = Profile::new(config, step, &trade);
         assert_eq!(profile.rows.len(), 1);
-        assert!(profile.rows.contains_key(&dollar(100.0)));
-        assert!(!profile.rows.contains_key(&dollar(101.0)));
+        assert!(!profile.rows.contains_key(&dollar(100.0)));
+        assert!(profile.rows.contains_key(&dollar(101.0)));
     }
 
     #[test]
-    fn bracket_range_fills_inclusive_floor_rows_only() {
+    fn bracket_range_fills_inclusive_nearest_rows_only() {
         let config = Config {
             profile_period: ProfilePeriod::Hour,
             block_size: BlockSize::Minutes30,
@@ -908,25 +913,26 @@ mod tests {
             },
         );
 
-        // floor(100.1)=100, floor(102.9)=102 → rows 100, 101, 102 only.
+        // nearest(100.1)=100, nearest(102.9)=103 -> rows 100 through 103.
         assert_eq!(
             profile.rows.keys().copied().collect::<Vec<_>>(),
-            vec![dollar(100.0), dollar(101.0), dollar(102.0)]
+            vec![dollar(100.0), dollar(101.0), dollar(102.0), dollar(103.0)]
         );
     }
 
     #[test]
-    fn single_prints_are_excess_tails_not_every_lonely_row() {
+    fn single_prints_are_interior_one_tpo_rows_not_excess_tails() {
         let mut profile = Profile {
             start: UnixMs::new(0),
             end: UnixMs::new(86_400_000),
             rows: BTreeMap::from([
-                (dollar(98.0), row(&[0])),       // bottom excess
-                (dollar(99.0), row(&[0])),       // bottom excess
+                (dollar(98.0), row(&[0])),        // bottom excess
+                (dollar(99.0), row(&[0])),        // bottom excess
                 (dollar(100.0), row(&[0, 1, 2])), // body
-                (dollar(101.0), row(&[0, 1])),   // body
-                (dollar(102.0), row(&[2])),      // top excess
-                (dollar(103.0), row(&[2])),      // top excess
+                (dollar(101.0), row(&[2])),       // interior single
+                (dollar(102.0), row(&[0, 1])),    // body
+                (dollar(103.0), row(&[2])),       // top excess
+                (dollar(104.0), row(&[2])),       // top excess
             ]),
             brackets: BTreeMap::new(),
             poc: dollar(0.0),
@@ -942,12 +948,13 @@ mod tests {
         };
         profile.recalculate(Config::default(), dollar_step());
 
-        assert!(profile.is_single_print(dollar(98.0)));
-        assert!(profile.is_single_print(dollar(99.0)));
+        assert!(!profile.is_single_print(dollar(98.0)));
+        assert!(!profile.is_single_print(dollar(99.0)));
         assert!(!profile.is_single_print(dollar(100.0)));
-        assert!(!profile.is_single_print(dollar(101.0)));
-        assert!(profile.is_single_print(dollar(102.0)));
-        assert!(profile.is_single_print(dollar(103.0)));
+        assert!(profile.is_single_print(dollar(101.0)));
+        assert!(!profile.is_single_print(dollar(102.0)));
+        assert!(!profile.is_single_print(dollar(103.0)));
+        assert!(!profile.is_single_print(dollar(104.0)));
     }
 
     #[test]
@@ -980,9 +987,14 @@ mod tests {
             },
         );
 
-        // One letter only → every row has count 1, but there is no multi-TPO
-        // body yet, so nothing is flagged as excess.
+        // One letter only -> every row is connected to an extreme, so nothing
+        // is flagged as an interior single print.
         assert!(profile.rows.values().all(|row| row.count() == 1));
-        assert!(profile.rows.keys().all(|price| !profile.is_single_print(*price)));
+        assert!(
+            profile
+                .rows
+                .keys()
+                .all(|price| !profile.is_single_print(*price))
+        );
     }
 }

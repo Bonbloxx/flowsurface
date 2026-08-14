@@ -109,7 +109,14 @@ impl From<&Dashboard> for data::Dashboard {
 
 impl From<&pane::State> for data::Pane {
     fn from(pane: &pane::State) -> Self {
-        let streams = pane.streams.clone().into_waiting();
+        let streams = if pane.content.kind().supports_aggregate_feed() {
+            pane.settings.aggregate_feed.map_or_else(
+                || pane.streams.clone().into_waiting(),
+                |feed| vec![data::stream::PersistStreamKind::AggregateTrades { feed }],
+            )
+        } else {
+            pane.streams.clone().into_waiting()
+        };
 
         match &pane.content {
             pane::Content::Starter => data::Pane::Starter {

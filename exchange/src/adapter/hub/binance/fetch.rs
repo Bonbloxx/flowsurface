@@ -550,6 +550,7 @@ async fn fetch_intraday_trades(
     hub: &mut HttpHub<BinanceLimiter>,
     ticker_info: TickerInfo,
     from: UnixMs,
+    to: Option<UnixMs>,
 ) -> Result<Vec<Trade>, AdapterError> {
     let ticker = ticker_info.ticker;
     let (symbol_str, market_type) = ticker.to_full_symbol_and_type();
@@ -561,7 +562,13 @@ async fn fetch_intraday_trades(
     };
 
     let mut url = format!("{base_url}?symbol={symbol_str}&limit=1000");
-    url.push_str(&format!("&startTime={}", from.as_u64()));
+    if let Some(to) = to {
+        // Supplying only endTime asks Binance for the newest page ending at
+        // this cursor. This lets callers page backward from the live edge.
+        url.push_str(&format!("&endTime={}", to.as_u64()));
+    } else {
+        url.push_str(&format!("&startTime={}", from.as_u64()));
+    }
 
     let de_trades: Vec<DeTrade> = hub.http_json_with_limiter(&url, weight, None, None).await?;
 
@@ -749,6 +756,7 @@ pub(super) async fn fetch_trades(
     hub: &mut HttpHub<BinanceLimiter>,
     ticker_info: TickerInfo,
     from_time: UnixMs,
+    to_time: Option<UnixMs>,
     data_path: Option<PathBuf>,
 ) -> Result<Vec<Trade>, AdapterError> {
     let Some(data_path) = data_path else {
@@ -756,6 +764,10 @@ pub(super) async fn fetch_trades(
             "Binance trades fetch requires data_path".to_string(),
         ));
     };
+
+    if to_time.is_some() {
+        return fetch_intraday_trades(hub, ticker_info, from_time, to_time).await;
+    }
 
     let today_date = chrono::Utc::now().date_naive();
     let today_midnight = today_date
@@ -769,7 +781,7 @@ pub(super) async fn fetch_trades(
         .map_err(|_| AdapterError::InvalidRequest("Timestamp exceeds i64 range".to_string()))?;
 
     if from_time_ms >= today_midnight.timestamp_millis() {
-        return fetch_intraday_trades(hub, ticker_info, from_time).await;
+        return fetch_intraday_trades(hub, ticker_info, from_time, None).await;
     }
 
     let mut cursor_time = from_time;
@@ -803,9 +815,7 @@ pub(super) async fn fetch_trades(
                 // Archive day fully behind the cursor — advance to next midnight.
             }
             Err(e) => {
-                log::warn!(
-                    "Historical trades unavailable for {cursor_date}: {e}; skipping day"
-                );
+                log::warn!("Historical trades unavailable for {cursor_date}: {e}; skipping day");
             }
         }
 
@@ -820,5 +830,5 @@ pub(super) async fn fetch_trades(
         cursor_time = UnixMs::new(u64::try_from(next_midnight_ms).unwrap_or(u64::MAX));
     }
 
-    fetch_intraday_trades(hub, ticker_info, cursor_time).await
+    fetch_intraday_trades(hub, ticker_info, cursor_time, None).await
 }

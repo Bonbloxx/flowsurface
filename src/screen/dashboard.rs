@@ -819,6 +819,21 @@ impl Dashboard {
         ticker_info: TickerInfo,
         content_kind: ContentKind,
     ) -> Task<Message> {
+        self.init_focused_pane_with_sources(handles, main_window, vec![ticker_info], content_kind)
+    }
+
+    pub fn init_focused_pane_with_sources(
+        &mut self,
+        handles: &AdapterHandles,
+        main_window: window::Id,
+        ticker_infos: Vec<TickerInfo>,
+        content_kind: ContentKind,
+    ) -> Task<Message> {
+        let Some(&ticker_info) = ticker_infos.first() else {
+            return Task::done(Message::Notification(Toast::warn(
+                "No market-data source found".to_string(),
+            )));
+        };
         if self.focus.is_none()
             && self.panes.len() == 1
             && let Some((pane_id, _)) = self.panes.iter().next()
@@ -856,7 +871,7 @@ impl Dashboard {
             state.link_group = None;
         }
 
-        let streams = state.set_content_and_streams(vec![ticker_info], content_kind);
+        let streams = state.set_content_and_streams(ticker_infos, content_kind);
 
         if let Some((_, studies, clusters)) = &synced {
             state.apply_synced_settings(studies, clusters);

@@ -246,7 +246,8 @@ impl TickAggr {
                     accumulation.kline.time = profile_start;
                     accumulation.kline.high = kline.high;
                     accumulation.kline.low = kline.low;
-                    accumulation.tpo = Some(TpoProfile::empty_at(config, profile_start, kline.open));
+                    accumulation.tpo =
+                        Some(TpoProfile::empty_at(config, profile_start, kline.open));
                     self.datapoints.insert(index, accumulation);
                     index
                 }
@@ -255,9 +256,7 @@ impl TickAggr {
             let accumulation = &mut self.datapoints[index];
             accumulation.kline.high = accumulation.kline.high.max(kline.high);
             accumulation.kline.low = accumulation.kline.low.min(kline.low);
-            if kline.time >= accumulation.kline.time
-                || accumulation.tick_count == 0
-            {
+            if kline.time >= accumulation.kline.time || accumulation.tick_count == 0 {
                 // Keep envelope OHLC; profile owns session open/close semantics.
             }
             if let Some(profile) = accumulation.tpo.as_mut() {
@@ -958,7 +957,10 @@ mod tests {
         let profile = aggr.datapoints[0].tpo.as_ref().expect("profile");
         // Multiple letters present on the value area.
         let max_count = profile.rows.values().map(|r| r.count()).max().unwrap_or(0);
-        assert!(max_count >= 3, "expected multi-letter rows, max={max_count}");
+        assert!(
+            max_count >= 3,
+            "expected multi-letter rows, max={max_count}"
+        );
         assert!(profile.total_tpos > 20);
     }
 
@@ -1050,7 +1052,7 @@ mod tests {
         let aggr = TickAggr::new_tpo(config, step, &[trade(0, 100.5)]);
         let profile = aggr.datapoints[0].tpo.as_ref().expect("TPO profile");
         assert_eq!(profile.rows.len(), 1);
-        assert!(profile.rows.contains_key(&Price::from_f64(100.0)));
+        assert!(profile.rows.contains_key(&Price::from_f64(101.0)));
     }
 
     #[test]

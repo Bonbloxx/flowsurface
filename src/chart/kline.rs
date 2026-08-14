@@ -8,6 +8,7 @@ use crate::connector::fetcher::{FetchRange, RequestHandler};
 use crate::{modal::pane::settings::study, style};
 use data::aggr::ticks::TickAggr;
 use data::aggr::time::TimeSeries;
+use data::aggregation::{KlineAggregator, ResolvedFeed};
 use data::chart::indicator::{Indicator, KlineIndicator};
 use data::chart::kline::{
     ClusterKind, ClusterScaling, Config, FootprintStudy, FootprintSummary, KlineDataPoint,
@@ -32,6 +33,8 @@ use iced::{Alignment, Color, Element, Point, Rectangle, Renderer, Size, Theme, V
 
 use enum_map::EnumMap;
 use std::time::Instant;
+
+const MAX_RENKO_SEED_TRADES: usize = 80_000;
 
 impl Chart for KlineChart {
     type IndicatorKind = KlineIndicator;
@@ -168,10 +171,15 @@ impl PlotConstants for KlineChart {
 
 pub struct KlineChart {
     chart: ViewState,
+    feed: Box<ResolvedFeed>,
     data_source: PlotData<KlineDataPoint>,
     raw_trades: Vec<Trade>,
+    /// Historical trades are buffered separately because they arrive after
+    /// live WebSocket trades and Renko construction must be chronological.
+    renko_seed_trades: Vec<Trade>,
+    renko_seed_cutoff: Option<UnixMs>,
     /// OHLC bars used to seed TPO letters (Sierra/Quantower-style high–low).
-    tpo_klines: Vec<Kline>,
+    tpo_klines: Box<KlineAggregator>,
     indicators: EnumMap<KlineIndicator, Option<Box<dyn KlineIndicatorImpl>>>,
     fetching_trades: (bool, Option<Handle>),
     /// Renko: trade seed done. TPO: multi-day bar history done.
@@ -197,6 +205,7 @@ impl KlineChart {
     ) -> Self {
         let visual_config = visual_config.unwrap_or_default();
         let kind = kind.clone();
+        let feed = ResolvedFeed::direct(ticker_info);
         let basis = if matches!(
             kind,
             KlineChartKind::Renko { .. } | KlineChartKind::Tpo { .. }
@@ -282,10 +291,13 @@ impl KlineChart {
 
                 KlineChart {
                     chart,
+                    tpo_klines: Box::new(KlineAggregator::new(&feed)),
+                    feed: Box::new(feed),
                     visual_config,
                     data_source,
                     raw_trades,
-                    tpo_klines: Vec::new(),
+                    renko_seed_trades: Vec::new(),
+                    renko_seed_cutoff: None,
                     indicators,
                     fetching_trades: (false, None),
                     trade_history_loaded: false,
@@ -332,18 +344,18 @@ impl KlineChart {
                 };
                 chart.translation.x = x_translation;
 
-                let tpo_klines = if matches!(kind, KlineChartKind::Tpo { .. }) {
-                    klines_raw.to_vec()
-                } else {
-                    Vec::new()
-                };
+                let mut tpo_klines = KlineAggregator::new(&feed);
+                if matches!(kind, KlineChartKind::Tpo { .. }) {
+                    tpo_klines.insert(feed.primary(), klines_raw);
+                }
+                let composite_tpo_klines = tpo_klines.composite_klines();
 
                 let data_source = PlotData::TickBased(match &kind {
                     KlineChartKind::Renko { config } => {
                         TickAggr::new_renko(*config, step, &raw_trades)
                     }
                     KlineChartKind::Tpo { config } => {
-                        TickAggr::new_tpo_seeded(*config, step, &tpo_klines, &raw_trades)
+                        TickAggr::new_tpo_seeded(*config, step, &composite_tpo_klines, &raw_trades)
                     }
                     _ => TickAggr::new(interval, step, &[]),
                 });
@@ -360,10 +372,13 @@ impl KlineChart {
 
                 KlineChart {
                     chart,
+                    feed: Box::new(feed),
                     visual_config,
                     data_source,
                     raw_trades,
-                    tpo_klines,
+                    renko_seed_trades: Vec::new(),
+                    renko_seed_cutoff: None,
+                    tpo_klines: Box::new(tpo_klines),
                     indicators,
                     fetching_trades: (false, None),
                     trade_history_loaded: false,
@@ -374,6 +389,19 @@ impl KlineChart {
                 }
             }
         }
+    }
+
+    pub fn set_feed(&mut self, feed: ResolvedFeed) {
+        let existing = self.tpo_klines.composite_klines();
+        let mut tpo_klines = KlineAggregator::new(&feed);
+        tpo_klines.insert(feed.primary(), &existing);
+        self.chart.ticker_info = feed.primary();
+        *self.feed = feed;
+        *self.tpo_klines = tpo_klines;
+    }
+
+    pub fn feed(&self) -> &ResolvedFeed {
+        &self.feed
     }
 
     pub fn update_latest_kline(&mut self, kline: &Kline) {
@@ -493,49 +521,55 @@ impl KlineChart {
             PlotData::TickBased(tick_aggr) => {
                 // TPO history: exchange OHLC bars (Sierra/Quantower), not raw trades.
                 // 60 days of 30m letters ≈ a few thousand bars — cheap and stable.
-                if tick_aggr.is_tpo() && !self.trade_history_loaded {
-                    if let KlineChartKind::Tpo { config } = &self.kind {
-                        let letter_tf = config.letter_timeframe();
-                        let latest = UnixMs::now();
-                        let need_earliest =
-                            latest.saturating_sub(config.history_range_ms());
-                        let have_earliest = self
-                            .tpo_klines
-                            .first()
-                            .map(|k| k.time)
-                            .or_else(|| {
-                                tick_aggr
-                                    .datapoints
-                                    .first()
-                                    .map(|dp| dp.kline.time)
-                            });
+                if tick_aggr.is_tpo()
+                    && !self.trade_history_loaded
+                    && let KlineChartKind::Tpo { config } = &self.kind
+                {
+                    let letter_tf = config.letter_timeframe();
+                    let latest = UnixMs::now();
+                    let need_earliest = latest.saturating_sub(config.history_range_ms());
+                    let page_ms = letter_tf.to_milliseconds().saturating_mul(1_000);
 
-                        // Request bars strictly older than what we already have.
-                        let page_end = have_earliest
-                            .map(|t| t.saturating_sub(1))
-                            .unwrap_or(latest);
-                        if page_end > need_earliest {
-                            // Page backward up to ~1000 bars per request (exchange limit).
-                            let page_ms = letter_tf.to_milliseconds().saturating_mul(1_000);
-                            let page_start =
-                                page_end.saturating_sub(page_ms).max(need_earliest);
-                            let range = FetchRange::Kline(page_start, page_end);
-                            let stream = StreamKind::Kline {
-                                ticker_info: self.chart.ticker_info,
-                                timeframe: letter_tf,
-                            };
-                            if let Some(action) =
-                                request_fetch_with_stream(&mut self.request_handler, range, Some(stream))
-                            {
-                                return Some(action);
-                            }
-                        } else {
-                            self.trade_history_loaded = true;
+                    for source in self.feed.sources().iter().copied() {
+                        if self.tpo_klines.source_is_complete(source, need_earliest) {
+                            continue;
                         }
+
+                        // Request bars strictly older than this source's
+                        // existing history. Request identity includes the
+                        // stream, so equal ranges can run for every venue.
+                        let page_end = self
+                            .tpo_klines
+                            .earliest(source)
+                            .map(|time| time.saturating_sub(1))
+                            .unwrap_or(latest);
+                        if page_end <= need_earliest {
+                            continue;
+                        }
+
+                        let page_start = page_end.saturating_sub(page_ms).max(need_earliest);
+                        let range = FetchRange::Kline(page_start, page_end);
+                        let stream = StreamKind::Kline {
+                            ticker_info: source,
+                            timeframe: letter_tf,
+                        };
+                        if let Some(action) = request_fetch_with_stream(
+                            &mut self.request_handler,
+                            range,
+                            Some(stream),
+                        ) {
+                            return Some(action);
+                        }
+                    }
+
+                    if self.tpo_klines.all_sources_complete(need_earliest) {
+                        self.trade_history_loaded = true;
                     }
                 }
 
-                // Renko still seeds from a short trade window (trade-built bricks).
+                // Renko needs the newest contiguous trades. A forward fetch from
+                // three hours ago can hit the trade cap long before reaching live
+                // BTC data and would create a false price jump to the live stream.
                 if tick_aggr.is_renko()
                     && !self.trade_history_loaded
                     && !self.fetching_trades.0
@@ -544,11 +578,13 @@ impl KlineChart {
                     let latest = UnixMs::now();
                     const MAX_SEED_HISTORY_MS: u64 = 3 * 60 * 60 * 1_000;
                     let earliest = latest.saturating_sub(MAX_SEED_HISTORY_MS);
-                    let range = FetchRange::Trades(earliest, latest);
+                    let range = FetchRange::TradesRecent(earliest, latest);
 
                     if self.request_handler.has_pending(&range) {
                         self.fetching_trades = (true, None);
                     } else if let Some(action) = request_fetch(&mut self.request_handler, range) {
+                        self.renko_seed_trades.clear();
+                        self.renko_seed_cutoff = Some(latest);
                         self.fetching_trades = (true, None);
                         return Some(action);
                     }
@@ -562,6 +598,8 @@ impl KlineChart {
     pub fn reset_request_handler(&mut self) {
         self.request_handler = RequestHandler::default();
         self.fetching_trades = (false, None);
+        self.renko_seed_trades.clear();
+        self.renko_seed_cutoff = None;
     }
 
     pub fn reset_trade_fetch_state(&mut self) {
@@ -579,12 +617,15 @@ impl KlineChart {
             &self.data_source,
             PlotData::TickBased(tick_aggr) if tick_aggr.is_renko() || tick_aggr.is_tpo()
         ) {
+            self.finish_renko_seed();
             self.trade_history_loaded = true;
         }
     }
 
     /// Mark a fetch request as failed to unblock re-fetches of the same range.
     pub fn mark_fetch_failed(&mut self, req_id: uuid::Uuid) {
+        self.renko_seed_trades.clear();
+        self.renko_seed_cutoff = None;
         self.request_handler.mark_failed(req_id);
     }
 
@@ -596,12 +637,45 @@ impl KlineChart {
             &self.data_source,
             PlotData::TickBased(tick_aggr) if tick_aggr.is_renko() || tick_aggr.is_tpo()
         ) {
+            self.renko_seed_trades.clear();
+            self.renko_seed_cutoff = None;
             self.trade_history_loaded = true;
         }
     }
 
     pub fn raw_trades(&self) -> Vec<Trade> {
         self.raw_trades.clone()
+    }
+
+    fn finish_renko_seed(&mut self) {
+        let config = match &self.kind {
+            KlineChartKind::Renko { config } => *config,
+            _ => return,
+        };
+
+        merge_renko_seed_trades(
+            &mut self.raw_trades,
+            &mut self.renko_seed_trades,
+            self.renko_seed_cutoff.take(),
+        );
+
+        self.data_source = PlotData::TickBased(TickAggr::new_renko(
+            config,
+            self.chart.tick_size,
+            &self.raw_trades,
+        ));
+        self.chart.last_price = match &self.data_source {
+            PlotData::TickBased(tick_aggr) => tick_aggr
+                .datapoints
+                .last()
+                .map(|dp| PriceInfoLabel::new(dp.kline.close, dp.kline.open)),
+            PlotData::TimeBased(_) => None,
+        };
+        self.indicators
+            .values_mut()
+            .filter_map(Option::as_mut)
+            .for_each(|indicator| indicator.on_basis_change(&self.data_source));
+        self.invalidate(None);
     }
 
     pub fn set_handle(&mut self, handle: Handle) {
@@ -723,14 +797,15 @@ impl KlineChart {
             || config.session_start_minutes_utc != normalized.session_start_minutes_utc
             || config.block_size != normalized.block_size
             || config.ticks_per_row != normalized.ticks_per_row;
-        let letter_tf_changed = config.block_size.letter_timeframe()
-            != normalized.block_size.letter_timeframe();
+        let letter_tf_changed =
+            config.block_size.letter_timeframe() != normalized.block_size.letter_timeframe();
         *config = normalized;
 
+        let composite_klines = self.tpo_klines.composite_klines();
         self.data_source = PlotData::TickBased(TickAggr::new_tpo_seeded(
             normalized,
             self.chart.tick_size,
-            &self.tpo_klines,
+            &composite_klines,
             &self.raw_trades,
         ));
         self.chart.last_price = match &self.data_source {
@@ -742,7 +817,7 @@ impl KlineChart {
         };
         if history_changed {
             if letter_tf_changed {
-                self.tpo_klines.clear();
+                *self.tpo_klines = KlineAggregator::new(&self.feed);
             }
             self.trade_history_loaded = false;
             self.reset_request_handler();
@@ -763,10 +838,11 @@ impl KlineChart {
         match &mut self.data_source {
             PlotData::TickBased(tick_aggr) if tick_aggr.is_tpo() => {
                 if let KlineChartKind::Tpo { config } = &self.kind {
+                    let composite_klines = self.tpo_klines.composite_klines();
                     self.data_source = PlotData::TickBased(TickAggr::new_tpo_seeded(
                         *config,
                         new_step,
-                        &self.tpo_klines,
+                        &composite_klines,
                         &self.raw_trades,
                     ));
                 }
@@ -899,6 +975,10 @@ impl KlineChart {
         is_batches_done: bool,
         req_id: Option<uuid::Uuid>,
     ) {
+        let is_renko = matches!(
+            &self.data_source,
+            PlotData::TickBased(tick_aggr) if tick_aggr.is_renko()
+        );
         let is_trade_profile = matches!(
             &self.data_source,
             PlotData::TickBased(tick_aggr) if tick_aggr.is_renko() || tick_aggr.is_tpo()
@@ -907,6 +987,33 @@ impl KlineChart {
         if matches!(&self.data_source, PlotData::TickBased(_)) && !is_trade_profile {
             if is_batches_done {
                 self.fetching_trades = (false, None);
+            }
+            return;
+        }
+
+        if is_renko {
+            if self.trade_history_loaded && !raw_trades.is_empty() {
+                if is_batches_done {
+                    self.fetching_trades = (false, None);
+                    if let Some(req_id) = req_id {
+                        self.request_handler.mark_completed(req_id);
+                    }
+                }
+                return;
+            }
+
+            let room = MAX_RENKO_SEED_TRADES.saturating_sub(self.renko_seed_trades.len());
+            self.renko_seed_trades
+                .extend_from_slice(&raw_trades[..raw_trades.len().min(room)]);
+
+            let hit_cap = self.renko_seed_trades.len() >= MAX_RENKO_SEED_TRADES;
+            if hit_cap || is_batches_done {
+                self.fetching_trades = (false, None);
+                self.trade_history_loaded = true;
+                if let Some(req_id) = req_id {
+                    self.request_handler.mark_completed(req_id);
+                }
+                self.finish_renko_seed();
             }
             return;
         }
@@ -956,9 +1063,7 @@ impl KlineChart {
                 self.indicators
                     .values_mut()
                     .filter_map(Option::as_mut)
-                    .for_each(|indicator| {
-                        indicator.on_insert_trades(batch, 0, &self.data_source)
-                    });
+                    .for_each(|indicator| indicator.on_insert_trades(batch, 0, &self.data_source));
             }
 
             // Hit the seed cap: abort further history paging and go live.
@@ -1024,7 +1129,12 @@ impl KlineChart {
         self.invalidate(None);
     }
 
-    pub fn insert_hist_klines(&mut self, req_id: uuid::Uuid, klines_raw: &[Kline]) {
+    pub fn insert_hist_klines(
+        &mut self,
+        req_id: uuid::Uuid,
+        source: TickerInfo,
+        klines_raw: &[Kline],
+    ) {
         match &mut self.data_source {
             PlotData::TimeBased(timeseries) => {
                 timeseries.insert_klines(klines_raw);
@@ -1046,14 +1156,18 @@ impl KlineChart {
                 if klines_raw.is_empty() {
                     // No more historical bars available — stop paging.
                     self.request_handler.mark_no_data(req_id);
-                    self.trade_history_loaded = true;
+                    self.tpo_klines.mark_exhausted(source);
+                    if let KlineChartKind::Tpo { config } = &self.kind {
+                        let need_earliest = UnixMs::now().saturating_sub(config.history_range_ms());
+                        self.trade_history_loaded =
+                            self.tpo_klines.all_sources_complete(need_earliest);
+                    }
                     self.invalidate(Some(Instant::now()));
                     return;
                 }
 
-                self.tpo_klines.extend_from_slice(klines_raw);
-                self.tpo_klines.sort_by_key(|k| k.time);
-                self.tpo_klines.dedup_by_key(|k| k.time);
+                self.tpo_klines.insert(source, klines_raw);
+                let composite_klines = self.tpo_klines.composite_klines();
 
                 // Rebuild from all seeded bars, then re-apply live trades for
                 // the developing session (print-accurate last letter).
@@ -1061,7 +1175,7 @@ impl KlineChart {
                     self.data_source = PlotData::TickBased(TickAggr::new_tpo_seeded(
                         *config,
                         self.chart.tick_size,
-                        &self.tpo_klines,
+                        &composite_klines,
                         &self.raw_trades,
                     ));
                     self.chart.last_price = match &self.data_source {
@@ -1078,13 +1192,7 @@ impl KlineChart {
                 // Done when we cover the configured profile history depth.
                 if let KlineChartKind::Tpo { config } = &self.kind {
                     let need_earliest = UnixMs::now().saturating_sub(config.history_range_ms());
-                    if self
-                        .tpo_klines
-                        .first()
-                        .is_some_and(|k| k.time <= need_earliest)
-                    {
-                        self.trade_history_loaded = true;
-                    }
+                    self.trade_history_loaded = self.tpo_klines.all_sources_complete(need_earliest);
                 }
 
                 self.invalidate(Some(Instant::now()));
@@ -1284,8 +1392,7 @@ impl KlineChart {
 
                             let padded_span = visible_span + top_padding + bottom_padding;
                             if padded_span > 0.0 {
-                                let fitted =
-                                    (chart_height * tick_size) / padded_span;
+                                let fitted = (chart_height * tick_size) / padded_span;
                                 // Keep fitted height inside zoom limits so the
                                 // right-scale Y drag/scroll can move either way.
                                 chart.cell_height = fitted.clamp(
@@ -1337,6 +1444,24 @@ impl KlineChart {
                 Some(prev_indi_count),
             );
         }
+    }
+}
+
+fn merge_renko_seed_trades(
+    live_trades: &mut Vec<Trade>,
+    historical_trades: &mut Vec<Trade>,
+    cutoff: Option<UnixMs>,
+) {
+    if let Some(cutoff) = cutoff {
+        // History owns everything through the request boundary; retain only
+        // genuinely newer live trades so the overlap is not counted twice.
+        live_trades.retain(|trade| trade.time > cutoff);
+    }
+    live_trades.append(historical_trades);
+    live_trades.sort_by_key(|trade| trade.time);
+    if live_trades.len() > MAX_RENKO_SEED_TRADES {
+        let excess = live_trades.len() - MAX_RENKO_SEED_TRADES;
+        live_trades.drain(..excess);
     }
 }
 
@@ -1915,14 +2040,20 @@ fn draw_tpo_profile(
     );
     frame.stroke(
         &Path::line(
-            Point::new(arrow_base_x + marker_size * 0.55, close_y - marker_size * 0.45),
+            Point::new(
+                arrow_base_x + marker_size * 0.55,
+                close_y - marker_size * 0.45,
+            ),
             arrow_tip,
         ),
         line(close_color),
     );
     frame.stroke(
         &Path::line(
-            Point::new(arrow_base_x + marker_size * 0.55, close_y + marker_size * 0.45),
+            Point::new(
+                arrow_base_x + marker_size * 0.55,
+                close_y + marker_size * 0.45,
+            ),
             arrow_tip,
         ),
         line(close_color),
@@ -3287,4 +3418,34 @@ fn price_padding_from_pixels(cell_height: f32, tick_size: f32) -> f32 {
     }
 
     (OUTER_BOUND_PADDING_PX / cell_height) * tick_size
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn trade(time: u64) -> Trade {
+        Trade {
+            time: UnixMs::new(time),
+            is_sell: false,
+            price: Price::from_f64(100.0),
+            qty: Qty::from_f64(1.0),
+        }
+    }
+
+    #[test]
+    fn renko_seed_replaces_overlap_and_merges_in_time_order() {
+        let mut live = vec![trade(10), trade(30)];
+        let mut historical = vec![trade(20), trade(5)];
+
+        merge_renko_seed_trades(&mut live, &mut historical, Some(UnixMs::new(20)));
+
+        assert!(historical.is_empty());
+        assert_eq!(
+            live.iter()
+                .map(|trade| trade.time.as_u64())
+                .collect::<Vec<_>>(),
+            vec![5, 20, 30]
+        );
+    }
 }

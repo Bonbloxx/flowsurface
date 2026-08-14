@@ -28,6 +28,7 @@ use crate::{
 };
 use data::{
     UserTimezone,
+    aggregation::{AggregateFeedId, ResolvedFeed},
     chart::{
         Basis, ViewConfig,
         heatmap::HeatmapStudy,
@@ -37,7 +38,7 @@ use data::{
     stream::PersistStreamKind,
 };
 use exchange::{
-    Kline, OpenInterest, StreamPairKind, TickMultiplier, TickerInfo, Timeframe,
+    Kline, OpenInterest, StreamPairKind, TickMultiplier, Ticker, TickerInfo, Timeframe,
     adapter::{MarketKind, StreamKind, StreamTicksize},
     unit::PriceStep,
 };
@@ -101,6 +102,7 @@ pub enum Event {
     ClusterScalingSelected(data::chart::kline::ClusterScaling),
     RenkoConfigChanged(data::chart::kline::RenkoConfig),
     TpoConfigChanged(data::chart::tpo::Config),
+    AggregateSourceToggled(Ticker, bool),
     StudyConfigurator(modal::pane::settings::study::StudyMessage),
     StreamModifierChanged(modal::stream::Message),
     ComparisonChartInteraction(super::chart::comparison::Message),
@@ -177,10 +179,41 @@ impl State {
 
         let base_ticker = tickers[0];
         let prev_base_ticker = self.stream_pair();
+        let aggregate_feed = if kind.supports_aggregate_feed() {
+            self.settings
+                .aggregate_feed
+                .filter(|feed| {
+                    feed.source_tickers()
+                        .any(|ticker| ticker == base_ticker.ticker)
+                })
+                .or_else(|| AggregateFeedId::for_seed_ticker(base_ticker.ticker))
+        } else {
+            None
+        };
+        self.settings.aggregate_feed = aggregate_feed;
+        if aggregate_feed.is_none() {
+            self.settings.aggregate_sources = None;
+        }
+        let resolved_feed = aggregate_feed.map_or_else(
+            || ResolvedFeed::direct(base_ticker),
+            |feed| {
+                ResolvedFeed::aggregated_selected(
+                    feed,
+                    base_ticker,
+                    &tickers,
+                    self.settings.aggregate_sources.as_deref(),
+                )
+            },
+        );
 
+        let setup_ticker = if matches!(kind, ContentKind::TpoChart) {
+            resolved_feed.primary()
+        } else {
+            base_ticker
+        };
         let derived_plan = PaneSetup::new(
             kind,
-            base_ticker,
+            setup_ticker,
             prev_base_ticker,
             self.settings.selected_basis,
             self.settings.tick_multiply,
@@ -239,7 +272,7 @@ impl State {
 
                     (content, streams)
                 }
-                ContentKind::RenkoChart | ContentKind::TpoChart => {
+                ContentKind::RenkoChart => {
                     let content = Content::new_kline(
                         kind,
                         &self.content,
@@ -248,6 +281,24 @@ impl State {
                         derived_plan.price_step,
                     );
                     let streams = vec![trades_stream(&derived_plan)];
+
+                    (content, streams)
+                }
+                ContentKind::TpoChart => {
+                    let mut content = Content::new_kline(
+                        kind,
+                        &self.content,
+                        resolved_feed.primary(),
+                        &self.settings,
+                        derived_plan.price_step,
+                    );
+                    if let Content::Kline {
+                        chart: Some(chart), ..
+                    } = &mut content
+                    {
+                        chart.set_feed(resolved_feed.clone());
+                    }
+                    let streams = resolved_feed.trade_streams();
 
                     (content, streams)
                 }
@@ -467,13 +518,14 @@ impl State {
                         );
                         return;
                     }
-                    chart.insert_hist_klines(id, klines);
+                    chart.insert_hist_klines(id, ticker_info, klines);
                 } else {
                     let (raw_trades, tick_size) = (chart.raw_trades(), chart.tick_size());
                     let layout = chart.chart_layout();
                     let visual_config = chart.visual_config();
+                    let feed = chart.feed().clone();
 
-                    *chart = KlineChart::new(
+                    let mut rebuilt = KlineChart::new(
                         layout,
                         Basis::Time(timeframe),
                         tick_size,
@@ -484,6 +536,8 @@ impl State {
                         chart.kind(),
                         Some(visual_config),
                     );
+                    rebuilt.set_feed(feed);
+                    *chart = rebuilt;
                 }
             }
             Content::Comparison(chart) => {
@@ -558,6 +612,9 @@ impl State {
             };
             if extra > 0 {
                 label = format!("{label} +{extra}");
+            }
+            if extra > 0 && self.settings.aggregate_feed.is_some() {
+                label = format!("{label} · AGG");
             }
 
             let content = row![
@@ -1004,6 +1061,8 @@ impl State {
                             chart_kind,
                             id,
                             chart.basis(),
+                            chart.tick_size(),
+                            Some(chart.feed()),
                         )
                     };
 
@@ -1281,6 +1340,29 @@ impl State {
                     c.set_tpo_config(config);
                     *kind = c.kind.clone();
                 }
+            }
+            Event::AggregateSourceToggled(ticker, enabled) => {
+                let Some((available_sources, selected_sources)) = (match &self.content {
+                    Content::Kline {
+                        chart: Some(chart), ..
+                    } => chart
+                        .feed()
+                        .id()
+                        .and_then(|_| chart.feed().toggled_source_tickers(ticker, enabled))
+                        .map(|selected| (chart.feed().available_sources().to_vec(), selected)),
+                    _ => None,
+                }) else {
+                    if !enabled {
+                        self.notifications.push(Toast::warn(
+                            "At least one data source must remain enabled".to_string(),
+                        ));
+                    }
+                    return None;
+                };
+
+                self.settings.aggregate_sources = Some(selected_sources);
+                self.set_content_and_streams(available_sources, ContentKind::TpoChart);
+                return Some(Effect::RefreshStreams);
             }
             Event::StudyConfigurator(study_msg) => match study_msg {
                 modal::pane::settings::study::StudyMessage::Footprint(m) => {
@@ -2619,5 +2701,55 @@ fn by_basis_default<T>(
     match basis.unwrap_or(Basis::Time(default_tf)) {
         Basis::Time(tf) => on_time(tf),
         Basis::Tick(_) => on_tick(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use exchange::adapter::Exchange;
+
+    fn ticker_info(exchange: Exchange, symbol: &str, min_ticksize: f32) -> TickerInfo {
+        TickerInfo::new(Ticker::new(symbol, exchange), min_ticksize, 0.001, None)
+    }
+
+    #[test]
+    fn tpo_source_toggles_rebuild_streams_and_support_single_venue_mode() {
+        let binance = ticker_info(Exchange::BinanceLinear, "BTCUSDT", 0.1);
+        let bybit = ticker_info(Exchange::BybitLinear, "BTCUSDT", 0.1);
+        let hyperliquid = ticker_info(Exchange::HyperliquidLinear, "BTC", 1.0);
+        let mut state = State::default();
+
+        assert_eq!(
+            state
+                .set_content_and_streams(vec![binance, bybit, hyperliquid], ContentKind::TpoChart,)
+                .len(),
+            3
+        );
+
+        assert!(matches!(
+            state.update(Event::AggregateSourceToggled(binance.ticker, false)),
+            Some(Effect::RefreshStreams)
+        ));
+        assert!(matches!(
+            state.update(Event::AggregateSourceToggled(hyperliquid.ticker, false)),
+            Some(Effect::RefreshStreams)
+        ));
+
+        let active = state
+            .streams
+            .ready_iter()
+            .expect("ready streams")
+            .map(StreamKind::ticker_info)
+            .collect::<Vec<_>>();
+        assert_eq!(active, vec![bybit]);
+        assert_eq!(state.settings.aggregate_sources, Some(vec![bybit.ticker]));
+
+        assert!(
+            state
+                .update(Event::AggregateSourceToggled(bybit.ticker, false))
+                .is_none()
+        );
+        assert_eq!(state.notifications.len(), 1);
     }
 }

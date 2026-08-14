@@ -1,6 +1,7 @@
-use exchange::{TickMultiplier, TickerInfo, Timeframe};
+use exchange::{TickMultiplier, Ticker, TickerInfo, Timeframe};
 use serde::{Deserialize, Serialize};
 
+use crate::aggregation::AggregateFeedId;
 use crate::chart::{comparison, heatmap, kline};
 use crate::panel::{ladder, timeandsales};
 use crate::stream::PersistStreamKind;
@@ -101,6 +102,10 @@ pub struct Settings {
     pub tick_multiply: Option<exchange::TickMultiplier>,
     pub visual_config: Option<VisualConfig>,
     pub selected_basis: Option<Basis>,
+    pub aggregate_feed: Option<AggregateFeedId>,
+    /// Explicit aggregate-source selection. `None` means every available
+    /// source; a non-empty list supports both mixed and single-venue views.
+    pub aggregate_sources: Option<Vec<Ticker>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
@@ -221,6 +226,13 @@ impl ContentKind {
         ContentKind::TimeAndSales,
         ContentKind::Ladder,
     ];
+
+    /// Whether this surface consumes the reusable aggregate market-data feed.
+    /// Add future aggregate-aware tools here; their stream planning stays in
+    /// the shared aggregation layer.
+    pub fn supports_aggregate_feed(self) -> bool {
+        matches!(self, ContentKind::TpoChart)
+    }
 }
 
 impl std::fmt::Display for ContentKind {
@@ -354,5 +366,31 @@ impl PaneSetup {
             depth_aggr,
             push_freq,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use exchange::adapter::Exchange;
+
+    #[test]
+    fn aggregate_source_selection_roundtrips_and_defaults_for_old_layouts() {
+        let selected = vec![
+            Ticker::new("BTCUSDT", Exchange::BybitLinear),
+            Ticker::new("BTC", Exchange::HyperliquidLinear),
+        ];
+        let settings = Settings {
+            aggregate_feed: Some(AggregateFeedId::BtcUsdtPerpetual),
+            aggregate_sources: Some(selected.clone()),
+            ..Settings::default()
+        };
+
+        let encoded = serde_json::to_string(&settings).expect("settings serialize");
+        let decoded: Settings = serde_json::from_str(&encoded).expect("settings deserialize");
+        assert_eq!(decoded.aggregate_sources, Some(selected));
+
+        let legacy: Settings = serde_json::from_str("{}").expect("legacy settings deserialize");
+        assert_eq!(legacy.aggregate_sources, None);
     }
 }

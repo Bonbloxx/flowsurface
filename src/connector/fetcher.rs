@@ -98,8 +98,12 @@ pub struct RequestHandler {
 impl RequestHandler {
     const RETRY_AFTER_MS: u64 = 30_000;
 
-    pub fn add_request(&mut self, fetch: FetchRange) -> Result<Option<Uuid>, ReqError> {
-        let request = FetchRequest::new(fetch);
+    pub fn add_request(
+        &mut self,
+        fetch: FetchRange,
+        stream: Option<StreamKind>,
+    ) -> Result<Option<Uuid>, ReqError> {
+        let request = FetchRequest::new(fetch, stream);
         let id = Uuid::new_v4();
 
         if let Some((existing_id, existing_req)) = self.requests.iter_mut().find_map(|(k, v)| {
@@ -173,24 +177,29 @@ pub enum FetchRange {
     Kline(UnixMs, UnixMs),
     OpenInterest(UnixMs, UnixMs),
     Trades(UnixMs, UnixMs),
+    /// A trade window where the newest contiguous data is more important than
+    /// starting exactly at the requested lower bound (for example, Renko seed).
+    TradesRecent(UnixMs, UnixMs),
 }
 
 #[derive(PartialEq, Debug)]
 struct FetchRequest {
     fetch_type: FetchRange,
+    stream: Option<StreamKind>,
     status: RequestStatus,
 }
 
 impl FetchRequest {
-    fn new(fetch_type: FetchRange) -> Self {
+    fn new(fetch_type: FetchRange, stream: Option<StreamKind>) -> Self {
         FetchRequest {
             fetch_type,
+            stream,
             status: RequestStatus::Pending,
         }
     }
 
     fn same_with(&self, other: &FetchRequest) -> bool {
-        self.same_with_range(&other.fetch_type)
+        self.stream == other.stream && self.same_with_range(&other.fetch_type)
     }
 
     /// Check whether the stored [`FetchRange`] matches a given range.
@@ -201,6 +210,9 @@ impl FetchRequest {
                 e1 == e2 && s1 == s2
             }
             (FetchRange::Trades(s1, e1), FetchRange::Trades(s2, e2)) => e1 == e2 && s1 == s2,
+            (FetchRange::TradesRecent(s1, e1), FetchRange::TradesRecent(s2, e2)) => {
+                e1 == e2 && s1 == s2
+            }
             _ => false,
         }
     }
@@ -338,7 +350,8 @@ pub fn request_fetch(
                 );
             }
         }
-        FetchRange::Trades(from_time, to_time) => {
+        FetchRange::Trades(from_time, to_time) | FetchRange::TradesRecent(from_time, to_time) => {
+            let recent_first = matches!(fetch, FetchRange::TradesRecent(..));
             let trade_info = ready_streams.iter().find_map(|stream| {
                 if let StreamKind::Trades { ticker_info } = stream {
                     Some((*ticker_info, pane_id, *stream))
@@ -392,7 +405,15 @@ pub fn request_fetch(
                 }
 
                 let (task, handle) = Task::sip(
-                    fetch_trades_paged(server, handles, ticker_info, from_time, to_time, data_path),
+                    fetch_trades_paged(
+                        server,
+                        handles,
+                        ticker_info,
+                        from_time,
+                        to_time,
+                        data_path,
+                        recent_first,
+                    ),
                     move |batch| {
                         let data = FetchedData::Trades {
                             batch,
@@ -594,8 +615,29 @@ pub fn fetch_trades_paged(
     from_time: UnixMs,
     to_time: UnixMs,
     data_path: PathBuf,
+    recent_first: bool,
 ) -> impl Straw<bool, Vec<Trade>, AdapterError> {
     sipper(async move |mut progress| {
+        if recent_first {
+            let batches = if let Some(client) = server {
+                fetch_recent_server_trade_batches(client, ticker_info, from_time, to_time).await?
+            } else {
+                fetch_recent_exchange_trade_batches(
+                    handles,
+                    ticker_info,
+                    from_time,
+                    to_time,
+                    data_path,
+                )
+                .await?
+            };
+            let had_data = !batches.is_empty();
+            for batch in batches {
+                progress.send(batch).await;
+            }
+            return Ok(had_data);
+        }
+
         let mut cursor = from_time;
         let mut had_data = false;
         let mut pages: usize = 0;
@@ -635,7 +677,7 @@ pub fn fetch_trades_paged(
                 }
             } else {
                 let batch = handles
-                    .fetch_trades(ticker_info, cursor, Some(data_path.clone()))
+                    .fetch_trades(ticker_info, cursor, None, Some(data_path.clone()))
                     .await?;
 
                 if batch.is_empty() {
@@ -663,4 +705,123 @@ pub fn fetch_trades_paged(
 
         Ok(had_data)
     })
+}
+
+async fn fetch_recent_exchange_trade_batches(
+    handles: AdapterHandles,
+    ticker_info: TickerInfo,
+    from_time: UnixMs,
+    to_time: UnixMs,
+    data_path: PathBuf,
+) -> Result<Vec<Vec<Trade>>, AdapterError> {
+    const MAX_PAGES: usize = 40;
+    const MAX_TOTAL_TRADES: usize = 80_000;
+
+    let mut cursor = to_time;
+    let mut total_trades = 0usize;
+    let mut newest_to_oldest = Vec::new();
+
+    while cursor >= from_time
+        && newest_to_oldest.len() < MAX_PAGES
+        && total_trades < MAX_TOTAL_TRADES
+    {
+        let mut batch = handles
+            .fetch_trades(
+                ticker_info,
+                from_time,
+                Some(cursor),
+                Some(data_path.clone()),
+            )
+            .await?;
+        batch.retain(|trade| trade.time >= from_time && trade.time <= cursor);
+        if batch.is_empty() {
+            break;
+        }
+
+        batch.sort_by_key(|trade| trade.time);
+        let oldest = batch.first().map_or(cursor, |trade| trade.time);
+        total_trades = total_trades.saturating_add(batch.len());
+        newest_to_oldest.push(batch);
+
+        let next_cursor = oldest.saturating_sub(1);
+        if next_cursor >= cursor {
+            return Err(AdapterError::ParseError(
+                "Recent trade paging cursor did not move backward".to_string(),
+            ));
+        }
+        cursor = next_cursor;
+    }
+
+    newest_to_oldest.reverse();
+    Ok(newest_to_oldest)
+}
+
+async fn fetch_recent_server_trade_batches(
+    client: ServerClient,
+    ticker_info: TickerInfo,
+    requested_from: UnixMs,
+    to_time: UnixMs,
+) -> Result<Vec<Vec<Trade>>, AdapterError> {
+    // The generic server API pages forward. Limit its scan to a recent window,
+    // then retain the newest bounded tail so a busy symbol cannot strand Renko
+    // hours behind live data.
+    const RECENT_SERVER_WINDOW_MS: u64 = 15 * 60 * 1_000;
+    const MAX_SCAN_PAGES: usize = 8;
+    const MAX_RETAINED_TRADES: usize = 80_000;
+
+    let mut cursor = requested_from.max(to_time.saturating_sub(RECENT_SERVER_WINDOW_MS));
+    let mut retained = Vec::new();
+
+    for _ in 0..MAX_SCAN_PAGES {
+        if cursor >= to_time {
+            break;
+        }
+        let parsed = client
+            .fetch_trades_arrow(ticker_info, cursor, to_time, ARROW_LIMIT)
+            .await?;
+        if parsed.raw_row_count == 0 {
+            break;
+        }
+
+        cursor = parsed.last_ts.map_or(cursor, |time| time.saturating_add(1));
+        retained.extend(parsed.trades);
+        if retained.len() > MAX_RETAINED_TRADES {
+            let excess = retained.len() - MAX_RETAINED_TRADES;
+            retained.drain(..excess);
+        }
+    }
+
+    retained.sort_by_key(|trade| trade.time);
+    Ok((!retained.is_empty())
+        .then_some(retained)
+        .into_iter()
+        .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use exchange::{Ticker, TickerInfo, Timeframe, adapter::Exchange};
+
+    fn kline_stream(exchange: Exchange) -> StreamKind {
+        StreamKind::Kline {
+            ticker_info: TickerInfo::new(Ticker::new("BTCUSDT", exchange), 0.1, 0.001, None),
+            timeframe: Timeframe::M30,
+        }
+    }
+
+    #[test]
+    fn equal_ranges_are_tracked_independently_per_source_stream() {
+        let range = FetchRange::Kline(UnixMs::new(1_000), UnixMs::new(2_000));
+        let binance = kline_stream(Exchange::BinanceLinear);
+        let bybit = kline_stream(Exchange::BybitLinear);
+        let mut handler = RequestHandler::default();
+
+        assert!(handler.add_request(range, Some(binance)).unwrap().is_some());
+        assert!(matches!(
+            handler.add_request(range, Some(binance)),
+            Err(ReqError::Overlaps)
+        ));
+        assert!(handler.add_request(range, Some(bybit)).unwrap().is_some());
+    }
 }

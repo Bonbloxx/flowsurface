@@ -290,7 +290,7 @@ impl ComparisonChart {
         out: &mut Vec<(uuid::Uuid, FetchRange, Option<StreamKind>)>,
     ) {
         let handler = self.request_handler.entry(ticker).or_default();
-        if let Ok(Some(req_id)) = handler.add_request(range) {
+        if let Ok(Some(req_id)) = handler.add_request(range, None) {
             out.push((
                 req_id,
                 range,

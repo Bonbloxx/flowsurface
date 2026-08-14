@@ -498,6 +498,7 @@ impl AdapterHandles {
         &self,
         ticker_info: TickerInfo,
         from_time: UnixMs,
+        to_time: Option<UnixMs>,
         data_path: Option<PathBuf>,
     ) -> Result<Vec<Trade>, AdapterError> {
         let exchange = ticker_info.ticker.exchange;
@@ -507,7 +508,9 @@ impl AdapterHandles {
                 let Some(handle) = self.binance.as_ref() else {
                     return Err(Self::missing_venue_error(exchange.venue()));
                 };
-                handle.fetch_trades(ticker_info, from_time, data_path).await
+                handle
+                    .fetch_trades(ticker_info, from_time, to_time, data_path)
+                    .await
             }
             _ => Err(AdapterError::InvalidRequest(format!(
                 "Trade fetch not available for {exchange}"

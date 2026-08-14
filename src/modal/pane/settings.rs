@@ -5,6 +5,7 @@ use crate::split_column;
 use crate::widget::{classic_slider_row, labeled_slider};
 use crate::{style, tooltip, widget::scrollable_content};
 
+use data::aggregation::ResolvedFeed;
 use data::chart::heatmap::HeatmapStudy;
 use data::chart::kline::FootprintStudy;
 use data::chart::{
@@ -600,6 +601,8 @@ pub fn kline_cfg_view<'a>(
     kind: &'a KlineChartKind,
     pane: pane_grid::Pane,
     basis: data::chart::Basis,
+    tick_size: exchange::unit::PriceStep,
+    aggregate_feed: Option<&'a ResolvedFeed>,
 ) -> Element<'a, Message> {
     let display_readout_section = {
         let data_labels_checkbox = tooltip(
@@ -715,6 +718,9 @@ pub fn kline_cfg_view<'a>(
         }
         KlineChartKind::Tpo { config } => {
             use data::chart::tpo::{BlockSize, DisplayStyle, ProfilePeriod, SessionStart};
+
+            let effective_row_size = config.row_step(tick_size).to_ui_string();
+            let exchange_tick_size = tick_size.to_ui_string();
 
             let profile_period = pick_list(
                 ProfilePeriod::ALL,
@@ -852,7 +858,7 @@ pub fn kline_cfg_view<'a>(
                     )
                 });
             let singles = checkbox(config.show_single_prints)
-                .label("Highlight single-print excess")
+                .label("Highlight interior single prints")
                 .on_toggle(move |show_single_prints| {
                     Message::PaneEvent(
                         pane,
@@ -863,8 +869,42 @@ pub fn kline_cfg_view<'a>(
                     )
                 });
 
+            let data_sources: Element<'a, Message> = aggregate_feed
+                .and_then(|feed| feed.id().map(|id| (feed, id)))
+                .map_or_else(
+                    || column![].into(),
+                    |(feed, id)| {
+                        let choices = feed.available_sources().iter().fold(
+                            column![].spacing(6),
+                            |choices, source| {
+                                let ticker = source.ticker;
+                                let selected = feed.sources().contains(source);
+                                let label = id.source_label(ticker).unwrap_or("Unknown venue");
+
+                                choices.push(checkbox(selected).label(label).on_toggle(
+                                    move |enabled| {
+                                        Message::PaneEvent(
+                                            pane,
+                                            Event::AggregateSourceToggled(ticker, enabled),
+                                        )
+                                    },
+                                ))
+                            },
+                        );
+
+                        column![
+                            text("Data sources").size(crate::style::text_size::SECTION),
+                            text("Select one venue for independent data, or combine any venues."),
+                            choices,
+                        ]
+                        .spacing(8)
+                        .into()
+                    },
+                );
+
             split_column![
                 display_readout_section,
+                data_sources,
                 column![
                     text("TPO construction").size(crate::style::text_size::SECTION),
                     text("Letters mark each bracket high–low from time bars (Sierra/Quantower style)."),
@@ -874,6 +914,10 @@ pub fn kline_cfg_view<'a>(
                         .align_y(Alignment::Center),
                     row![text("Ticks per row"), space::horizontal(), row_size]
                         .align_y(Alignment::Center),
+                    text(format!(
+                        "Effective row size: {effective_row_size} ({exchange_tick_size} exchange tick)"
+                    ))
+                    .size(crate::style::text_size::SMALL),
                     row![text("Session start"), space::horizontal(), session_start]
                         .align_y(Alignment::Center),
                     row![text("Value area (%)"), space::horizontal(), value_area]

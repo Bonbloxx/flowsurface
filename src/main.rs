@@ -684,10 +684,29 @@ impl Flowsurface {
 
                         let task = {
                             if let Some(kind) = content {
-                                self.active_dashboard_mut().init_focused_pane(
+                                let ticker_infos =
+                                    data::aggregation::AggregateFeedId::for_seed_ticker(
+                                        ticker_info.ticker,
+                                    )
+                                    .filter(|_| kind.supports_aggregate_feed())
+                                    .map(|feed| {
+                                        feed.source_tickers()
+                                            .filter_map(|ticker| {
+                                                self.sidebar
+                                                    .tickers_info()
+                                                    .get(&ticker)
+                                                    .copied()
+                                                    .flatten()
+                                            })
+                                            .collect::<Vec<_>>()
+                                    })
+                                    .filter(|sources| !sources.is_empty())
+                                    .unwrap_or_else(|| vec![ticker_info]);
+
+                                self.active_dashboard_mut().init_focused_pane_with_sources(
                                     &handles,
                                     main_window_id,
-                                    ticker_info,
+                                    ticker_infos,
                                     kind,
                                 )
                             } else {

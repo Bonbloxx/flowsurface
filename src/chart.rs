@@ -1143,7 +1143,7 @@ fn request_fetch_with_stream(
     range: FetchRange,
     stream: Option<exchange::adapter::StreamKind>,
 ) -> Option<Action> {
-    match handler.add_request(range) {
+    match handler.add_request(range, stream) {
         Ok(Some(req_id)) => {
             let fetch_spec = FetchSpec {
                 req_id,
