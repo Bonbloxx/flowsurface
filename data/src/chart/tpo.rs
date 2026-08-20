@@ -177,8 +177,10 @@ impl Config {
     ];
     pub const VALUE_AREA_PRESETS: [u8; 7] = [50, 60, 68, 70, 75, 80, 90];
     pub const INITIAL_BALANCE_PRESETS: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
-    /// How many completed/developing profiles to keep (bar-seeded history).
-    pub const HISTORY_PROFILE_PRESETS: [u8; 7] = [5, 10, 20, 30, 45, 60, 90];
+    /// Keep enough bar-seeded history for meaningful profile comparison.
+    pub const MIN_HISTORY_PROFILES: u8 = 150;
+    pub const MAX_HISTORY_PROFILES: u8 = 240;
+    pub const HISTORY_PROFILE_PRESETS: [u8; 4] = [150, 180, 210, 240];
 
     pub fn normalized(self) -> Self {
         let block_size = if self.block_size.minutes() > self.profile_period.minutes() {
@@ -204,7 +206,9 @@ impl Config {
                 u64::from(self.initial_balance_blocks.max(1)).min(max_blocks),
             )
             .unwrap_or(u8::MAX),
-            profiles_to_load: self.profiles_to_load.clamp(1, 90),
+            profiles_to_load: self
+                .profiles_to_load
+                .clamp(Self::MIN_HISTORY_PROFILES, Self::MAX_HISTORY_PROFILES),
             ..self
         }
     }
@@ -259,7 +263,7 @@ impl Default for Config {
             value_area_percent: 70,
             initial_balance_blocks: 2,
             // Multi-day history is bar-seeded (cheap), not raw-trade backfill.
-            profiles_to_load: 60,
+            profiles_to_load: Self::MIN_HISTORY_PROFILES,
             display_style: DisplayStyle::Auto,
             show_poc: true,
             show_value_area: true,
@@ -783,12 +787,29 @@ mod tests {
         assert_eq!(config.session_start_minutes_utc, 1_439);
         assert_eq!(config.value_area_percent, 1);
         assert_eq!(config.initial_balance_blocks, 1);
-        assert_eq!(config.profiles_to_load, 1);
+        assert_eq!(config.profiles_to_load, Config::MIN_HISTORY_PROFILES);
 
         let json = serde_json::to_string(&config).expect("serialize TPO settings");
         assert_eq!(
             serde_json::from_str::<Config>(&json).expect("deserialize TPO settings"),
             config
+        );
+    }
+
+    #[test]
+    fn legacy_history_depth_is_upgraded_to_at_least_150_profiles() {
+        let legacy = Config {
+            profiles_to_load: 60,
+            ..Config::default()
+        };
+
+        assert_eq!(
+            legacy.normalized().profiles_to_load,
+            Config::MIN_HISTORY_PROFILES
+        );
+        assert_eq!(
+            legacy.history_range_ms(),
+            ProfilePeriod::Day.millis() * u64::from(Config::MIN_HISTORY_PROFILES)
         );
     }
 
@@ -801,7 +822,7 @@ mod tests {
             session_start_minutes_utc: 8 * 60 + 30,
             value_area_percent: 75,
             initial_balance_blocks: 4,
-            profiles_to_load: 20,
+            profiles_to_load: 180,
             display_style: DisplayStyle::Blocks,
             show_poc: false,
             show_value_area: true,
@@ -833,6 +854,10 @@ mod tests {
             data_labels_always_visible: true,
             show_footprint_summary: false,
             show_renko_wicks: false,
+            daily_delta_ticks: 10,
+            daily_delta_days: 5,
+            previous_value_area_ticks: 10,
+            liquidity_heatmap_order_size_filter: 125_000.0,
         };
 
         let kind_json = serde_json::to_string(&kind).expect("serialize Renko settings");

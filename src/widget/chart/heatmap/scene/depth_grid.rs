@@ -61,6 +61,13 @@ impl GridRing {
         }
     }
 
+    pub fn with_horizon_buckets(horizon_buckets: u32) -> Self {
+        Self {
+            horizon_buckets: horizon_buckets.max(1),
+            ..Self::new()
+        }
+    }
+
     pub fn bids_len(&self) -> usize {
         self.bid.len()
     }
@@ -922,6 +929,21 @@ impl GridRing {
             height: self.tex_h,
             cols: Arc::from(cols),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{GRID_TEX_H, GridRing};
+
+    #[test]
+    fn custom_horizon_avoids_standalone_grid_allocation() {
+        let mut grid = GridRing::with_horizon_buckets(2_048);
+        grid.ensure_layout(1_000);
+
+        assert_eq!(grid.tex_w(), 2_048);
+        assert_eq!(grid.bids_len(), 2_048 * GRID_TEX_H as usize);
+        assert_eq!(grid.asks_len(), 2_048 * GRID_TEX_H as usize);
     }
 }
 

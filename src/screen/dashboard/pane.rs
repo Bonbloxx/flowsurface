@@ -1,8 +1,11 @@
 use crate::{
-    chart::{self, comparison::ComparisonChart, heatmap::HeatmapChart, kline::KlineChart},
+    chart::{
+        self, comparison::ComparisonChart, footprint_history::FootprintHistory,
+        heatmap::HeatmapChart, kline::KlineChart,
+    },
     connector::{
         ResolvedStream,
-        fetcher::{FetchSpec, InfoKind},
+        fetcher::{FetchSpec, InfoKind, TradeFetchMode, trade_fetch_mode},
     },
     modal::{
         self, ModifierKind,
@@ -10,7 +13,8 @@ use crate::{
             Modal,
             mini_tickers_list::MiniPanel,
             settings::{
-                comparison_cfg_view, heatmap_cfg_view, heatmap_shader_cfg_view, kline_cfg_view,
+                comparison_cfg_view, footprint_history_cfg_view, heatmap_cfg_view,
+                heatmap_shader_cfg_view, kline_cfg_view,
             },
             stack_modal,
         },
@@ -35,11 +39,11 @@ use data::{
         indicator::{HeatmapIndicator, Indicator, KlineIndicator, UiIndicator},
     },
     layout::pane::{ContentKind, LinkGroup, PaneSetup, Settings, VisualConfig},
-    stream::PersistStreamKind,
+    stream::{PersistDepth, PersistStreamKind},
 };
 use exchange::{
     Kline, OpenInterest, StreamPairKind, TickMultiplier, TickerInfo, Timeframe,
-    adapter::{MarketKind, StreamKind, StreamTicksize},
+    adapter::{MarketKind, StreamKind, StreamTicksize, Venue},
     unit::PriceStep,
 };
 use iced::{
@@ -47,6 +51,9 @@ use iced::{
     widget::{button, center, column, container, pane_grid, pick_list, row, text, tooltip},
 };
 use std::time::Instant;
+
+const INITIALIZING_TICK_INTERVAL_MS: u64 = 100;
+const IDLE_TICK_INTERVAL_MS: u64 = 1000;
 
 #[derive(Debug, Clone)]
 pub enum Effect {
@@ -69,6 +76,114 @@ pub enum Action {
     Panel(panel::Action),
     ResolveStreams(Vec<PersistStreamKind>),
     ResolveContent,
+}
+
+fn has_trade_history_indicator(indicators: &[KlineIndicator]) -> bool {
+    indicators
+        .iter()
+        .copied()
+        .any(KlineIndicator::needs_trade_history)
+}
+
+fn restore_configured_trade_history_streams(
+    content: &Content,
+    settings: &Settings,
+    streams: &mut Vec<PersistStreamKind>,
+) {
+    let uses_trade_history = match content {
+        Content::Kline { indicators, .. } => has_trade_history_indicator(indicators),
+        Content::FootprintHistory(_) => true,
+        _ => false,
+    };
+    if !uses_trade_history {
+        return;
+    }
+
+    let Some(selected) = settings.footprint_history_sources.as_deref() else {
+        return;
+    };
+    let active = if settings.footprint_history_aggregate {
+        selected
+    } else {
+        selected.get(..1).unwrap_or(&[])
+    };
+
+    for ticker in active {
+        let already_restored = streams.iter().any(|stream| match stream {
+            PersistStreamKind::Trades { ticker: existing } => existing.same_market(ticker),
+            PersistStreamKind::AggregateTrades { feed } => feed
+                .source_tickers()
+                .any(|source| source.same_market(ticker)),
+            PersistStreamKind::DepthAndTrades(depth) => depth.ticker.same_market(ticker),
+            PersistStreamKind::Kline { .. } | PersistStreamKind::Depth(_) => false,
+        });
+        if !already_restored {
+            streams.push(PersistStreamKind::Trades { ticker: *ticker });
+        }
+    }
+}
+
+fn has_liquidity_heatmap(indicators: &[KlineIndicator]) -> bool {
+    indicators.contains(&KlineIndicator::LiquidityHeatmap)
+}
+
+fn restore_configured_liquidity_heatmap_streams(
+    content: &Content,
+    settings: &Settings,
+    streams: &mut Vec<PersistStreamKind>,
+) {
+    let Content::Kline { indicators, .. } = content else {
+        return;
+    };
+    if !has_liquidity_heatmap(indicators) {
+        return;
+    }
+
+    let Some(selected) = settings.liquidity_heatmap_sources.as_deref() else {
+        return;
+    };
+
+    for ticker in selected {
+        let already_restored = streams.iter().any(|stream| match stream {
+            PersistStreamKind::Depth(depth) | PersistStreamKind::DepthAndTrades(depth) => {
+                depth.ticker.same_market(ticker)
+            }
+            PersistStreamKind::Kline { .. }
+            | PersistStreamKind::Trades { .. }
+            | PersistStreamKind::AggregateTrades { .. } => false,
+        });
+        if already_restored {
+            continue;
+        }
+
+        streams.push(PersistStreamKind::Depth(PersistDepth {
+            ticker: *ticker,
+            depth_aggr: ticker
+                .exchange
+                .stream_ticksize(Some(TickMultiplier(1)), TickMultiplier(1)),
+            push_freq: exchange::PushFrequency::ServerDefault,
+        }));
+    }
+}
+
+fn default_footprint_history_sources(available: &[TickerInfo]) -> Vec<TickerInfo> {
+    let mut selected = match trade_fetch_mode() {
+        // Direct Hyperliquid public history is not available. Leaving it off by
+        // default keeps all three displayed days comparable and avoids a warning
+        // on a fresh Exchange-mode history pane. It remains available to opt in.
+        TradeFetchMode::Exchange => available
+            .iter()
+            .copied()
+            .filter(|source| matches!(source.exchange().venue(), Venue::Binance | Venue::Bybit))
+            .collect(),
+        TradeFetchMode::Off | TradeFetchMode::Server => available.to_vec(),
+    };
+    if selected.is_empty()
+        && let Some(first) = available.first()
+    {
+        selected.push(*first);
+    }
+    selected
 }
 
 #[derive(Debug, Clone)]
@@ -105,6 +220,7 @@ pub enum Event {
     AggregateSourceToggled(TickerInfo, bool),
     FootprintHistoryAggregationToggled(bool),
     FootprintHistorySourceToggled(TickerInfo, bool),
+    LiquidityHeatmapSourceToggled(TickerInfo, bool),
     StudyConfigurator(modal::pane::settings::study::StudyMessage),
     StreamModifierChanged(modal::stream::Message),
     ComparisonChartInteraction(super::chart::comparison::Message),
@@ -130,10 +246,13 @@ impl State {
 
     pub fn from_config(
         content: Content,
-        streams: Vec<PersistStreamKind>,
+        mut streams: Vec<PersistStreamKind>,
         settings: Settings,
         link_group: Option<LinkGroup>,
     ) -> Self {
+        restore_configured_trade_history_streams(&content, &settings, &mut streams);
+        restore_configured_liquidity_heatmap_streams(&content, &settings, &mut streams);
+
         Self {
             content,
             settings,
@@ -160,7 +279,7 @@ impl State {
                 chart: Some(chart),
                 indicators,
                 ..
-            } if indicators.contains(&KlineIndicator::FootprintHistory) => {
+            } if has_trade_history_indicator(indicators) => {
                 let uses_trades = matches!(
                     chart.kind(),
                     data::chart::KlineChartKind::Footprint { .. }
@@ -169,11 +288,25 @@ impl State {
                 ) || matches!(chart.basis(), Basis::Tick(_));
                 if !uses_trades {
                     Some(Vec::new())
-                } else if matches!(chart.kind(), data::chart::KlineChartKind::Tpo { .. }) {
+                } else if matches!(
+                    chart.kind(),
+                    data::chart::KlineChartKind::Footprint { .. }
+                        | data::chart::KlineChartKind::Tpo { .. }
+                ) {
                     Some(chart.feed().sources().to_vec())
                 } else {
                     Some(vec![chart.feed().primary()])
                 }
+            }
+            _ => None,
+        };
+        let overlay_depth_sources = match &self.content {
+            Content::Kline {
+                chart: Some(chart),
+                indicators,
+                ..
+            } if has_liquidity_heatmap(indicators) => {
+                Some(chart.liquidity_heatmap_sources().to_vec())
             }
             _ => None,
         };
@@ -182,6 +315,14 @@ impl State {
             if let (Some(main_sources), StreamKind::Trades { ticker_info }) =
                 (&main_trade_sources, stream)
                 && !main_sources
+                    .iter()
+                    .any(|source| source.ticker.same_market(&ticker_info.ticker))
+            {
+                continue;
+            }
+            if let (Some(sources), StreamKind::Depth { ticker_info, .. }) =
+                (&overlay_depth_sources, stream)
+                && sources
                     .iter()
                     .any(|source| source.ticker.same_market(&ticker_info.ticker))
             {
@@ -239,7 +380,7 @@ impl State {
             },
         );
 
-        let setup_ticker = if matches!(kind, ContentKind::TpoChart) {
+        let setup_ticker = if matches!(kind, ContentKind::FootprintChart | ContentKind::TpoChart) {
             resolved_feed.primary()
         } else {
             base_ticker
@@ -283,27 +424,82 @@ impl State {
                     (content, streams)
                 }
                 ContentKind::FootprintChart => {
-                    let content = Content::new_kline(
+                    let mut content = Content::new_kline(
                         kind,
                         &self.content,
-                        derived_plan.ticker_info,
+                        resolved_feed.primary(),
                         &self.settings,
-                        derived_plan.price_step,
+                        resolved_feed.price_step(),
                     );
+                    if let Content::Kline {
+                        chart: Some(chart), ..
+                    } = &mut content
+                    {
+                        chart.set_feed(resolved_feed.clone());
+                    }
 
                     let streams = by_basis_default(
                         derived_plan.basis,
                         Timeframe::M5,
                         |tf| {
-                            vec![
-                                trades_stream(&derived_plan),
-                                kline_stream(derived_plan.ticker_info, tf),
-                            ]
+                            let mut streams = resolved_feed.trade_streams();
+                            streams.push(kline_stream(resolved_feed.primary(), tf));
+                            streams
                         },
-                        || vec![trades_stream(&derived_plan)],
+                        || resolved_feed.trade_streams(),
                     );
 
                     (content, streams)
+                }
+                ContentKind::FootprintHistory => {
+                    let available = data::aggregation::equivalent_footprint_sources(
+                        base_ticker,
+                        tickers.iter().copied(),
+                    );
+                    let selected = self
+                        .settings
+                        .footprint_history_sources
+                        .as_deref()
+                        .map(|wanted| {
+                            available
+                                .iter()
+                                .copied()
+                                .filter(|source| {
+                                    wanted
+                                        .iter()
+                                        .any(|ticker| ticker.same_market(&source.ticker))
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .filter(|sources| !sources.is_empty())
+                        .unwrap_or_else(|| default_footprint_history_sources(&available));
+                    let aggregate = self.settings.footprint_history_sources.is_none()
+                        || self.settings.footprint_history_aggregate;
+                    self.settings.footprint_history_aggregate = aggregate;
+                    self.settings.footprint_history_sources =
+                        Some(selected.iter().map(|source| source.ticker).collect());
+                    let min_step = selected
+                        .iter()
+                        .map(|source| PriceStep::from(source.min_ticksize))
+                        .min_by_key(|step| step.units)
+                        .unwrap_or(derived_plan.price_step);
+                    let block_step = self
+                        .settings
+                        .tick_multiply
+                        .unwrap_or(TickMultiplier(1000))
+                        .multiply_step(min_step);
+                    let history = FootprintHistory::new(selected.clone(), aggregate, block_step);
+                    let active = if aggregate {
+                        selected
+                    } else {
+                        selected.into_iter().take(1).collect()
+                    };
+                    let streams = active
+                        .into_iter()
+                        .map(|ticker_info| StreamKind::Trades { ticker_info })
+                        .collect();
+
+                    (Content::FootprintHistory(Some(history)), streams)
                 }
                 ContentKind::RenkoChart => {
                     let content = Content::new_kline(
@@ -511,7 +707,7 @@ impl State {
             indicators,
             ..
         } = &mut content
-            && indicators.contains(&KlineIndicator::FootprintHistory)
+            && has_trade_history_indicator(indicators)
         {
             let available = data::aggregation::equivalent_footprint_sources(
                 base_ticker,
@@ -537,9 +733,43 @@ impl State {
             chart.configure_footprint_history(selected, self.settings.footprint_history_aggregate);
         }
 
+        if let Content::Kline {
+            chart: Some(chart),
+            indicators,
+            ..
+        } = &mut content
+            && has_liquidity_heatmap(indicators)
+        {
+            let available = data::aggregation::equivalent_footprint_sources(
+                base_ticker,
+                tickers.iter().copied(),
+            );
+            let selected = self
+                .settings
+                .liquidity_heatmap_sources
+                .as_deref()
+                .map(|wanted| {
+                    available
+                        .iter()
+                        .copied()
+                        .filter(|source| {
+                            wanted
+                                .iter()
+                                .any(|ticker| ticker.same_market(&source.ticker))
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .filter(|sources| !sources.is_empty())
+                .unwrap_or(available);
+            self.settings.liquidity_heatmap_sources =
+                Some(selected.iter().map(|source| source.ticker).collect());
+            chart.configure_liquidity_heatmap(selected);
+        }
+
         self.content = content;
         self.streams = ResolvedStream::Ready(streams.clone());
         self.sync_footprint_history_streams();
+        self.sync_liquidity_heatmap_streams();
 
         match &self.streams {
             ResolvedStream::Ready(streams) => streams.clone(),
@@ -548,6 +778,28 @@ impl State {
     }
 
     fn sync_footprint_history_streams(&mut self) {
+        if let Content::FootprintHistory(Some(history)) = &self.content {
+            let sources = history.active_sources().to_vec();
+            let ResolvedStream::Ready(streams) = &mut self.streams else {
+                return;
+            };
+            streams.retain(|stream| match stream {
+                StreamKind::Trades { ticker_info } => sources
+                    .iter()
+                    .any(|source| source.ticker.same_market(&ticker_info.ticker)),
+                StreamKind::Kline { .. } | StreamKind::Depth { .. } => false,
+            });
+            for source in sources {
+                let wanted = StreamKind::Trades {
+                    ticker_info: source,
+                };
+                if !streams.contains(&wanted) {
+                    streams.push(wanted);
+                }
+            }
+            return;
+        }
+
         let Content::Kline {
             chart: Some(chart),
             indicators,
@@ -565,12 +817,15 @@ impl State {
         ) || matches!(chart.basis(), Basis::Tick(_));
         let main_sources = if !main_uses_trades {
             Vec::new()
-        } else if matches!(chart.kind(), data::chart::KlineChartKind::Tpo { .. }) {
+        } else if matches!(
+            chart.kind(),
+            data::chart::KlineChartKind::Footprint { .. } | data::chart::KlineChartKind::Tpo { .. }
+        ) {
             chart.feed().sources().to_vec()
         } else {
             vec![chart.feed().primary()]
         };
-        let indicator_sources = if indicators.contains(&KlineIndicator::FootprintHistory) {
+        let indicator_sources = if has_trade_history_indicator(indicators) {
             if chart.footprint_history_aggregate() {
                 chart.footprint_history_sources().to_vec()
             } else {
@@ -604,6 +859,37 @@ impl State {
         }
     }
 
+    fn sync_liquidity_heatmap_streams(&mut self) {
+        let sources = match &self.content {
+            Content::Kline {
+                chart: Some(chart),
+                indicators,
+                ..
+            } if has_liquidity_heatmap(indicators) && chart.allows_liquidity_heatmap() => {
+                chart.liquidity_heatmap_sources().to_vec()
+            }
+            Content::Kline { .. } => Vec::new(),
+            _ => return,
+        };
+
+        let ResolvedStream::Ready(streams) = &mut self.streams else {
+            return;
+        };
+        streams.retain(|stream| !matches!(stream, StreamKind::Depth { .. }));
+        for source in sources {
+            let wanted = StreamKind::Depth {
+                ticker_info: source,
+                depth_aggr: source
+                    .exchange()
+                    .stream_ticksize(Some(TickMultiplier(1)), TickMultiplier(1)),
+                push_freq: exchange::PushFrequency::ServerDefault,
+            };
+            if !streams.contains(&wanted) {
+                streams.push(wanted);
+            }
+        }
+    }
+
     pub fn insert_hist_oi(
         &mut self,
         source: TickerInfo,
@@ -616,6 +902,9 @@ impl State {
                     panic!("Kline chart wasn't initialized when inserting open interest");
                 };
                 chart.insert_open_interest(source, req_id, oi);
+            }
+            Content::FootprintHistory(Some(history)) => {
+                history.insert_open_interest(source, oi, req_id);
             }
             _ => {
                 log::error!("pane content not candlestick");
@@ -640,8 +929,8 @@ impl State {
 
                 if let Some(id) = req_id {
                     let accepts_time = chart.basis() == Basis::Time(timeframe);
-                    let accepts_tpo_seed = chart.accepts_tpo_kline_seed(timeframe);
-                    if !accepts_time && !accepts_tpo_seed {
+                    let accepts_tick_seed = chart.accepts_tick_kline_seed(timeframe);
+                    if !accepts_time && !accepts_tick_seed {
                         log::warn!(
                             "Ignoring stale kline fetch for timeframe {:?}; chart basis = {:?}",
                             timeframe,
@@ -905,6 +1194,83 @@ impl State {
                     None,
                     tickers_table,
                 )
+            }
+            Content::FootprintHistory(history) => {
+                if let Some(history) = history {
+                    let ticker_info = history
+                        .sources()
+                        .iter()
+                        .min_by_key(|ticker| ticker.min_ticksize.power)
+                        .copied()
+                        .or_else(|| self.stream_pair());
+                    let tick_multiply = self.settings.tick_multiply.unwrap_or(TickMultiplier(1000));
+                    let min_ticksize = ticker_info.map(|ticker| ticker.min_ticksize);
+                    let exchange = ticker_info.map(|ticker| ticker.ticker.exchange);
+                    let base_step = ticker_info
+                        .map(|ticker| {
+                            tick_multiply
+                                .unscale_step_or_min_tick(history.block_step(), ticker.min_ticksize)
+                        })
+                        .unwrap_or_else(|| tick_multiply.unscale_step(history.block_step()));
+                    top_left_buttons = top_left_buttons.push(footprint_history_modifier(
+                        id,
+                        history.block_step(),
+                        base_step,
+                        min_ticksize,
+                        tick_multiply,
+                        modifier,
+                        exchange,
+                    ));
+
+                    let available = ticker_info.map_or_else(Vec::new, |selected| {
+                        data::aggregation::equivalent_footprint_sources(
+                            selected,
+                            tickers_table.tickers_info.values().filter_map(|info| *info),
+                        )
+                    });
+                    let source_choices = available
+                        .into_iter()
+                        .map(|source| {
+                            let selected = history
+                                .sources()
+                                .iter()
+                                .any(|active| active.ticker.same_market(&source.ticker));
+                            let symbol = source.ticker.display_symbol_and_type().0;
+                            (
+                                source,
+                                format!("{} · {}", source.exchange().venue(), symbol),
+                                selected,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    let aggregate = history.aggregate();
+                    let settings_modal =
+                        move || footprint_history_cfg_view(id, source_choices.clone(), aggregate);
+                    let base = history.view().map(move |message| {
+                        Message::PaneEvent(id, Event::ChartInteraction(message))
+                    });
+
+                    self.compose_stack_view(
+                        base,
+                        id,
+                        None,
+                        compact_controls,
+                        settings_modal,
+                        None,
+                        tickers_table,
+                    )
+                } else {
+                    let base = uninitialized_base(ContentKind::FootprintHistory);
+                    self.compose_stack_view(
+                        base,
+                        id,
+                        None,
+                        compact_controls,
+                        || column![].into(),
+                        None,
+                        tickers_table,
+                    )
+                }
             }
             Content::Comparison(chart) => {
                 if let Some(c) = chart {
@@ -1223,9 +1589,8 @@ impl State {
                                 })
                                 .collect()
                         });
-                        let footprint_history = indicators
-                            .contains(&KlineIndicator::FootprintHistory)
-                            .then(|| {
+                        let footprint_history =
+                            has_trade_history_indicator(indicators).then(|| {
                                 let sources = footprint_history_available
                                     .iter()
                                     .copied()
@@ -1244,6 +1609,26 @@ impl State {
                                     .collect();
                                 (sources, chart.footprint_history_aggregate())
                             });
+                        let liquidity_heatmap = indicators
+                            .contains(&KlineIndicator::LiquidityHeatmap)
+                            .then(|| {
+                                footprint_history_available
+                                    .iter()
+                                    .copied()
+                                    .map(|source| {
+                                        let selected =
+                                            chart.liquidity_heatmap_sources().iter().any(
+                                                |active| active.ticker.same_market(&source.ticker),
+                                            );
+                                        let symbol = source.ticker.display_symbol_and_type().0;
+                                        (
+                                            source,
+                                            format!("{} · {}", source.exchange().venue(), symbol),
+                                            selected,
+                                        )
+                                    })
+                                    .collect()
+                            });
                         kline_cfg_view(
                             chart.study_configurator(),
                             chart.visual_config(),
@@ -1253,6 +1638,14 @@ impl State {
                             chart.tick_size(),
                             aggregate_sources,
                             footprint_history,
+                            liquidity_heatmap,
+                            indicators.contains(&KlineIndicator::DailyDelta).then(|| {
+                                let cfg = chart.visual_config();
+                                (cfg.daily_delta_ticks, cfg.daily_delta_days)
+                            }),
+                            indicators
+                                .contains(&KlineIndicator::PreviousValueArea)
+                                .then(|| chart.visual_config().previous_value_area_ticks),
                         )
                     };
 
@@ -1489,13 +1882,31 @@ impl State {
                 _ => {}
             },
             Event::ToggleIndicator(ind, available_sources) => {
-                let is_footprint_history =
-                    matches!(ind, UiIndicator::Kline(KlineIndicator::FootprintHistory));
-                let enabling = is_footprint_history
+                let is_trade_history = matches!(
+                    ind,
+                    UiIndicator::Kline(indicator) if indicator.needs_trade_history()
+                );
+                let enabling = is_trade_history
                     && matches!(
                         &self.content,
                         Content::Kline { indicators, .. }
-                            if !indicators.contains(&KlineIndicator::FootprintHistory)
+                            if !has_trade_history_indicator(indicators)
+                    );
+                let is_liquidity_heatmap =
+                    matches!(ind, UiIndicator::Kline(KlineIndicator::LiquidityHeatmap));
+                let is_open_interest =
+                    matches!(ind, UiIndicator::Kline(KlineIndicator::OpenInterest));
+                let enabling_open_interest = is_open_interest
+                    && matches!(
+                        &self.content,
+                        Content::Kline { indicators, .. }
+                            if !indicators.contains(&KlineIndicator::OpenInterest)
+                    );
+                let enabling_liquidity = is_liquidity_heatmap
+                    && matches!(
+                        &self.content,
+                        Content::Kline { indicators, .. }
+                            if !has_liquidity_heatmap(indicators)
                     );
 
                 if enabling {
@@ -1515,7 +1926,7 @@ impl State {
                                 .collect::<Vec<_>>()
                         })
                         .filter(|sources| !sources.is_empty())
-                        .unwrap_or_else(|| available_sources.clone());
+                        .unwrap_or_else(|| default_footprint_history_sources(&available_sources));
                     let aggregate = self.settings.footprint_history_sources.is_none()
                         || self.settings.footprint_history_aggregate;
                     self.settings.footprint_history_aggregate = aggregate;
@@ -1529,9 +1940,75 @@ impl State {
                     }
                 }
 
+                if enabling_liquidity {
+                    let configured = self
+                        .settings
+                        .liquidity_heatmap_sources
+                        .as_deref()
+                        .map(|selected| {
+                            available_sources
+                                .iter()
+                                .copied()
+                                .filter(|source| {
+                                    selected
+                                        .iter()
+                                        .any(|ticker| ticker.same_market(&source.ticker))
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .filter(|sources| !sources.is_empty())
+                        .unwrap_or_else(|| available_sources.clone());
+                    self.settings.liquidity_heatmap_sources =
+                        Some(configured.iter().map(|source| source.ticker).collect());
+                    if let Content::Kline {
+                        chart: Some(chart), ..
+                    } = &mut self.content
+                    {
+                        chart.configure_liquidity_heatmap(configured);
+                    }
+                }
+
+                if enabling_open_interest
+                    && let Content::Kline {
+                        chart: Some(chart), ..
+                    } = &mut self.content
+                {
+                    chart.configure_open_interest(available_sources.clone());
+                }
+
                 self.content.toggle_indicator(ind);
-                if is_footprint_history {
+                if is_trade_history {
                     self.sync_footprint_history_streams();
+                    return Some(Effect::RefreshStreams);
+                }
+                if is_liquidity_heatmap {
+                    if let Content::Kline {
+                        chart: Some(chart),
+                        indicators,
+                        ..
+                    } = &mut self.content
+                        && has_liquidity_heatmap(indicators)
+                    {
+                        let sources = self
+                            .settings
+                            .liquidity_heatmap_sources
+                            .as_deref()
+                            .map(|wanted| {
+                                available_sources
+                                    .iter()
+                                    .copied()
+                                    .filter(|source| {
+                                        wanted
+                                            .iter()
+                                            .any(|ticker| ticker.same_market(&source.ticker))
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
+                            .filter(|sources| !sources.is_empty())
+                            .unwrap_or_else(|| available_sources.clone());
+                        chart.configure_liquidity_heatmap(sources);
+                    }
+                    self.sync_liquidity_heatmap_streams();
                     return Some(Effect::RefreshStreams);
                 }
             }
@@ -1578,22 +2055,25 @@ impl State {
                 }
             }
             Event::AggregateSourceToggled(ticker_info, enabled) => {
-                let (mut available_sources, mut selected_sources) = (match &self.content {
-                    Content::Kline {
-                        chart: Some(chart), ..
-                    } => chart.feed().id().map(|_| {
-                        (
-                            chart.feed().available_sources().to_vec(),
-                            chart
-                                .feed()
-                                .sources()
-                                .iter()
-                                .map(|source| source.ticker)
-                                .collect::<Vec<_>>(),
-                        )
-                    }),
-                    _ => None,
-                })?;
+                let Content::Kline {
+                    chart: Some(chart), ..
+                } = &self.content
+                else {
+                    return None;
+                };
+                chart.feed().id()?;
+                let content_kind = match chart.kind() {
+                    data::chart::KlineChartKind::Footprint { .. } => ContentKind::FootprintChart,
+                    data::chart::KlineChartKind::Tpo { .. } => ContentKind::TpoChart,
+                    _ => return None,
+                };
+                let mut available_sources = chart.feed().available_sources().to_vec();
+                let mut selected_sources = chart
+                    .feed()
+                    .sources()
+                    .iter()
+                    .map(|source| source.ticker)
+                    .collect::<Vec<_>>();
 
                 if enabled {
                     if !available_sources
@@ -1619,7 +2099,7 @@ impl State {
                 }
 
                 self.settings.aggregate_sources = Some(selected_sources);
-                self.set_content_and_streams(available_sources, ContentKind::TpoChart);
+                self.set_content_and_streams(available_sources, content_kind);
                 return Some(Effect::RefreshStreams);
             }
             Event::FootprintHistoryAggregationToggled(aggregate) => {
@@ -1630,6 +2110,9 @@ impl State {
                         chart.footprint_history_sources().to_vec(),
                         chart.footprint_history_aggregate(),
                     )),
+                    Content::FootprintHistory(Some(history)) => {
+                        Some((history.sources().to_vec(), history.aggregate()))
+                    }
                     _ => None,
                 })?;
                 if aggregate == current {
@@ -1641,11 +2124,14 @@ impl State {
                 self.settings.footprint_history_aggregate = aggregate;
                 self.settings.footprint_history_sources =
                     Some(sources.iter().map(|source| source.ticker).collect());
-                if let Content::Kline {
-                    chart: Some(chart), ..
-                } = &mut self.content
-                {
-                    chart.configure_footprint_history(sources, aggregate);
+                match &mut self.content {
+                    Content::Kline {
+                        chart: Some(chart), ..
+                    } => chart.configure_footprint_history(sources, aggregate),
+                    Content::FootprintHistory(Some(history)) => {
+                        history.configure_sources(sources, aggregate);
+                    }
+                    _ => {}
                 }
                 self.sync_footprint_history_streams();
                 return Some(Effect::RefreshStreams);
@@ -1658,6 +2144,9 @@ impl State {
                         chart.footprint_history_sources().to_vec(),
                         chart.footprint_history_aggregate(),
                     )),
+                    Content::FootprintHistory(Some(history)) => {
+                        Some((history.sources().to_vec(), history.aggregate()))
+                    }
                     _ => None,
                 })?;
 
@@ -1684,13 +2173,52 @@ impl State {
 
                 self.settings.footprint_history_sources =
                     Some(sources.iter().map(|source| source.ticker).collect());
+                match &mut self.content {
+                    Content::Kline {
+                        chart: Some(chart), ..
+                    } => chart.configure_footprint_history(sources, aggregate),
+                    Content::FootprintHistory(Some(history)) => {
+                        history.configure_sources(sources, aggregate);
+                    }
+                    _ => {}
+                }
+                self.sync_footprint_history_streams();
+                return Some(Effect::RefreshStreams);
+            }
+            Event::LiquidityHeatmapSourceToggled(ticker_info, enabled) => {
+                let mut sources = (match &self.content {
+                    Content::Kline {
+                        chart: Some(chart), ..
+                    } => Some(chart.liquidity_heatmap_sources().to_vec()),
+                    _ => None,
+                })?;
+
+                if enabled {
+                    if !sources
+                        .iter()
+                        .any(|source| source.ticker.same_market(&ticker_info.ticker))
+                    {
+                        sources.push(ticker_info);
+                    }
+                } else {
+                    sources.retain(|source| !source.ticker.same_market(&ticker_info.ticker));
+                    if sources.is_empty() {
+                        self.notifications.push(Toast::warn(
+                            "At least one liquidity venue must remain enabled".to_string(),
+                        ));
+                        return None;
+                    }
+                }
+
+                self.settings.liquidity_heatmap_sources =
+                    Some(sources.iter().map(|source| source.ticker).collect());
                 if let Content::Kline {
                     chart: Some(chart), ..
                 } = &mut self.content
                 {
-                    chart.configure_footprint_history(sources, aggregate);
+                    chart.configure_liquidity_heatmap(sources);
                 }
-                self.sync_footprint_history_streams();
+                self.sync_liquidity_heatmap_streams();
                 return Some(Effect::RefreshStreams);
             }
             Event::StudyConfigurator(study_msg) => match study_msg {
@@ -1744,6 +2272,17 @@ impl State {
                                         }
                                         Content::Ladder(Some(p)) => {
                                             p.set_tick_size(tm.multiply_with_min_tick_step(ticker));
+                                        }
+                                        Content::FootprintHistory(Some(history)) => {
+                                            let min_step = history
+                                                .sources()
+                                                .iter()
+                                                .map(|source| PriceStep::from(source.min_ticksize))
+                                                .min_by_key(|step| step.units)
+                                                .unwrap_or_else(|| {
+                                                    PriceStep::from(ticker.min_ticksize)
+                                                });
+                                            history.set_block_step(tm.multiply_step(min_step));
                                         }
                                         Content::ShaderHeatmap {
                                             chart: Some(c),
@@ -1927,6 +2466,7 @@ impl State {
                                 }
                             }
                         }
+                        self.sync_liquidity_heatmap_streams();
                     }
 
                     self.modal = Some(Modal::StreamModifier(modifier));
@@ -2229,6 +2769,9 @@ impl State {
             Content::Kline { chart, .. } => chart
                 .as_mut()
                 .and_then(|c| c.invalidate(Some(now)).map(Action::Chart)),
+            Content::FootprintHistory(history) => history
+                .as_mut()
+                .and_then(|content| content.invalidate(Some(now)).map(Action::Chart)),
             Content::TimeAndSales(panel) => panel
                 .as_mut()
                 .and_then(|p| p.invalidate(Some(now)).map(Action::Panel)),
@@ -2254,7 +2797,9 @@ impl State {
 
     pub fn update_interval(&self) -> Option<u64> {
         match &self.content {
-            Content::Kline { .. } | Content::Comparison(_) => Some(1000),
+            Content::Kline { .. } | Content::FootprintHistory(_) | Content::Comparison(_) => {
+                Some(1000)
+            }
             Content::Heatmap { chart, .. } => {
                 if let Some(chart) = chart {
                     chart.basis_interval()
@@ -2265,6 +2810,22 @@ impl State {
             Content::Ladder(_) | Content::TimeAndSales(_) => Some(100),
             Content::ShaderHeatmap { .. } => None,
             Content::Starter => None,
+        }
+    }
+
+    /// Returns `None` only when this pane needs a redraw on every rendered frame.
+    pub fn tick_subscription_interval_ms(&self) -> Option<u64> {
+        match &self.content {
+            Content::ShaderHeatmap { chart: Some(_), .. } => None,
+            Content::Heatmap {
+                chart: Some(chart), ..
+            } if chart.basis_interval().is_none() => Some(INITIALIZING_TICK_INTERVAL_MS),
+            _ if !self.content.initialized() => Some(INITIALIZING_TICK_INTERVAL_MS),
+            _ => Some(
+                self.update_interval()
+                    .unwrap_or(IDLE_TICK_INTERVAL_MS)
+                    .max(1),
+            ),
         }
     }
 
@@ -2364,6 +2925,7 @@ pub enum Content {
         layout: data::chart::ViewConfig,
         kind: data::chart::KlineChartKind,
     },
+    FootprintHistory(Option<FootprintHistory>),
     TimeAndSales(Option<TimeAndSales>),
     Ladder(Option<Ladder>),
     Comparison(Option<ComparisonChart>),
@@ -2497,6 +3059,12 @@ impl Content {
             ContentKind::CandlestickChart => (Timeframe::M15, data::chart::KlineChartKind::Candles),
             _ => unreachable!("invalid content kind for kline chart"),
         };
+        let determined_chart_kind = match determined_chart_kind {
+            data::chart::KlineChartKind::Tpo { config } => data::chart::KlineChartKind::Tpo {
+                config: config.normalized(),
+            },
+            kind => kind,
+        };
 
         let basis = settings.selected_basis.unwrap_or(Basis::Time(default_tf));
 
@@ -2527,20 +3095,20 @@ impl Content {
         let splits = {
             let main_chart_split: f32 = 0.8;
             let mut splits_vec = vec![main_chart_split];
+            let num_indicators = enabled_indicators
+                .iter()
+                .filter(|indicator| !indicator.is_overlay())
+                .count();
 
-            if !enabled_indicators.is_empty() {
-                let num_indicators = enabled_indicators.len();
+            if num_indicators > 1 {
+                let indicator_total_height_ratio = 1.0 - main_chart_split;
+                let height_per_indicator_pane =
+                    indicator_total_height_ratio / num_indicators as f32;
 
-                if num_indicators > 0 {
-                    let indicator_total_height_ratio = 1.0 - main_chart_split;
-                    let height_per_indicator_pane =
-                        indicator_total_height_ratio / num_indicators as f32;
-
-                    let mut current_split_pos = main_chart_split;
-                    for _ in 0..(num_indicators - 1) {
-                        current_split_pos += height_per_indicator_pane;
-                        splits_vec.push(current_split_pos);
-                    }
+                let mut current_split_pos = main_chart_split;
+                for _ in 0..(num_indicators - 1) {
+                    current_split_pos += height_per_indicator_pane;
+                    splits_vec.push(current_split_pos);
                 }
             }
             splits_vec
@@ -2577,6 +3145,7 @@ impl Content {
     fn placeholder(kind: ContentKind) -> Self {
         match kind {
             ContentKind::Starter => Content::Starter,
+            ContentKind::FootprintHistory => Content::FootprintHistory(None),
             ContentKind::CandlestickChart => Content::Kline {
                 chart: None,
                 indicators: vec![KlineIndicator::Volume],
@@ -2650,6 +3219,7 @@ impl Content {
             Content::TimeAndSales(panel) => Some(panel.as_ref()?.last_update()),
             Content::Ladder(panel) => Some(panel.as_ref()?.last_update()),
             Content::Comparison(chart) => Some(chart.as_ref()?.last_update()),
+            Content::FootprintHistory(history) => Some(history.as_ref()?.last_update()),
             Content::Starter => None,
             Content::ShaderHeatmap { chart, .. } => Some(chart.as_ref()?.last_tick?),
         }
@@ -2693,11 +3263,18 @@ impl Content {
                 let Some(chart) = chart else {
                     return;
                 };
-                if !kind.allows_indicator(ind) {
+                let is_enabled = indicators.contains(&ind);
+                if !is_enabled && !kind.allows_indicator(ind) {
+                    return;
+                }
+                if !is_enabled
+                    && ind == KlineIndicator::LiquidityHeatmap
+                    && !chart.allows_liquidity_heatmap()
+                {
                     return;
                 }
 
-                if indicators.contains(&ind) {
+                if is_enabled {
                     indicators.retain(|i| i != &ind);
                 } else {
                     indicators.push(ind);
@@ -2732,6 +3309,7 @@ impl Content {
             Content::TimeAndSales(_)
             | Content::Ladder(_)
             | Content::Starter
+            | Content::FootprintHistory(_)
             | Content::Comparison(_)
             | Content::ShaderHeatmap { .. } => {
                 panic!("indicator reorder on {} pane", self)
@@ -2779,6 +3357,7 @@ impl Content {
             Content::TimeAndSales(_)
             | Content::Ladder(_)
             | Content::Starter
+            | Content::FootprintHistory(_)
             | Content::Comparison(_) => None,
         }
     }
@@ -2849,14 +3428,17 @@ impl Content {
             Content::TimeAndSales(_) => ContentKind::TimeAndSales,
             Content::Ladder(_) => ContentKind::Ladder,
             Content::Comparison(_) => ContentKind::ComparisonChart,
+            Content::FootprintHistory(_) => ContentKind::FootprintHistory,
             Content::Starter => ContentKind::Starter,
             Content::ShaderHeatmap { .. } => ContentKind::ShaderHeatmap,
         }
     }
 
     pub fn update_theme(&mut self, theme: &iced_core::Theme) {
-        if let Content::ShaderHeatmap { chart: Some(c), .. } = self {
-            c.update_theme(theme);
+        match self {
+            Content::ShaderHeatmap { chart: Some(c), .. } => c.update_theme(theme),
+            Content::Kline { chart: Some(c), .. } => c.update_theme(theme),
+            _ => {}
         }
     }
 
@@ -2865,6 +3447,7 @@ impl Content {
             Content::Heatmap { chart, .. } => chart.is_some(),
             Content::ShaderHeatmap { chart, .. } => chart.is_some(),
             Content::Kline { chart, .. } => chart.is_some(),
+            Content::FootprintHistory(history) => history.is_some(),
             Content::TimeAndSales(panel) => panel.is_some(),
             Content::Ladder(panel) => panel.is_some(),
             Content::Comparison(chart) => chart.is_some(),
@@ -2898,6 +3481,7 @@ impl PartialEq for Content {
             (Content::Starter, Content::Starter)
                 | (Content::Heatmap { .. }, Content::Heatmap { .. })
                 | (Content::Kline { .. }, Content::Kline { .. })
+                | (Content::FootprintHistory(_), Content::FootprintHistory(_))
                 | (Content::TimeAndSales(_), Content::TimeAndSales(_))
                 | (Content::Ladder(_), Content::Ladder(_))
         )
@@ -2977,6 +3561,38 @@ fn ticksize_modifier<'a>(
         .into()
 }
 
+#[allow(clippy::too_many_arguments)]
+fn footprint_history_modifier(
+    id: pane_grid::Pane,
+    block_step: PriceStep,
+    base_step: PriceStep,
+    min_ticksize: Option<exchange::unit::MinTicksize>,
+    multiplier: TickMultiplier,
+    modifier: Option<modal::stream::Modifier>,
+    exchange: Option<exchange::adapter::Exchange>,
+) -> Element<'static, Message> {
+    let kind = ModifierKind::Footprint(Basis::Tick(data::aggr::TickCount(1)), multiplier);
+    let modifier_modal =
+        Modal::StreamModifier(modal::stream::Modifier::new(kind).with_ticksize_view(
+            base_step,
+            min_ticksize,
+            multiplier,
+            exchange,
+        ));
+    let is_active = modifier.is_some_and(|value| {
+        matches!(
+            value.view_mode,
+            modal::stream::ViewMode::TicksizeSelection { .. }
+        )
+    });
+
+    button(text(format!("Block {}", block_step.to_ui_string())).align_y(Alignment::Center))
+        .style(move |theme, status| style::button::modifier(theme, status, !is_active))
+        .on_press(Message::PaneEvent(id, Event::ShowModal(modifier_modal)))
+        .height(widget::PANE_CONTROL_BTN_HEIGHT)
+        .into()
+}
+
 fn basis_modifier<'a>(
     id: pane_grid::Pane,
     selected_basis: Basis,
@@ -3036,8 +3652,12 @@ fn by_basis_default<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use exchange::Ticker;
     use exchange::adapter::Exchange;
+    use exchange::{
+        Ticker, UnixMs,
+        depth::Depth,
+        unit::{Price, Qty},
+    };
 
     fn ticker_info(exchange: Exchange, symbol: &str, min_ticksize: f32) -> TickerInfo {
         TickerInfo::new(Ticker::new(symbol, exchange), min_ticksize, 0.001, None)
@@ -3121,6 +3741,58 @@ mod tests {
     }
 
     #[test]
+    fn footprint_uses_all_three_btc_perpetual_trade_sources() {
+        let binance = ticker_info(Exchange::BinanceLinear, "BTCUSDT", 0.1);
+        let bybit = ticker_info(Exchange::BybitLinear, "BTCUSDT", 0.1);
+        let hyperliquid = ticker_info(Exchange::HyperliquidLinear, "BTC", 1.0);
+        let mut state = State::default();
+
+        let streams = state.set_content_and_streams(
+            vec![binance, bybit, hyperliquid],
+            ContentKind::FootprintChart,
+        );
+
+        assert_eq!(
+            streams
+                .iter()
+                .filter(|stream| matches!(stream, StreamKind::Trades { .. }))
+                .count(),
+            3
+        );
+        assert_eq!(
+            streams
+                .iter()
+                .filter(|stream| matches!(stream, StreamKind::Kline { .. }))
+                .count(),
+            1
+        );
+        let Content::Kline {
+            chart: Some(chart), ..
+        } = &state.content
+        else {
+            panic!("Footprint chart initialized");
+        };
+        assert_eq!(chart.feed().sources(), &[binance, bybit, hyperliquid]);
+        assert_eq!(chart.tick_size().to_ui_string(), "0.1");
+        assert!(matches!(
+            state.stream_pair_kind(),
+            Some(StreamPairKind::MultiSource(sources)) if sources == vec![binance, bybit, hyperliquid]
+        ));
+
+        assert!(matches!(
+            state.update(Event::AggregateSourceToggled(hyperliquid, false)),
+            Some(Effect::RefreshStreams)
+        ));
+        assert!(matches!(
+            state.content,
+            Content::Kline {
+                kind: data::chart::KlineChartKind::Footprint { .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn footprint_history_streams_are_toggleable_and_hidden_from_main_chart_identity() {
         let binance = ticker_info(Exchange::BinanceLinear, "BTCUSDT", 0.1);
         let bybit = ticker_info(Exchange::BybitLinear, "BTCUSDT", 0.1);
@@ -3162,5 +3834,379 @@ mod tests {
                 .count(),
             0
         );
+    }
+
+    #[test]
+    fn daily_delta_reuses_trade_history_streams_and_aggregation() {
+        let binance = ticker_info(Exchange::BinanceLinear, "BTCUSDT", 0.1);
+        let bybit = ticker_info(Exchange::BybitLinear, "BTCUSDT", 0.1);
+        let hyperliquid = ticker_info(Exchange::HyperliquidLinear, "BTC", 0.1);
+        let mut state = State::default();
+        state.set_content_and_streams(vec![binance], ContentKind::CandlestickChart);
+
+        assert!(matches!(
+            state.update(Event::ToggleIndicator(
+                UiIndicator::Kline(KlineIndicator::DailyDelta),
+                vec![binance, bybit, hyperliquid],
+            )),
+            Some(Effect::RefreshStreams)
+        ));
+        assert_eq!(
+            state
+                .streams
+                .ready_iter()
+                .expect("ready streams")
+                .filter(|stream| matches!(stream, StreamKind::Trades { .. }))
+                .count(),
+            3
+        );
+        assert!(matches!(
+            state.stream_pair_kind(),
+            Some(StreamPairKind::SingleSource(source)) if source == binance
+        ));
+
+        let Content::Kline {
+            indicators,
+            chart: Some(chart),
+            ..
+        } = &state.content
+        else {
+            panic!("candlestick chart initialized");
+        };
+        assert!(indicators.contains(&KlineIndicator::DailyDelta));
+        assert!(chart.footprint_history_aggregate());
+        assert_eq!(chart.footprint_history_sources().len(), 3);
+    }
+
+    #[test]
+    fn restored_daily_delta_resolves_selected_bybit_and_hyperliquid_trade_streams() {
+        let binance = ticker_info(Exchange::BinanceLinear, "BTCUSDT", 0.1);
+        let bybit = ticker_info(Exchange::BybitLinear, "BTCUSDT", 0.1);
+        let hyperliquid = ticker_info(Exchange::HyperliquidLinear, "BTC", 0.1);
+        let mut content = Content::placeholder(ContentKind::CandlestickChart);
+        let Content::Kline { indicators, .. } = &mut content else {
+            panic!("candlestick placeholder");
+        };
+        indicators.push(KlineIndicator::DailyDelta);
+
+        let mut state = State::from_config(
+            content,
+            vec![PersistStreamKind::Kline {
+                ticker: binance.ticker,
+                timeframe: Timeframe::M30,
+            }],
+            Settings {
+                footprint_history_sources: Some(vec![bybit.ticker, hyperliquid.ticker]),
+                footprint_history_aggregate: true,
+                ..Settings::default()
+            },
+            None,
+        );
+        let ResolvedStream::Waiting { streams, .. } = &state.streams else {
+            panic!("persisted streams wait for metadata");
+        };
+        let restored_sources = streams
+            .iter()
+            .filter_map(|stream| match stream {
+                PersistStreamKind::Trades { ticker } => Some(*ticker),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(restored_sources, vec![bybit.ticker, hyperliquid.ticker]);
+
+        let metadata = [binance, bybit, hyperliquid];
+        let resolved = streams
+            .clone()
+            .into_iter()
+            .flat_map(|stream| {
+                stream
+                    .into_stream_kinds(|ticker| {
+                        metadata
+                            .iter()
+                            .copied()
+                            .find(|info| info.ticker.same_market(ticker))
+                    })
+                    .expect("configured metadata resolves")
+            })
+            .collect::<Vec<_>>();
+        state.streams = ResolvedStream::Ready(resolved);
+        let Some(StreamPairKind::MultiSource(tickers)) = state.stream_pair_kind() else {
+            panic!("restored sources are available during chart initialization");
+        };
+        state.set_content_and_streams(tickers, ContentKind::CandlestickChart);
+
+        let Content::Kline {
+            chart: Some(chart), ..
+        } = &state.content
+        else {
+            panic!("restored candlestick chart initialized");
+        };
+        assert_eq!(chart.footprint_history_sources(), &[bybit, hyperliquid]);
+    }
+
+    #[test]
+    fn restored_liquidity_heatmap_rebuilds_selected_depth_streams() {
+        let binance = ticker_info(Exchange::BinanceLinear, "BTCUSDT", 0.1);
+        let bybit = ticker_info(Exchange::BybitLinear, "BTCUSDT", 0.1);
+        let hyperliquid = ticker_info(Exchange::HyperliquidLinear, "BTC", 1.0);
+        let mut content = Content::placeholder(ContentKind::CandlestickChart);
+        let Content::Kline { indicators, .. } = &mut content else {
+            panic!("candlestick placeholder");
+        };
+        indicators.push(KlineIndicator::LiquidityHeatmap);
+
+        let mut state = State::from_config(
+            content,
+            vec![PersistStreamKind::Kline {
+                ticker: binance.ticker,
+                timeframe: Timeframe::M30,
+            }],
+            Settings {
+                liquidity_heatmap_sources: Some(vec![
+                    binance.ticker,
+                    bybit.ticker,
+                    hyperliquid.ticker,
+                ]),
+                ..Settings::default()
+            },
+            None,
+        );
+        let ResolvedStream::Waiting { streams, .. } = &state.streams else {
+            panic!("persisted streams wait for metadata");
+        };
+        let restored_sources = streams
+            .iter()
+            .filter_map(|stream| match stream {
+                PersistStreamKind::Depth(depth) => Some(depth.ticker),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            restored_sources,
+            vec![binance.ticker, bybit.ticker, hyperliquid.ticker]
+        );
+
+        let metadata = [binance, bybit, hyperliquid];
+        let resolved = streams
+            .clone()
+            .into_iter()
+            .flat_map(|stream| {
+                stream
+                    .into_stream_kinds(|ticker| {
+                        metadata
+                            .iter()
+                            .copied()
+                            .find(|info| info.ticker.same_market(ticker))
+                    })
+                    .expect("configured metadata resolves")
+            })
+            .collect::<Vec<_>>();
+        state.streams = ResolvedStream::Ready(resolved);
+        let Some(StreamPairKind::MultiSource(tickers)) = state.stream_pair_kind() else {
+            panic!("restored depth sources are available during chart initialization");
+        };
+        state.set_content_and_streams(tickers, ContentKind::CandlestickChart);
+
+        let Content::Kline {
+            chart: Some(chart), ..
+        } = &state.content
+        else {
+            panic!("restored candlestick chart initialized");
+        };
+        assert_eq!(
+            chart.liquidity_heatmap_sources(),
+            &[binance, bybit, hyperliquid]
+        );
+        assert_eq!(
+            state
+                .streams
+                .ready_iter()
+                .expect("ready streams")
+                .filter(|stream| matches!(stream, StreamKind::Depth { .. }))
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn previous_value_area_aggregates_all_selected_trade_venues() {
+        let binance = ticker_info(Exchange::BinanceLinear, "BTCUSDT", 0.1);
+        let bybit = ticker_info(Exchange::BybitLinear, "BTCUSDT", 0.1);
+        let hyperliquid = ticker_info(Exchange::HyperliquidLinear, "BTC", 0.1);
+        let mut state = State::default();
+        state.set_content_and_streams(vec![binance], ContentKind::CandlestickChart);
+
+        assert!(matches!(
+            state.update(Event::ToggleIndicator(
+                UiIndicator::Kline(KlineIndicator::PreviousValueArea),
+                vec![binance, bybit, hyperliquid],
+            )),
+            Some(Effect::RefreshStreams)
+        ));
+        assert_eq!(
+            state
+                .streams
+                .ready_iter()
+                .expect("ready streams")
+                .filter(|stream| matches!(stream, StreamKind::Trades { .. }))
+                .count(),
+            3
+        );
+
+        let Content::Kline {
+            indicators,
+            chart: Some(chart),
+            ..
+        } = &state.content
+        else {
+            panic!("candlestick chart initialized");
+        };
+        assert!(indicators.contains(&KlineIndicator::PreviousValueArea));
+        assert!(chart.footprint_history_aggregate());
+        assert_eq!(chart.footprint_history_sources().len(), 3);
+    }
+
+    #[test]
+    fn liquidity_heatmap_uses_three_depth_streams_without_changing_chart_identity() {
+        let binance = ticker_info(Exchange::BinanceLinear, "BTCUSDT", 0.1);
+        let bybit = ticker_info(Exchange::BybitLinear, "BTCUSDT", 0.1);
+        let hyperliquid = ticker_info(Exchange::HyperliquidLinear, "BTC", 1.0);
+        let mut state = State::default();
+        state.set_content_and_streams(vec![binance], ContentKind::CandlestickChart);
+
+        assert!(matches!(
+            state.update(Event::ToggleIndicator(
+                UiIndicator::Kline(KlineIndicator::LiquidityHeatmap),
+                vec![binance, bybit, hyperliquid],
+            )),
+            Some(Effect::RefreshStreams)
+        ));
+        assert_eq!(
+            state
+                .streams
+                .ready_iter()
+                .expect("ready streams")
+                .filter(|stream| matches!(stream, StreamKind::Depth { .. }))
+                .count(),
+            3
+        );
+        assert!(matches!(
+            state.stream_pair_kind(),
+            Some(StreamPairKind::SingleSource(source)) if source == binance
+        ));
+
+        let Content::Kline {
+            indicators,
+            chart: Some(chart),
+            ..
+        } = &state.content
+        else {
+            panic!("candlestick chart initialized");
+        };
+        assert!(indicators.contains(&KlineIndicator::LiquidityHeatmap));
+        assert_eq!(chart.liquidity_heatmap_sources().len(), 3);
+        assert!(chart.liquidity_heatmap_runtime_active());
+        assert!(!chart.liquidity_heatmap_has_depth_data());
+
+        let depth = Depth {
+            bids: [(Price::from_f64(70_000.0), Qty::from_f64(2.0))]
+                .into_iter()
+                .collect(),
+            asks: [(Price::from_f64(70_001.0), Qty::from_f64(3.0))]
+                .into_iter()
+                .collect(),
+        };
+        let Content::Kline {
+            chart: Some(chart), ..
+        } = &mut state.content
+        else {
+            panic!("candlestick chart initialized");
+        };
+        chart.insert_depth(binance, &depth, UnixMs::new(1_000));
+        assert!(chart.liquidity_heatmap_has_depth_data());
+
+        let mut config = chart.visual_config();
+        config.liquidity_heatmap_order_size_filter = 125_000.0;
+        chart.set_visual_config(config);
+        assert_eq!(chart.liquidity_heatmap_order_size_filter(), Some(125_000.0));
+
+        assert!(matches!(
+            state.update(Event::LiquidityHeatmapSourceToggled(bybit, false)),
+            Some(Effect::RefreshStreams)
+        ));
+        assert_eq!(
+            state
+                .streams
+                .ready_iter()
+                .expect("ready streams")
+                .filter(|stream| matches!(stream, StreamKind::Depth { .. }))
+                .count(),
+            2
+        );
+
+        assert!(matches!(
+            state.update(Event::ToggleIndicator(
+                UiIndicator::Kline(KlineIndicator::LiquidityHeatmap),
+                vec![binance, bybit, hyperliquid],
+            )),
+            Some(Effect::RefreshStreams)
+        ));
+        assert_eq!(
+            state
+                .streams
+                .ready_iter()
+                .expect("ready streams")
+                .filter(|stream| matches!(stream, StreamKind::Depth { .. }))
+                .count(),
+            0
+        );
+        let Content::Kline {
+            indicators,
+            chart: Some(chart),
+            ..
+        } = &state.content
+        else {
+            panic!("candlestick chart initialized");
+        };
+        assert!(!indicators.contains(&KlineIndicator::LiquidityHeatmap));
+        assert!(!chart.liquidity_heatmap_runtime_active());
+    }
+
+    #[test]
+    fn standalone_footprint_history_owns_its_sources_and_aggregation_toggle() {
+        let binance = ticker_info(Exchange::BinanceLinear, "BTCUSDT", 0.1);
+        let bybit = ticker_info(Exchange::BybitLinear, "BTCUSDT", 0.1);
+        let hyperliquid = ticker_info(Exchange::HyperliquidLinear, "BTC", 0.1);
+        let mut state = State::default();
+
+        let streams = state.set_content_and_streams(
+            vec![binance, bybit, hyperliquid],
+            ContentKind::FootprintHistory,
+        );
+        assert_eq!(streams.len(), 3);
+        let Content::FootprintHistory(Some(history)) = &state.content else {
+            panic!("standalone Footprint History initialized");
+        };
+        assert_eq!(history.sources(), &[binance, bybit, hyperliquid]);
+        assert!(history.aggregate());
+
+        assert!(matches!(
+            state.update(Event::FootprintHistoryAggregationToggled(false)),
+            Some(Effect::RefreshStreams)
+        ));
+        assert_eq!(
+            state.streams.ready_iter().expect("ready streams").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn regular_panes_do_not_request_frame_rate_ticks() {
+        let mut state = State::default();
+        assert_eq!(state.tick_subscription_interval_ms(), Some(1000));
+
+        state.content = Content::placeholder(ContentKind::CandlestickChart);
+        assert_eq!(state.tick_subscription_interval_ms(), Some(100));
     }
 }

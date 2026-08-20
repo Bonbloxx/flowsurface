@@ -16,6 +16,7 @@ use data::layout::pane::VisualConfig;
 use data::panel::ladder;
 use data::panel::timeandsales::{StackedBar, StackedBarRatio};
 use data::util::format_with_commas;
+use exchange::TickMultiplier;
 
 use iced::widget::{checkbox, space};
 use iced::{
@@ -595,6 +596,41 @@ pub fn comparison_cfg_view<'a>(
 }
 
 type FootprintHistorySettings = Option<(Vec<(exchange::TickerInfo, String, bool)>, bool)>;
+type LiquidityHeatmapSettings = Option<Vec<(exchange::TickerInfo, String, bool)>>;
+
+pub fn footprint_history_cfg_view(
+    pane: pane_grid::Pane,
+    sources: Vec<(exchange::TickerInfo, String, bool)>,
+    aggregate: bool,
+) -> Element<'static, Message> {
+    let source_choices = sources.into_iter().fold(
+        column![].spacing(6),
+        |choices, (ticker_info, label, selected)| {
+            choices.push(checkbox(selected).label(label).on_toggle(move |enabled| {
+                Message::PaneEvent(
+                    pane,
+                    Event::FootprintHistorySourceToggled(ticker_info, enabled),
+                )
+            }))
+        },
+    );
+
+    cfg_view_container(
+        360,
+        column![
+            text("Footprint History").size(crate::style::text_size::SECTION),
+            text("Choose one venue or combine equivalent markets."),
+            checkbox(aggregate)
+                .label("Aggregate selected venues")
+                .on_toggle(move |enabled| Message::PaneEvent(
+                    pane,
+                    Event::FootprintHistoryAggregationToggled(enabled),
+                )),
+            source_choices,
+        ]
+        .spacing(8),
+    )
+}
 
 pub fn kline_cfg_view<'a>(
     study_config: &'a study::Configurator<FootprintStudy>,
@@ -605,6 +641,9 @@ pub fn kline_cfg_view<'a>(
     tick_size: exchange::unit::PriceStep,
     aggregate_sources: Vec<(exchange::TickerInfo, &'static str, bool)>,
     footprint_history: FootprintHistorySettings,
+    liquidity_heatmap: LiquidityHeatmapSettings,
+    daily_delta: Option<(u16, u16)>,
+    previous_value_area: Option<u16>,
 ) -> Element<'a, Message> {
     let uses_shared_price_grid = !aggregate_sources.is_empty();
     let display_readout_section = {
@@ -702,7 +741,7 @@ pub fn kline_cfg_view<'a>(
                 display_readout_section,
                 column![
                     text("Renko construction").size(crate::style::text_size::SECTION),
-                    text("Built directly from executed trades; time does not close a brick."),
+                    text("History uses 1m closes; live bricks use executed trades. Time never closes a brick."),
                     row![text("Brick size (ticks)"), space::horizontal(), brick_size]
                         .align_y(Alignment::Center),
                     row![text("Reversal boxes"), space::horizontal(), reversal]
@@ -807,7 +846,7 @@ pub fn kline_cfg_view<'a>(
             );
             let history = pick_list(
                 data::chart::tpo::Config::HISTORY_PROFILE_PRESETS,
-                Some(config.profiles_to_load),
+                Some(config.normalized().profiles_to_load),
                 move |profiles_to_load| {
                     Message::PaneEvent(
                         pane,
@@ -1056,6 +1095,74 @@ pub fn kline_cfg_view<'a>(
         }
     };
 
+    if let Some((ticks, days)) = daily_delta {
+        let tick_choices = pick_list(
+            data::chart::kline::Config::DAILY_DELTA_TICK_PRESETS,
+            Some(TickMultiplier(ticks)),
+            move |multiplier| {
+                Message::VisualConfigChanged(
+                    pane,
+                    VisualConfig::Kline(data::chart::kline::Config {
+                        daily_delta_ticks: multiplier.0,
+                        ..cfg
+                    }),
+                    false,
+                )
+            },
+        );
+        let day_choices = pick_list(
+            data::chart::kline::Config::DAILY_DELTA_DAY_PRESETS,
+            Some(days),
+            move |days| {
+                Message::VisualConfigChanged(
+                    pane,
+                    VisualConfig::Kline(data::chart::kline::Config {
+                        daily_delta_days: days,
+                        ..cfg
+                    }),
+                    false,
+                )
+            },
+        );
+        content = content.push(
+            column![
+                text("Daily Delta").size(crate::style::text_size::SECTION),
+                text("UTC-day dollar delta grouped by N exchange ticks. Shows only the last N UTC days, including today. Completed days sit at that day's UTC close; today is pinned to the live edge."),
+                row![text("Ticks per level"), space::horizontal(), tick_choices]
+                    .align_y(Alignment::Center),
+                row![text("Days back"), space::horizontal(), day_choices]
+                    .align_y(Alignment::Center),
+            ]
+            .spacing(8),
+        );
+    }
+
+    if let Some(ticks) = previous_value_area {
+        let tick_choices = pick_list(
+            data::chart::kline::Config::DAILY_DELTA_TICK_PRESETS,
+            Some(TickMultiplier(ticks)),
+            move |multiplier| {
+                Message::VisualConfigChanged(
+                    pane,
+                    VisualConfig::Kline(data::chart::kline::Config {
+                        previous_value_area_ticks: multiplier.0,
+                        ..cfg
+                    }),
+                    false,
+                )
+            },
+        );
+        content = content.push(
+            column![
+                text("Previous Value Areas").size(crate::style::text_size::SECTION),
+                text("Plots prior completed UTC day VAH/VAL plus week, month, and year VAH/POC/VAL from 70% executed-volume profiles."),
+                row![text("Ticks per level"), space::horizontal(), tick_choices]
+                    .align_y(Alignment::Center),
+            ]
+            .spacing(8),
+        );
+    }
+
     if let Some((sources, aggregate)) = footprint_history {
         let source_choices = sources.into_iter().fold(
             column![].spacing(6),
@@ -1070,14 +1177,54 @@ pub fn kline_cfg_view<'a>(
         );
         content = content.push(
             column![
-                text("Footprint History").size(crate::style::text_size::SECTION),
-                text("Venue data is isolated from the main chart."),
+                text("Trade venues").size(crate::style::text_size::SECTION),
+                text("Choose one venue or combine Binance, Bybit, and Hyperliquid."),
                 checkbox(aggregate)
                     .label("Aggregate selected venues")
                     .on_toggle(move |enabled| Message::PaneEvent(
                         pane,
                         Event::FootprintHistoryAggregationToggled(enabled),
                     )),
+                source_choices,
+            ]
+            .spacing(8),
+        );
+    }
+
+    if let Some(sources) = liquidity_heatmap {
+        let order_size_filter = labeled_slider(
+            "Minimum order (USD)",
+            0.0..=500_000.0,
+            cfg.liquidity_heatmap_order_size_filter,
+            move |value| {
+                Message::VisualConfigChanged(
+                    pane,
+                    VisualConfig::Kline(data::chart::kline::Config {
+                        liquidity_heatmap_order_size_filter: value,
+                        ..cfg
+                    }),
+                    false,
+                )
+            },
+            |value| format!(">${}", format_with_commas(*value as f64)),
+            Some(5_000.0),
+        );
+        let source_choices = sources.into_iter().fold(
+            column![].spacing(6),
+            |choices, (ticker_info, label, selected)| {
+                choices.push(checkbox(selected).label(label).on_toggle(move |enabled| {
+                    Message::PaneEvent(
+                        pane,
+                        Event::LiquidityHeatmapSourceToggled(ticker_info, enabled),
+                    )
+                }))
+            },
+        );
+        content = content.push(
+            column![
+                text("Liquidity Heatmap").size(crate::style::text_size::SECTION),
+                text("Combine live order books from Binance, Bybit, and Hyperliquid. History starts when enabled because venues do not provide historical L2 snapshots."),
+                order_size_filter,
                 source_choices,
             ]
             .spacing(8),

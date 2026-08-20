@@ -163,6 +163,11 @@ impl From<&pane::State> for data::Pane {
                 indicators: indicators.clone(),
                 link_group: pane.link_group,
             },
+            pane::Content::FootprintHistory(_) => data::Pane::FootprintHistory {
+                stream_type: streams,
+                settings: pane.settings.clone(),
+                link_group: pane.link_group,
+            },
             pane::Content::TimeAndSales(_) => data::Pane::TimeAndSales {
                 stream_type: streams,
                 settings: pane.settings.clone(),
@@ -272,6 +277,16 @@ pub fn configuration(pane: data::Pane) -> Configuration<pane::State> {
                 link_group,
             ))
         }
+        data::Pane::FootprintHistory {
+            stream_type,
+            settings,
+            link_group,
+        } => Configuration::Pane(pane::State::from_config(
+            pane::Content::FootprintHistory(None),
+            stream_type,
+            settings,
+            link_group,
+        )),
         data::Pane::ComparisonChart {
             stream_type,
             settings,

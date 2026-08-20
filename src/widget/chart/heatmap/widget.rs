@@ -1,4 +1,4 @@
-use crate::widget::chart::heatmap::scene::{InteractionKind, Scene};
+use crate::widget::chart::heatmap::scene::{Interaction, InteractionKind, Scene};
 use crate::widget::chart::heatmap::ui::AxisInteraction;
 use crate::widget::chart::heatmap::ui::axisx::AxisXLabelCanvas;
 use crate::widget::chart::heatmap::ui::axisy::AxisYLabelCanvas;
@@ -14,6 +14,73 @@ use iced_core::renderer::Quad;
 
 pub const DEFAULT_Y_AXIS_GUTTER: Length = Length::Fixed(66.0);
 pub const DEFAULT_X_AXIS_HEIGHT: Length = Length::Fixed(24.0);
+
+/// Passive shader-only layer used behind another chart's canvas.
+///
+/// This deliberately uses the same direct `draw_primitive` path as the
+/// standalone heatmap widget, without adding a second set of axes or input
+/// handling.
+pub struct HeatmapShaderLayer<'a> {
+    scene: &'a Scene,
+}
+
+impl<'a> HeatmapShaderLayer<'a> {
+    pub fn new(scene: &'a Scene) -> Self {
+        Self { scene }
+    }
+}
+
+impl<M> Widget<M, Theme, Renderer> for HeatmapShaderLayer<'_> {
+    fn tag(&self) -> tree::Tag {
+        tree::Tag::of::<Interaction>()
+    }
+
+    fn state(&self) -> tree::State {
+        tree::State::new(Interaction::default())
+    }
+
+    fn size(&self) -> Size<Length> {
+        Size {
+            width: Length::Fill,
+            height: Length::Fill,
+        }
+    }
+
+    fn layout(
+        &mut self,
+        _tree: &mut Tree,
+        _renderer: &Renderer,
+        limits: &layout::Limits,
+    ) -> layout::Node {
+        layout::Node::new(limits.max())
+    }
+
+    fn draw(
+        &self,
+        tree: &Tree,
+        renderer: &mut Renderer,
+        _theme: &Theme,
+        _style: &renderer::Style,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        _viewport: &Rectangle,
+    ) {
+        let bounds = layout.bounds();
+        if bounds.width < 1.0 || bounds.height < 1.0 {
+            return;
+        }
+
+        let state = tree.state.downcast_ref::<Interaction>();
+        use iced_wgpu::primitive::Renderer as _;
+        renderer.draw_primitive(bounds, self.scene.draw(state, cursor, bounds));
+    }
+}
+
+impl<'a, M: 'a> From<HeatmapShaderLayer<'a>> for Element<'a, M, Theme, Renderer> {
+    fn from(widget: HeatmapShaderLayer<'a>) -> Self {
+        Element::new(widget)
+    }
+}
 
 pub struct HeatmapShaderWidget<'a> {
     scene: &'a Scene,

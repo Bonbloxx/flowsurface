@@ -488,6 +488,14 @@ impl AdapterHandles {
                     .fetch_open_interest(ticker_info, timeframe, range)
                     .await
             }
+            Exchange::HyperliquidLinear => {
+                let Some(handle) = self.hyperliquid.as_ref() else {
+                    return Err(Self::missing_venue_error(exchange.venue()));
+                };
+                handle
+                    .fetch_open_interest(ticker_info, timeframe, range)
+                    .await
+            }
             _ => Err(AdapterError::InvalidRequest(format!(
                 "Open interest data not available for {exchange}"
             ))),
@@ -506,6 +514,14 @@ impl AdapterHandles {
         match exchange.venue() {
             Venue::Binance => {
                 let Some(handle) = self.binance.as_ref() else {
+                    return Err(Self::missing_venue_error(exchange.venue()));
+                };
+                handle
+                    .fetch_trades(ticker_info, from_time, to_time, data_path)
+                    .await
+            }
+            Venue::Bybit => {
+                let Some(handle) = self.bybit.as_ref() else {
                     return Err(Self::missing_venue_error(exchange.venue()));
                 };
                 handle

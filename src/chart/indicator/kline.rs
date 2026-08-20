@@ -5,14 +5,20 @@ use data::chart::indicator::KlineIndicator;
 use data::chart::kline::KlineDataPoint;
 use data::chart::{BasisSeries, PlotData};
 use exchange::adapter::Exchange;
+use exchange::unit::PriceStep;
 use exchange::{Kline, Timeframe, Trade, UnixMs};
+use iced::theme::palette::Extended;
+use iced::{Rectangle, widget::canvas};
 
 use super::plot::AnySeries;
 
 pub mod bar_analysis;
 pub mod cumulative_delta;
+pub mod daily_delta;
 pub mod footprint_history;
+pub mod liquidity_heatmap;
 pub mod open_interest;
+pub mod previous_value_area;
 pub mod volume;
 
 /// UI adapter methods for converting domain `BasisSeries` into plot-ready series.
@@ -122,7 +128,12 @@ pub trait KlineIndicatorImpl {
     /// Timeframe/tick interval has changed
     fn on_basis_change(&mut self, _source: &PlotData<KlineDataPoint>) {}
 
-    fn on_open_interest(&mut self, _pairs: &[exchange::OpenInterest]) {}
+    /// Configure venue sources for the aggregated open-interest indicator.
+    fn configure_open_interest(&mut self, _sources: &[exchange::TickerInfo]) {}
+
+    fn open_interest_sources(&self) -> &[exchange::TickerInfo] {
+        &[]
+    }
 
     /// Configure the independent Footprint History venue set.
     fn configure_footprint_history(&mut self, _sources: &[exchange::TickerInfo], _aggregate: bool) {
@@ -130,6 +141,24 @@ pub trait KlineIndicatorImpl {
 
     /// Set the historical/live boundary before a source backfill begins.
     fn prepare_footprint_history(&mut self, _source: exchange::TickerInfo, _cutoff: UnixMs) {}
+
+    /// Load one completed UTC-day trade book from the shared disk cache.
+    fn load_cached_footprint_day(
+        &mut self,
+        _source: exchange::TickerInfo,
+        _day_start: UnixMs,
+    ) -> Option<UnixMs> {
+        None
+    }
+
+    /// Persist one completed UTC-day trade book to the shared disk cache.
+    fn persist_cached_footprint_day(
+        &mut self,
+        _source: exchange::TickerInfo,
+        _day_start: UnixMs,
+        _covered_through: UnixMs,
+    ) {
+    }
 
     /// Source-aware trades used only by Footprint History.
     fn on_source_trades(
@@ -145,6 +174,27 @@ pub trait KlineIndicatorImpl {
         &mut self,
         _source: exchange::TickerInfo,
         _values: &[exchange::OpenInterest],
+    ) {
+    }
+
+    /// How many UTC days of trade history this indicator should retain.
+    fn set_trade_history_lookback(&mut self, _days: u16) {}
+
+    /// Price bucket retained by long-lookback value-area histories.
+    fn set_trade_history_price_step(&mut self, _step: PriceStep) {}
+
+    /// Drop cached UTC-day books so the next backfill is not merged on top.
+    fn reset_trade_history_backfill(&mut self) {}
+
+    /// Overlay drawn on the main chart canvas. Default is a no-op.
+    fn draw_overlay(
+        &self,
+        _frame: &mut canvas::Frame,
+        _chart: &ViewState,
+        _data_source: &PlotData<KlineDataPoint>,
+        _palette: &Extended,
+        _region: Rectangle,
+        _group_step: PriceStep,
     ) {
     }
 }
@@ -171,6 +221,15 @@ pub fn make_empty(which: KlineIndicator) -> Box<dyn KlineIndicatorImpl> {
         }
         KlineIndicator::FootprintHistory => {
             Box::new(super::kline::footprint_history::FootprintHistoryIndicator::new())
+        }
+        KlineIndicator::DailyDelta => {
+            Box::new(super::kline::daily_delta::DailyDeltaIndicator::new())
+        }
+        KlineIndicator::PreviousValueArea => {
+            Box::new(super::kline::previous_value_area::PreviousValueAreaIndicator::new())
+        }
+        KlineIndicator::LiquidityHeatmap => {
+            Box::new(super::kline::liquidity_heatmap::LiquidityHeatmapIndicator)
         }
     }
 }

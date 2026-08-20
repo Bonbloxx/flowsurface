@@ -48,6 +48,9 @@ pub enum Message {
     /// Trade history fetch finished successfully — clear in-flight flags and
     /// mark the request completed so further gap fills can run.
     TradeFetchCompleted(uuid::Uuid, Option<uuid::Uuid>),
+    /// Immediately schedule the next bounded trade-history range. This must
+    /// not wait for the chart timeframe tick (which can be one day).
+    ContinueTradeHistory(uuid::Uuid),
     SavePopoutSpecs(HashMap<window::Id, WindowSpec>),
     ErrorOccurred(Option<uuid::Uuid>, DashboardError),
     Notification(Toast),
@@ -204,9 +207,16 @@ impl Dashboard {
                                 log::error!("Fetch error: {msg}");
                                 c.mark_fetch_failed(req_id);
                             }
+                        } else if let pane::Content::FootprintHistory(Some(history)) =
+                            &mut state.content
+                            && let DashboardError::Fetch(ref msg, Some(req_id)) = err
+                        {
+                            log::error!("Fetch error: {msg}");
+                            history.mark_fetch_failed(req_id);
                         }
                         state.status = pane::Status::Ready;
                         state.notifications.push(Toast::error(err.to_string()));
+                        return (Task::done(Message::ContinueTradeHistory(id)), None);
                     }
                 }
                 _ => {
@@ -392,6 +402,11 @@ impl Dashboard {
                                             && let Some(c) = chart
                                         {
                                             c.set_handle(handle);
+                                        } else if let pane::Content::FootprintHistory(Some(
+                                            history,
+                                        )) = &mut state.content
+                                        {
+                                            history.set_handle(handle);
                                         }
                                     },
                                 )
@@ -434,11 +449,52 @@ impl Dashboard {
                             // reuse the public path that also clears trade flags.
                             c.finalize_trade_fetch(req_id);
                         }
+                    } else if let pane::Content::FootprintHistory(Some(history)) =
+                        &mut pane_state.content
+                        && let Some(req_id) = req_id
+                    {
+                        history.finalize_fetch(req_id);
                     }
                     if matches!(pane_state.status, pane::Status::Loading(..)) {
                         pane_state.status = pane::Status::Ready;
                     }
                 }
+                return (Task::done(Message::ContinueTradeHistory(pane_id)), None);
+            }
+            Message::ContinueTradeHistory(pane_id) => {
+                let Some(state) = self.get_mut_pane_state_by_uuid(main_window.id, pane_id) else {
+                    return (Task::none(), None);
+                };
+                let Some(pane::Action::Chart(chart::Action::RequestFetch(reqs))) =
+                    state.invalidate(Instant::now())
+                else {
+                    return (Task::none(), None);
+                };
+                let ready_streams = state
+                    .streams
+                    .ready_iter()
+                    .map(|iter| iter.copied().collect::<Vec<_>>())
+                    .unwrap_or_default();
+                let task = fetcher::request_fetch_many(
+                    data_sources,
+                    pane_id,
+                    &ready_streams,
+                    *layout_id,
+                    reqs.into_iter().map(|r| (r.req_id, r.fetch, r.stream)),
+                    |handle| {
+                        if let pane::Content::Kline { chart, .. } = &mut state.content
+                            && let Some(chart) = chart
+                        {
+                            chart.set_handle(handle);
+                        } else if let pane::Content::FootprintHistory(Some(history)) =
+                            &mut state.content
+                        {
+                            history.set_handle(handle);
+                        }
+                    },
+                )
+                .map(Message::from);
+                return (task, None);
             }
             Message::DistributeFetchedData {
                 layout_id,
@@ -981,12 +1037,18 @@ impl Dashboard {
                             if let Some(req_id) = req_id {
                                 c.mark_fetch_no_data(req_id);
                             }
+                        } else if let pane::Content::FootprintHistory(Some(history)) =
+                            &mut pane_state.content
+                            && let Some(req_id) = req_id
+                        {
+                            history.mark_fetch_no_data(req_id);
                         }
 
                         if matches!(pane_state.status, pane::Status::Loading(..)) {
                             pane_state.status = pane::Status::Ready;
                         }
                     }
+                    return Task::done(Message::ContinueTradeHistory(pane_id));
                 } else {
                     let last_trade_time = batch.last().map_or(UnixMs::ZERO, |trade| trade.time);
 
@@ -1088,6 +1150,13 @@ impl Dashboard {
                     ))
                 }
             }
+            pane::Content::FootprintHistory(Some(history)) => {
+                history.insert_historical_trades(source, trades, req_id, is_batches_done);
+                if is_batches_done {
+                    pane_state.status = pane::Status::Ready;
+                }
+                Ok(())
+            }
             _ => Err(DashboardError::Unknown(
                 "No matching chart found for fetched trades".to_string(),
             )),
@@ -1149,6 +1218,11 @@ impl Dashboard {
                                 c.insert_depth(depth, update_t);
                             }
                         }
+                        pane::Content::Kline { chart, .. } => {
+                            if let Some(c) = chart {
+                                c.insert_depth(stream.ticker_info(), depth, update_t);
+                            }
+                        }
                         pane::Content::Ladder(panel) => {
                             if let Some(panel) = panel {
                                 panel.insert_depth(depth, update_t);
@@ -1197,6 +1271,9 @@ impl Dashboard {
                                 c.insert_trades(stream.ticker_info(), buffer);
                             }
                         }
+                        pane::Content::FootprintHistory(Some(history)) => {
+                            history.insert_live_trades(stream.ticker_info(), buffer);
+                        }
                         pane::Content::TimeAndSales(panel) => {
                             if let Some(p) = panel {
                                 p.insert_buffer(buffer);
@@ -1234,6 +1311,30 @@ impl Dashboard {
             .for_each(|(_, _, state)| state.park_for_inactive_layout());
     }
 
+    /// Chooses the slowest subscription that still satisfies every visible pane.
+    /// `None` means an active shader heatmap needs frame-rate ticks.
+    pub fn tick_interval_ms(&self) -> Option<u64> {
+        let maximized = self.panes.maximized();
+        let main_panes = self.panes.iter().filter_map(|(pane_id, state)| {
+            maximized
+                .is_none_or(|maximized| maximized == *pane_id)
+                .then_some(state)
+        });
+        let popout_panes = self
+            .popout
+            .values()
+            .flat_map(|(panes, _)| panes.iter().map(|(_, state)| state));
+
+        let mut interval_ms: Option<u64> = None;
+        for state in main_panes.chain(popout_panes) {
+            let state_interval = state.tick_subscription_interval_ms()?;
+            interval_ms =
+                Some(interval_ms.map_or(state_interval, |current| current.min(state_interval)));
+        }
+
+        Some(interval_ms.unwrap_or(1000))
+    }
+
     pub fn tick(
         &mut self,
         now: Instant,
@@ -1267,6 +1368,10 @@ impl Dashboard {
                                 && let Some(c) = chart
                             {
                                 c.set_handle(handle);
+                            } else if let pane::Content::FootprintHistory(Some(history)) =
+                                &mut state.content
+                            {
+                                history.set_handle(handle);
                             }
                         },
                     )

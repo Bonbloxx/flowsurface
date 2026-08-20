@@ -18,6 +18,22 @@ static TRADE_FETCH_MODE: RwLock<TradeFetchMode> = RwLock::new(TradeFetchMode::Of
 /// Maximum trades to request per Arrow IPC call to server.
 const ARROW_LIMIT: usize = 400_000;
 
+/// Keep historical trade ingestion responsive by yielding smaller work units
+/// to the iced update loop. A busy UTC day can contain millions of trades;
+/// processing large pages as one message blocks chart interaction.
+const TRADE_UI_CHUNK: usize = 10_000;
+
+fn split_trade_batch(batch: Vec<Trade>) -> Vec<Vec<Trade>> {
+    if batch.len() <= TRADE_UI_CHUNK {
+        vec![batch]
+    } else {
+        batch
+            .chunks(TRADE_UI_CHUNK)
+            .map(<[Trade]>::to_vec)
+            .collect()
+    }
+}
+
 /// Override the global trade-fetch mode at runtime.
 pub fn set_trade_fetch_mode(mode: TradeFetchMode) {
     if let Ok(mut guard) = TRADE_FETCH_MODE.write() {
@@ -136,14 +152,6 @@ impl RequestHandler {
         Ok(Some(id))
     }
 
-    /// Returns `true` when a request with the given range is currently
-    /// pending (in-flight and not yet completed or failed).
-    pub fn has_pending(&self, range: &FetchRange) -> bool {
-        self.requests
-            .values()
-            .any(|r| r.status == RequestStatus::Pending && r.same_with_range(range))
-    }
-
     pub fn mark_completed(&mut self, id: Uuid) {
         if let Some(request) = self.requests.get_mut(&id) {
             request.status = RequestStatus::Completed;
@@ -162,6 +170,18 @@ impl RequestHandler {
         }
     }
 
+    /// Drop kline/trade gap-fill requests but keep Footprint History backfills.
+    /// Timeframe and tick-size changes must not re-download UTC-day trades.
+    pub fn drop_non_footprint_history(&mut self) {
+        self.requests.retain(|_, request| {
+            matches!(
+                request.fetch_type,
+                FetchRange::FootprintHistoryTrades(..)
+                    | FetchRange::FootprintHistoryOpenInterest(..)
+            )
+        });
+    }
+
     pub fn mark_failed(&mut self, id: Uuid) {
         if let Some(request) = self.requests.get_mut(&id) {
             let timestamp = chrono::Utc::now().timestamp_millis() as u64;
@@ -177,7 +197,10 @@ pub enum FetchRange {
     Kline(UnixMs, UnixMs),
     OpenInterest(UnixMs, UnixMs),
     Trades(UnixMs, UnixMs),
-    /// Three UTC days requested exclusively by the Footprint History indicator.
+    /// Complete executed-trade history for a visible Footprint chart range.
+    /// Unlike generic seeds, this must not stop at a fixed trade-count cap.
+    FootprintTrades(UnixMs, UnixMs),
+    /// Per-UTC-day trades requested by Footprint History / Daily Delta.
     FootprintHistoryTrades(UnixMs, UnixMs),
     /// Open-interest history requested exclusively by Footprint History.
     FootprintHistoryOpenInterest(UnixMs, UnixMs),
@@ -214,6 +237,9 @@ impl FetchRequest {
                 e1 == e2 && s1 == s2
             }
             (FetchRange::Trades(s1, e1), FetchRange::Trades(s2, e2)) => e1 == e2 && s1 == s2,
+            (FetchRange::FootprintTrades(s1, e1), FetchRange::FootprintTrades(s2, e2)) => {
+                e1 == e2 && s1 == s2
+            }
             (
                 FetchRange::FootprintHistoryTrades(s1, e1),
                 FetchRange::FootprintHistoryTrades(s2, e2),
@@ -363,28 +389,34 @@ pub fn request_fetch(
             }
         }
         FetchRange::Trades(from_time, to_time)
+        | FetchRange::FootprintTrades(from_time, to_time)
         | FetchRange::FootprintHistoryTrades(from_time, to_time)
         | FetchRange::TradesRecent(from_time, to_time) => {
             let recent_first = matches!(fetch, FetchRange::TradesRecent(..));
-            let trade_info = ready_streams.iter().find_map(|stream| {
-                if let StreamKind::Trades { ticker_info } = stream {
-                    Some((*ticker_info, pane_id, *stream))
-                } else {
-                    None
-                }
-            });
+            let trade_stream = select_trade_stream(stream, ready_streams);
+            let trade_info = trade_stream.map(|stream| (stream.ticker_info(), pane_id, stream));
 
             if let Some((ticker_info, pane_id, stream)) = trade_info {
-                let is_binance = matches!(
+                let supports_exchange_fetch = matches!(
                     ticker_info.exchange(),
-                    Exchange::BinanceSpot | Exchange::BinanceLinear | Exchange::BinanceInverse
+                    Exchange::BinanceSpot
+                        | Exchange::BinanceLinear
+                        | Exchange::BinanceInverse
+                        | Exchange::BybitLinear
+                        | Exchange::BybitInverse
                 );
                 let mode = trade_fetch_mode();
                 let server = sources.server.clone();
-                let data_path = data::data_path(Some("market_data/binance/"));
+                let data_path = match ticker_info.exchange().venue() {
+                    exchange::adapter::Venue::Binance => {
+                        data::data_path(Some("market_data/binance/"))
+                    }
+                    exchange::adapter::Venue::Bybit => data::data_path(Some("market_data/bybit/")),
+                    _ => data::data_path(Some("market_data/")),
+                };
 
                 if let Some(ref client) = server {
-                    log::debug!(
+                    log::trace!(
                         "Trade fetch: using server at {} ({})",
                         client.base_url(),
                         ticker_info.exchange()
@@ -398,26 +430,30 @@ pub fn request_fetch(
                         error: "Server mode selected but the server URL is invalid.".to_string(),
                         req_id: Some(req_id),
                     });
-                } else if is_binance {
+                } else if supports_exchange_fetch {
                     log::debug!(
                         "Trade fetch: using direct exchange API for {}",
                         ticker_info.exchange()
                     );
                 } else {
                     log::warn!(
-                        "Trade fetch via exchange API is only supported for Binance, got {}",
+                        "Trade fetch via exchange API is only supported for Binance and Bybit, got {}",
                         ticker_info.exchange()
                     );
                     return Task::done(FetchUpdate::Error {
                         pane_id,
                         error: format!(
-                            "Trade fetch via exchange API is only supported for Binance, got {}",
+                            "Trade fetch via exchange API is only supported for Binance and Bybit, got {}",
                             ticker_info.exchange()
                         ),
                         req_id: Some(req_id),
                     });
                 }
 
+                let is_complete_footprint = matches!(
+                    fetch,
+                    FetchRange::FootprintTrades(..) | FetchRange::FootprintHistoryTrades(..)
+                );
                 let (task, handle) = Task::sip(
                     fetch_trades_paged(
                         server,
@@ -427,6 +463,12 @@ pub fn request_fetch(
                         to_time,
                         data_path,
                         recent_first,
+                        // A completed UTC-day profile must be complete. Busy symbols can
+                        // legitimately exceed any fixed trade-count ceiling, so Footprint
+                        // History / Daily Delta page until the requested boundary. Generic
+                        // chart seeds stay bounded because they only need a useful window.
+                        trade_fetch_limits(is_complete_footprint),
+                        is_complete_footprint,
                     ),
                     move |batch| {
                         let data = FetchedData::Trades {
@@ -482,6 +524,20 @@ pub fn request_fetch(
     }
 
     Task::none()
+}
+
+fn select_trade_stream(
+    explicit: Option<StreamKind>,
+    ready_streams: &[StreamKind],
+) -> Option<StreamKind> {
+    explicit
+        .filter(|stream| matches!(stream, StreamKind::Trades { .. }))
+        .or_else(|| {
+            ready_streams
+                .iter()
+                .copied()
+                .find(|stream| matches!(stream, StreamKind::Trades { .. }))
+        })
 }
 
 pub fn request_fetch_many(
@@ -622,7 +678,7 @@ pub fn kline_fetch_task(
 ///
 /// Returns `Ok(true)` when at least one trade was received, `Ok(false)`
 /// when the source confirmed the range has no data.
-pub fn fetch_trades_paged(
+fn fetch_trades_paged(
     server: Option<ServerClient>,
     handles: AdapterHandles,
     ticker_info: TickerInfo,
@@ -630,6 +686,8 @@ pub fn fetch_trades_paged(
     to_time: UnixMs,
     data_path: PathBuf,
     recent_first: bool,
+    limits: Option<FetchLimits>,
+    fill_exchange_gaps: bool,
 ) -> impl Straw<bool, Vec<Trade>, AdapterError> {
     sipper(async move |mut progress| {
         if recent_first {
@@ -655,70 +713,195 @@ pub fn fetch_trades_paged(
         let mut cursor = from_time;
         let mut had_data = false;
         let mut pages: usize = 0;
-        // Hard stop so BTCUSDT cannot crawl REST for hours under rate limits.
-        // 40 × 1k REST ≈ 40k trades; 2 × 50k archive ≈ 100k trades.
-        const MAX_PAGES: usize = 40;
         let mut total_trades: usize = 0;
-        const MAX_TOTAL_TRADES: usize = 80_000;
+        let mut earliest_server: Option<UnixMs> = None;
+        let exchange_available = supports_exchange_trade_fetch(ticker_info);
 
-        while cursor < to_time {
-            if pages >= MAX_PAGES || total_trades >= MAX_TOTAL_TRADES {
-                log::info!(
-                    "Trade fetch page/trade cap reached (pages={pages}, trades={total_trades}); stopping seed"
-                );
-                break;
+        let query_server = if let Some(ref client) = server {
+            match client.earliest_trade_time(ticker_info).await {
+                Ok(earliest) => server_range_may_have_data(to_time, earliest),
+                Err(err) => {
+                    log::debug!(
+                        "Could not read server coverage for {} ({}): {err}",
+                        ticker_info.ticker,
+                        ticker_info.exchange()
+                    );
+                    true
+                }
             }
-            pages += 1;
+        } else {
+            false
+        };
 
-            let prev_cursor = cursor;
+        if query_server && let Some(ref client) = server {
+            while cursor <= to_time {
+                if fetch_limit_reached(limits, pages, total_trades) {
+                    log::info!(
+                        "Trade fetch page/trade cap reached (pages={pages}, trades={total_trades}); stopping seed"
+                    );
+                    break;
+                }
+                pages += 1;
 
-            if let Some(ref client) = server {
+                let prev_cursor = cursor;
                 let parsed = client
                     .fetch_trades_arrow(ticker_info, cursor, to_time, ARROW_LIMIT)
                     .await?;
 
                 let is_empty = parsed.raw_row_count == 0;
-                if !is_empty {
-                    had_data = had_data || !parsed.trades.is_empty();
-                    cursor = parsed.last_ts.map_or(cursor, |t| t.saturating_add(1));
-                }
-                if !parsed.trades.is_empty() {
-                    total_trades = total_trades.saturating_add(parsed.trades.len());
-                    progress.send(parsed.trades).await;
-                }
                 if is_empty {
                     break;
                 }
-            } else {
-                let batch = handles
-                    .fetch_trades(ticker_info, cursor, None, Some(data_path.clone()))
-                    .await?;
+                if let Some(first) = parsed.trades.first() {
+                    earliest_server = Some(match earliest_server {
+                        Some(current) => current.min(first.time),
+                        None => first.time,
+                    });
+                }
+                if !parsed.trades.is_empty() {
+                    had_data = true;
+                    total_trades = total_trades.saturating_add(parsed.trades.len());
+                    for chunk in split_trade_batch(parsed.trades) {
+                        progress.send(chunk).await;
+                    }
+                }
+                cursor = parsed.last_ts.map_or(cursor, |t| t.saturating_add(1));
+                if cursor <= prev_cursor {
+                    log::error!(
+                        "paging cursor did not advance past {prev_cursor:?} despite a non-empty response; \
+                 aborting to avoid an infinite loop (source may be malformed)"
+                    );
+                    return Err(AdapterError::ParseError(
+                        "Source may be malformed. Check logs for details.".to_string(),
+                    ));
+                }
+            }
+        }
 
+        let exchange_ranges = exchange_trade_ranges(
+            server.is_some(),
+            fill_exchange_gaps,
+            from_time,
+            to_time,
+            earliest_server,
+            cursor,
+            had_data,
+        );
+
+        for (exchange_from, exchange_to) in exchange_ranges {
+            if !exchange_available {
+                break;
+            }
+            cursor = exchange_from;
+            while cursor <= exchange_to {
+                if fetch_limit_reached(limits, pages, total_trades) {
+                    log::info!(
+                        "Trade fetch page/trade cap reached (pages={pages}, trades={total_trades}); stopping seed"
+                    );
+                    break;
+                }
+                pages += 1;
+
+                let prev_cursor = cursor;
+                let mut batch = handles
+                    .fetch_trades(
+                        ticker_info,
+                        cursor,
+                        Some(exchange_to),
+                        Some(data_path.clone()),
+                    )
+                    .await?;
+                batch.retain(|trade| trade.time >= from_time && trade.time <= exchange_to);
                 if batch.is_empty() {
                     break;
                 }
 
                 had_data = true;
+                batch.sort_by_key(|trade| trade.time);
                 cursor = batch.last().map_or(cursor, |t| t.time.saturating_add(1));
                 total_trades = total_trades.saturating_add(batch.len());
+                for chunk in split_trade_batch(batch) {
+                    progress.send(chunk).await;
+                }
 
-                // Batch is already bounded by the exchange adapter (≤50k).
-                progress.send(batch).await;
-            }
-
-            if cursor <= prev_cursor {
-                log::error!(
-                    "paging cursor did not advance past {prev_cursor:?} despite a non-empty response; \
-             aborting to avoid an infinite loop (source may be malformed)"
-                );
-                return Err(AdapterError::ParseError(
-                    "Source may be malformed. Check logs for details.".to_string(),
-                ));
+                if cursor <= prev_cursor {
+                    log::error!(
+                        "paging cursor did not advance past {prev_cursor:?} despite a non-empty response; \
+                 aborting to avoid an infinite loop (source may be malformed)"
+                    );
+                    return Err(AdapterError::ParseError(
+                        "Source may be malformed. Check logs for details.".to_string(),
+                    ));
+                }
             }
         }
 
         Ok(had_data)
     })
+}
+
+fn exchange_trade_ranges(
+    server_configured: bool,
+    fill_exchange_gaps: bool,
+    from_time: UnixMs,
+    to_time: UnixMs,
+    earliest_server: Option<UnixMs>,
+    next_server_cursor: UnixMs,
+    had_server_data: bool,
+) -> Vec<(UnixMs, UnixMs)> {
+    if !server_configured {
+        return vec![(from_time, to_time)];
+    }
+    if !fill_exchange_gaps {
+        return Vec::new();
+    }
+    if !had_server_data {
+        return vec![(from_time, to_time)];
+    }
+
+    let mut ranges = Vec::with_capacity(2);
+    if let Some(first) = earliest_server
+        && first > from_time
+    {
+        ranges.push((from_time, first.saturating_sub(1)));
+    }
+    if next_server_cursor < to_time {
+        ranges.push((next_server_cursor, to_time));
+    }
+    ranges
+}
+
+fn server_range_may_have_data(to_time: UnixMs, earliest_server: Option<UnixMs>) -> bool {
+    earliest_server.is_none_or(|earliest| to_time >= earliest)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FetchLimits {
+    max_total_trades: usize,
+    max_pages: usize,
+}
+
+fn trade_fetch_limits(is_footprint_history: bool) -> Option<FetchLimits> {
+    (!is_footprint_history).then_some(FetchLimits {
+        max_total_trades: 80_000,
+        max_pages: 40,
+    })
+}
+
+fn fetch_limit_reached(limits: Option<FetchLimits>, pages: usize, total_trades: usize) -> bool {
+    limits
+        .is_some_and(|limits| pages >= limits.max_pages || total_trades >= limits.max_total_trades)
+}
+
+fn supports_exchange_trade_fetch(ticker_info: TickerInfo) -> bool {
+    matches!(
+        ticker_info.exchange(),
+        Exchange::BinanceSpot
+            | Exchange::BinanceLinear
+            | Exchange::BinanceInverse
+            | Exchange::BybitLinear
+            | Exchange::BybitInverse
+    )
 }
 
 async fn fetch_recent_exchange_trade_batches(
@@ -815,7 +998,11 @@ async fn fetch_recent_server_trade_batches(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use exchange::{Ticker, TickerInfo, Timeframe, adapter::Exchange};
+    use exchange::{
+        Ticker, TickerInfo, Timeframe,
+        adapter::Exchange,
+        unit::{Price, Qty},
+    };
 
     fn kline_stream(exchange: Exchange) -> StreamKind {
         StreamKind::Kline {
@@ -837,5 +1024,158 @@ mod tests {
             Err(ReqError::Overlaps)
         ));
         assert!(handler.add_request(range, Some(bybit)).unwrap().is_some());
+    }
+
+    #[test]
+    fn explicit_trade_source_wins_over_first_ready_stream() {
+        let binance = TickerInfo::new(
+            Ticker::new("BTCUSDT", Exchange::BinanceLinear),
+            0.1,
+            0.001,
+            None,
+        );
+        let bybit = TickerInfo::new(
+            Ticker::new("BTCUSDT", Exchange::BybitLinear),
+            0.1,
+            0.001,
+            None,
+        );
+        let binance_stream = StreamKind::Trades {
+            ticker_info: binance,
+        };
+        let bybit_stream = StreamKind::Trades { ticker_info: bybit };
+
+        assert_eq!(
+            select_trade_stream(Some(bybit_stream), &[binance_stream, bybit_stream]),
+            Some(bybit_stream)
+        );
+    }
+
+    #[test]
+    fn timeframe_reset_keeps_completed_footprint_history_requests() {
+        let stream = StreamKind::Trades {
+            ticker_info: TickerInfo::new(
+                Ticker::new("BTCUSDT", Exchange::BinanceLinear),
+                0.1,
+                0.001,
+                None,
+            ),
+        };
+        let mut handler = RequestHandler::default();
+        let kline = FetchRange::Kline(UnixMs::new(1), UnixMs::new(2));
+        let history = FetchRange::FootprintHistoryTrades(UnixMs::new(1), UnixMs::new(2));
+        let kline_id = handler
+            .add_request(kline, Some(kline_stream(Exchange::BinanceLinear)))
+            .unwrap()
+            .unwrap();
+        let history_id = handler.add_request(history, Some(stream)).unwrap().unwrap();
+        handler.mark_completed(kline_id);
+        handler.mark_completed(history_id);
+
+        handler.drop_non_footprint_history();
+
+        assert!(
+            handler
+                .add_request(history, Some(stream))
+                .expect("kept footprint request")
+                .is_none()
+        );
+        assert!(
+            handler
+                .add_request(kline, Some(kline_stream(Exchange::BinanceLinear)))
+                .expect("kline request was dropped")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn footprint_history_pages_to_day_end_without_seed_caps() {
+        let limits = trade_fetch_limits(true);
+
+        assert_eq!(limits, None);
+        assert!(!fetch_limit_reached(limits, usize::MAX, usize::MAX));
+    }
+
+    #[test]
+    fn footprint_chart_ranges_are_distinct_from_bounded_generic_seeds() {
+        let chart = FetchRange::FootprintTrades(UnixMs::new(1), UnixMs::new(2));
+        let generic = FetchRange::Trades(UnixMs::new(1), UnixMs::new(2));
+
+        assert_ne!(chart, generic);
+        assert_eq!(trade_fetch_limits(true), None);
+    }
+
+    #[test]
+    fn generic_trade_seeds_remain_bounded() {
+        let limits = trade_fetch_limits(false);
+
+        assert!(fetch_limit_reached(limits, 40, 0));
+        assert!(fetch_limit_reached(limits, 0, 80_000));
+        assert!(!fetch_limit_reached(limits, 39, 79_999));
+    }
+
+    #[test]
+    fn historical_trade_pages_are_split_into_responsive_ui_chunks() {
+        let trade = Trade {
+            time: UnixMs::new(1),
+            price: Price::from_f64(100.0),
+            qty: Qty::from_f64(1.0),
+            is_sell: false,
+        };
+        let chunks = split_trade_batch(vec![trade; TRADE_UI_CHUNK * 2 + 1]);
+
+        assert_eq!(
+            chunks.iter().map(Vec::len).collect::<Vec<_>>(),
+            [10_000, 10_000, 1]
+        );
+    }
+
+    #[test]
+    fn exchange_fills_trailing_gap_after_partial_server_prefix() {
+        let from = UnixMs::new(1_000);
+        let to = UnixMs::new(10_000);
+        let first_server = UnixMs::new(1_000);
+        let after_last_server = UnixMs::new(6_001);
+
+        assert_eq!(
+            exchange_trade_ranges(
+                true,
+                true,
+                from,
+                to,
+                Some(first_server),
+                after_last_server,
+                true,
+            ),
+            vec![(after_last_server, to)]
+        );
+    }
+
+    #[test]
+    fn exchange_fills_both_sides_of_partial_server_history() {
+        let from = UnixMs::new(1_000);
+        let to = UnixMs::new(10_000);
+
+        assert_eq!(
+            exchange_trade_ranges(
+                true,
+                true,
+                from,
+                to,
+                Some(UnixMs::new(3_000)),
+                UnixMs::new(6_001),
+                true,
+            ),
+            vec![(from, UnixMs::new(2_999)), (UnixMs::new(6_001), to),]
+        );
+    }
+
+    #[test]
+    fn server_ranges_before_earliest_history_are_skipped() {
+        let earliest = Some(UnixMs::new(1_000));
+
+        assert!(!server_range_may_have_data(UnixMs::new(999), earliest));
+        assert!(server_range_may_have_data(UnixMs::new(1_000), earliest));
+        assert!(server_range_may_have_data(UnixMs::new(0), None));
     }
 }

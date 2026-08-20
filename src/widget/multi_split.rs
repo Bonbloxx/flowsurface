@@ -25,7 +25,7 @@ struct State {
 
 pub struct MultiSplit<'a, Message> {
     panels: Vec<Element<'a, Message>>,
-    splits: &'a Vec<f32>,
+    splits: Vec<f32>,
     resize: fn(usize, f32) -> Message,
 }
 
@@ -47,11 +47,14 @@ where
         resize: fn(usize, f32) -> Message,
     ) -> Self {
         assert!(panels.len() >= 2, "MultiSplit needs at least 2 panels");
-        assert_eq!(
-            panels.len() - 1,
-            splits.len(),
-            "Number of splits must be one less than number of panels"
-        );
+        let expected = panels.len() - 1;
+        let splits = if splits.len() == expected {
+            splits.clone()
+        } else {
+            // Overlay indicators are not subplot panels. Reconcile a stale
+            // split list instead of aborting the whole UI.
+            data::util::calc_panel_splits(splits.first().copied().unwrap_or(0.8), expected, None)
+        };
 
         let mut elements = Vec::with_capacity(panels.len() * 2 - 1);
         for (i, panel) in panels.into_iter().enumerate() {

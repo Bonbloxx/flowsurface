@@ -3,22 +3,39 @@ use crate::chart::{
     indicator::{
         indicator_row,
         kline::{AvailabilityCause, FetchCtx, IndicatorAvailability, KlineIndicatorImpl},
-        plot::{AnySeries, PlotTooltip, line::LinePlot},
+        plot::{AnySeries, PlotTooltip, candle::CandlePlot},
     },
 };
 use crate::connector::fetcher::FetchRange;
 
 use data::chart::{PlotData, kline::KlineDataPoint};
-use data::util::format_with_commas;
-use exchange::adapter::Exchange;
-use exchange::{Kline, Timeframe, Trade, UnixMs};
+use data::util::{abbr_large_numbers, format_with_commas};
+use exchange::adapter::{Exchange, Venue};
+use exchange::{Kline, TickerInfo, Timeframe, Trade, UnixMs};
+use rustc_hash::FxHashMap;
 
 use iced::widget::{center, row, text};
-use std::{collections::BTreeMap, ops::RangeInclusive};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    ops::RangeInclusive,
+};
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OpenInterestCandle {
+    pub open: f64,
+    pub high: f64,
+    pub low: f64,
+    pub close: f64,
+    pub source_count: usize,
+    pub expected_source_count: usize,
+}
 
 pub struct OpenInterestIndicator {
     cache: Caches,
-    pub data: BTreeMap<UnixMs, f64>,
+    pub data: BTreeMap<UnixMs, OpenInterestCandle>,
+    sources: Vec<TickerInfo>,
+    source_data: FxHashMap<TickerInfo, BTreeMap<UnixMs, f64>>,
+    timeframe: Option<Timeframe>,
 }
 
 impl OpenInterestIndicator {
@@ -26,6 +43,9 @@ impl OpenInterestIndicator {
         Self {
             cache: Caches::default(),
             data: BTreeMap::new(),
+            sources: Vec::new(),
+            source_data: FxHashMap::default(),
+            timeframe: None,
         }
     }
 
@@ -44,29 +64,41 @@ impl OpenInterestIndicator {
             return row![].into();
         }
 
-        let tooltip = |value: &f64, next: Option<&f64>| {
-            let value_text = format!("Open Interest: {}", format_with_commas(*value));
+        let tooltip = |value: &OpenInterestCandle, next: Option<&OpenInterestCandle>| {
+            let usd = |value: f64| format!("${}", format_with_commas(value));
+            let value_text = format!(
+                "Aggregated OI: {} ({})\nO {}  H {}\nL {}  C {}",
+                usd(value.close),
+                abbr_large_numbers(value.close),
+                usd(value.open),
+                usd(value.high),
+                usd(value.low),
+                usd(value.close),
+            );
             let change_text = if let Some(next_value) = next {
-                let delta = next_value - *value;
+                let delta = next_value.close - value.close;
                 let sign = if delta >= 0.0 { "+" } else { "" };
-                format!("Change: {}{}", sign, format_with_commas(delta))
+                format!("Change: {sign}${}", format_with_commas(delta.abs()))
             } else {
                 "Change: N/A".to_string()
             };
-            PlotTooltip::new(format!("{value_text}\n{change_text}"))
+            let coverage = format!(
+                "Sources: {}/{}",
+                value.source_count, value.expected_source_count
+            );
+            PlotTooltip::new(format!("{value_text}\n{change_text}\n{coverage}"))
         };
 
-        let value_fn = |v: &f64| *v as f32;
-
-        let plot = LinePlot::new(value_fn)
-            .stroke_width(1.0)
-            .show_points(true)
-            .point_radius_factor(0.2)
-            // Open interest is snapshotted at candle open, not computed from close like regular indicators.
-            // Shift left by 1 so each OI value aligns with the equivalent candle close.
-            .shift(-1)
-            .padding(0.08)
-            .with_tooltip(tooltip);
+        let plot = CandlePlot::new(
+            |v: &OpenInterestCandle| v.open as f32,
+            |v: &OpenInterestCandle| v.high as f32,
+            |v: &OpenInterestCandle| v.low as f32,
+            |v: &OpenInterestCandle| v.close as f32,
+        )
+        // Open interest is snapshotted at candle open, not computed from close like regular indicators.
+        // Shift left by 1 so each OI value aligns with the equivalent candle close.
+        .shift(-1)
+        .with_tooltip(tooltip);
 
         indicator_row(
             main_chart,
@@ -90,11 +122,57 @@ impl OpenInterestIndicator {
         (from_time, to_time)
     }
 
+    fn rebuild_candles(&mut self) {
+        let Some(timeframe) = self.timeframe else {
+            return;
+        };
+        let max_age = timeframe.to_milliseconds().saturating_mul(2);
+        let times = self
+            .source_data
+            .values()
+            .flat_map(|series| series.keys().copied())
+            .collect::<BTreeSet<_>>();
+        let mut rebuilt = BTreeMap::new();
+        let mut previous_close = None;
+
+        for time in times {
+            let values = self
+                .sources
+                .iter()
+                .filter_map(|source| self.source_data.get(source)?.range(..=time).next_back())
+                .filter(|(sample_time, _)| {
+                    time.as_u64().saturating_sub(sample_time.as_u64()) <= max_age
+                })
+                .map(|(_, value)| *value)
+                .collect::<Vec<_>>();
+            if values.is_empty() {
+                continue;
+            }
+            let close = values.iter().sum::<f64>();
+            let open = previous_close.unwrap_or(close);
+            rebuilt.insert(
+                time,
+                OpenInterestCandle {
+                    open,
+                    high: open.max(close),
+                    low: open.min(close),
+                    close,
+                    source_count: values.len(),
+                    expected_source_count: self.sources.len(),
+                },
+            );
+            previous_close = Some(close);
+        }
+        self.data = rebuilt;
+        self.clear_all_caches();
+    }
+
     fn is_supported_exchange(exchange: Exchange) -> bool {
         exchange.is_perps()
-            && exchange != Exchange::HyperliquidLinear
-            && exchange != Exchange::MexcLinear
-            && exchange != Exchange::MexcInverse
+            && matches!(
+                exchange.venue(),
+                Venue::Binance | Venue::Bybit | Venue::Hyperliquid
+            )
     }
 
     fn is_supported_timeframe(timeframe: Timeframe) -> bool {
@@ -140,6 +218,10 @@ impl KlineIndicatorImpl for OpenInterestIndicator {
     }
 
     fn fetch_range(&mut self, ctx: &FetchCtx) -> Option<FetchRange> {
+        if self.timeframe != Some(ctx.timeframe) {
+            self.timeframe = Some(ctx.timeframe);
+            self.rebuild_candles();
+        }
         let availability = Self::availability_for(
             Basis::Time(ctx.timeframe),
             ctx.main_chart.ticker_info.exchange(),
@@ -183,8 +265,114 @@ impl KlineIndicatorImpl for OpenInterestIndicator {
 
     fn on_basis_change(&mut self, _source: &PlotData<KlineDataPoint>) {}
 
-    fn on_open_interest(&mut self, data: &[exchange::OpenInterest]) {
-        self.data.extend(data.iter().map(|oi| (oi.time, oi.value)));
-        self.clear_all_caches();
+    fn configure_open_interest(&mut self, sources: &[TickerInfo]) {
+        self.sources = sources
+            .iter()
+            .copied()
+            .filter(|source| Self::is_supported_exchange(source.exchange()))
+            .collect();
+        self.source_data
+            .retain(|source, _| self.sources.contains(source));
+        self.rebuild_candles();
+    }
+
+    fn open_interest_sources(&self) -> &[TickerInfo] {
+        &self.sources
+    }
+
+    fn on_source_open_interest(&mut self, source: TickerInfo, values: &[exchange::OpenInterest]) {
+        if !self.sources.contains(&source) {
+            return;
+        }
+        let interval = self
+            .timeframe
+            .map(Timeframe::to_milliseconds)
+            .unwrap_or_else(|| Timeframe::M5.to_milliseconds());
+        let series = self.source_data.entry(source).or_default();
+        for value in values {
+            let bucket = value.time.as_u64() / interval * interval;
+            series.insert(UnixMs::new(bucket), value.value);
+        }
+        self.rebuild_candles();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use exchange::{OpenInterest, Ticker};
+
+    fn source(exchange: Exchange, symbol: &str) -> TickerInfo {
+        TickerInfo::new(Ticker::new(symbol, exchange), 0.1, 0.001, None)
+    }
+
+    #[test]
+    fn aggregates_venue_notional_and_builds_oi_candles() {
+        let binance = source(Exchange::BinanceLinear, "BTCUSDT");
+        let bybit = source(Exchange::BybitLinear, "BTCUSDT");
+        let hyperliquid = source(Exchange::HyperliquidLinear, "BTC");
+        let mut indicator = OpenInterestIndicator::new();
+        indicator.timeframe = Some(Timeframe::M5);
+        indicator.configure_open_interest(&[binance, bybit, hyperliquid]);
+
+        indicator.on_source_open_interest(
+            binance,
+            &[
+                OpenInterest {
+                    time: UnixMs::new(300_000),
+                    value: 7_000_000_000.0,
+                },
+                OpenInterest {
+                    time: UnixMs::new(600_000),
+                    value: 7_100_000_000.0,
+                },
+            ],
+        );
+        indicator.on_source_open_interest(
+            bybit,
+            &[
+                OpenInterest {
+                    time: UnixMs::new(300_000),
+                    value: 4_000_000_000.0,
+                },
+                OpenInterest {
+                    time: UnixMs::new(600_000),
+                    value: 3_900_000_000.0,
+                },
+            ],
+        );
+        indicator.on_source_open_interest(
+            hyperliquid,
+            &[OpenInterest {
+                time: UnixMs::new(600_123),
+                value: 2_500_000_000.0,
+            }],
+        );
+
+        let first = indicator.data[&UnixMs::new(300_000)];
+        assert_eq!(first.close, 11_000_000_000.0);
+        assert_eq!(first.source_count, 2);
+        let current = indicator.data[&UnixMs::new(600_000)];
+        assert_eq!(current.open, 11_000_000_000.0);
+        assert_eq!(current.close, 13_500_000_000.0);
+        assert_eq!(current.high, 13_500_000_000.0);
+        assert_eq!(current.low, 11_000_000_000.0);
+        assert_eq!(current.source_count, 3);
+    }
+
+    #[test]
+    fn supports_the_three_aggregate_venues() {
+        assert!(OpenInterestIndicator::is_supported_exchange(
+            Exchange::BinanceLinear
+        ));
+        assert!(OpenInterestIndicator::is_supported_exchange(
+            Exchange::BybitLinear
+        ));
+        assert!(OpenInterestIndicator::is_supported_exchange(
+            Exchange::HyperliquidLinear
+        ));
+        assert!(!OpenInterestIndicator::is_supported_exchange(
+            Exchange::OkexLinear
+        ));
     }
 }

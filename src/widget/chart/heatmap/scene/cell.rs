@@ -72,6 +72,13 @@ impl Cell {
         self.clamp_world_only();
     }
 
+    pub fn set_overlay_dimensions(&mut self, width_world: f32, height_world: f32) {
+        const MIN_OVERLAY_WORLD: f32 = 1.0e-6;
+        const MAX_OVERLAY_WORLD: f32 = 1.0e3;
+        self.width_world = width_world.clamp(MIN_OVERLAY_WORLD, MAX_OVERLAY_WORLD);
+        self.height_world = height_world.clamp(MIN_OVERLAY_WORLD, MAX_OVERLAY_WORLD);
+    }
+
     /// Axis-zoom helper: apply factor, then clamp so resulting pixel size stays within
     /// [MIN_COL_PX, MAX_COL_PX] at the given camera scale, and also within world bounds.
     pub fn zoom_width_world_clamped(&mut self, factor: f32, cam_scale: f32) {

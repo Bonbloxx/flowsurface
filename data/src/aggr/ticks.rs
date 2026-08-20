@@ -5,7 +5,7 @@ use crate::chart::{
 };
 use exchange::unit::Qty;
 use exchange::unit::price::{Price, PriceStep};
-use exchange::{Kline, Trade, Volume};
+use exchange::{Kline, Trade, UnixMs, Volume};
 
 use std::collections::BTreeMap;
 
@@ -153,6 +153,19 @@ impl TickAggr {
     }
 
     pub fn new_renko(config: RenkoConfig, tick_size: PriceStep, raw_trades: &[Trade]) -> Self {
+        Self::new_renko_seeded(config, tick_size, &[], raw_trades)
+    }
+
+    /// Build close-based historical Renko bricks, then continue the developing
+    /// brick with newer live trades. Using compact minute bars for the seed is
+    /// deliberate: a liquid market can print millions of trades in the time it
+    /// takes to form a useful Renko history.
+    pub fn new_renko_seeded(
+        config: RenkoConfig,
+        tick_size: PriceStep,
+        klines: &[Kline],
+        raw_trades: &[Trade],
+    ) -> Self {
         let mut tick_aggr = Self {
             datapoints: Vec::new(),
             // One x-axis unit represents one Renko brick.
@@ -165,9 +178,30 @@ impl TickAggr {
             tpo: None,
         };
 
-        if !raw_trades.is_empty() {
-            tick_aggr.insert_trades(raw_trades);
+        let mut ordered_klines = klines.to_vec();
+        ordered_klines.sort_by_key(|kline| kline.time);
+
+        // Ignore the still-forming minute. Its close is already represented by
+        // the live trade stream and applying both would double-count movement.
+        let minute_ms = 60_000;
+        let current_minute = UnixMs::now().as_u64() / minute_ms * minute_ms;
+        ordered_klines.retain(|kline| kline.time.as_u64() < current_minute);
+
+        for kline in &ordered_klines {
+            tick_aggr.insert_renko_price(kline.time, kline.close, None);
         }
+
+        let seed_cutoff = ordered_klines
+            .last()
+            .map(|kline| kline.time.saturating_add(minute_ms).saturating_sub(1));
+        for trade in raw_trades
+            .iter()
+            .filter(|trade| seed_cutoff.is_none_or(|cutoff| trade.time > cutoff))
+        {
+            tick_aggr.insert_renko_price(trade.time, trade.price, Some(trade));
+        }
+
+        tick_aggr.update_poc_status();
 
         tick_aggr
     }
@@ -353,20 +387,33 @@ impl TickAggr {
     }
 
     fn insert_renko_trade(&mut self, trade: &Trade) {
+        self.insert_renko_price(trade.time, trade.price, Some(trade));
+    }
+
+    fn insert_renko_price(&mut self, time: UnixMs, price: Price, trade: Option<&Trade>) {
         let Some(mut state) = self.renko else {
             return;
         };
 
         if self.datapoints.is_empty() {
-            self.datapoints
-                .push(TickAccumulation::new(trade, self.tick_size));
+            self.datapoints.push(trade.map_or_else(
+                || TickAccumulation::empty_at(time, price, price),
+                |trade| TickAccumulation::new(trade, self.tick_size),
+            ));
             return;
         }
 
-        self.datapoints
+        let current = self
+            .datapoints
             .last_mut()
-            .expect("Renko datapoint initialized")
-            .update_with_trade(trade, self.tick_size);
+            .expect("Renko datapoint initialized");
+        if let Some(trade) = trade {
+            current.update_with_trade(trade, self.tick_size);
+        } else {
+            current.kline.high = current.kline.high.max(price);
+            current.kline.low = current.kline.low.min(price);
+            current.kline.close = price;
+        }
 
         let brick_units = self
             .tick_size
@@ -378,9 +425,7 @@ impl TickAggr {
 
         loop {
             let current = self.datapoints.last().expect("Renko datapoint initialized");
-            if trade.time.saturating_diff(current.kline.time)
-                < u64::from(state.config.normalization_ms)
-            {
+            if time.saturating_diff(current.kline.time) < u64::from(state.config.normalization_ms) {
                 break;
             }
 
@@ -390,25 +435,23 @@ impl TickAggr {
             let down_close = Price::from_units(anchor.units.saturating_sub(brick_units));
 
             let completion = match state.direction {
-                None if trade.price >= up_close => Some((RenkoDirection::Up, anchor, up_close)),
-                None if trade.price <= down_close => {
-                    Some((RenkoDirection::Down, anchor, down_close))
-                }
-                Some(RenkoDirection::Up) if trade.price >= up_close => {
+                None if price >= up_close => Some((RenkoDirection::Up, anchor, up_close)),
+                None if price <= down_close => Some((RenkoDirection::Down, anchor, down_close)),
+                Some(RenkoDirection::Up) if price >= up_close => {
                     Some((RenkoDirection::Up, anchor, up_close))
                 }
-                Some(RenkoDirection::Down) if trade.price <= down_close => {
+                Some(RenkoDirection::Down) if price <= down_close => {
                     Some((RenkoDirection::Down, anchor, down_close))
                 }
                 Some(RenkoDirection::Up)
-                    if trade.price.units <= anchor.units.saturating_sub(reversal_units) =>
+                    if price.units <= anchor.units.saturating_sub(reversal_units) =>
                 {
                     let close = Price::from_units(anchor.units.saturating_sub(reversal_units));
                     let open = Price::from_units(close.units.saturating_add(brick_units));
                     Some((RenkoDirection::Down, open, close))
                 }
                 Some(RenkoDirection::Down)
-                    if trade.price.units >= anchor.units.saturating_add(reversal_units) =>
+                    if price.units >= anchor.units.saturating_add(reversal_units) =>
                 {
                     let close = Price::from_units(anchor.units.saturating_add(reversal_units));
                     let open = Price::from_units(close.units.saturating_sub(brick_units));
@@ -439,7 +482,7 @@ impl TickAggr {
 
             state.direction = Some(direction);
             self.datapoints
-                .push(TickAccumulation::empty_at(trade.time, close, trade.price));
+                .push(TickAccumulation::empty_at(time, close, price));
         }
 
         self.renko = Some(state);
@@ -736,6 +779,18 @@ mod tests {
         }
     }
 
+    fn kline(time: u64, close: f64) -> Kline {
+        let price = Price::from_f64(close);
+        Kline {
+            time: UnixMs::new(time),
+            open: price,
+            high: price,
+            low: price,
+            close: price,
+            volume: Volume::empty_total(),
+        }
+    }
+
     #[test]
     fn renko_builds_fixed_continuation_bricks_and_two_box_reversals() {
         let config = RenkoConfig {
@@ -791,6 +846,47 @@ mod tests {
         assert_eq!(large.datapoints.len(), 2);
         assert_eq!(small.datapoints[0].kline.close, Price::from_f64(110.0));
         assert_eq!(large.datapoints[0].kline.close, Price::from_f64(120.0));
+    }
+
+    #[test]
+    fn renko_seeds_fixed_bricks_from_compact_close_history() {
+        let config = RenkoConfig {
+            brick_size: 10,
+            reversal: 2,
+            normalization_ms: 0,
+        };
+        let klines = [kline(0, 100.0), kline(60_000, 111.0), kline(120_000, 121.0)];
+
+        let aggr = TickAggr::new_renko_seeded(config, one_dollar_step(), &klines, &[]);
+
+        assert_eq!(aggr.datapoints.len(), 3);
+        assert_eq!(aggr.datapoints[0].kline.open, Price::from_f64(100.0));
+        assert_eq!(aggr.datapoints[0].kline.close, Price::from_f64(110.0));
+        assert_eq!(aggr.datapoints[1].kline.open, Price::from_f64(110.0));
+        assert_eq!(aggr.datapoints[1].kline.close, Price::from_f64(120.0));
+        assert_eq!(aggr.datapoints[2].kline.open, Price::from_f64(120.0));
+        assert_eq!(aggr.datapoints[2].kline.close, Price::from_f64(121.0));
+    }
+
+    #[test]
+    fn renko_350_ticks_on_tenth_dollar_market_is_35_dollars() {
+        let step = PriceStep {
+            units: Price::from_f64(0.1).units,
+        };
+        let mut aggr = TickAggr::new_renko(
+            RenkoConfig {
+                brick_size: 350,
+                reversal: 2,
+                normalization_ms: 0,
+            },
+            step,
+            &[],
+        );
+
+        aggr.insert_trades(&[trade(0, 63_000.0), trade(1, 63_035.0)]);
+
+        assert_eq!(aggr.datapoints[0].kline.open, Price::from_f64(63_000.0));
+        assert_eq!(aggr.datapoints[0].kline.close, Price::from_f64(63_035.0));
     }
 
     #[test]
@@ -1036,6 +1132,32 @@ mod tests {
         ];
         let aggr = TickAggr::new_tpo_seeded(config, one_dollar_step(), &klines, &[]);
         assert_eq!(aggr.datapoints.len(), 2, "two daily profiles");
+    }
+
+    #[test]
+    fn tpo_populates_at_least_150_bar_seeded_daily_profiles() {
+        let day_ms = ProfilePeriod::Day.millis();
+        let klines = (0..TpoConfig::MIN_HISTORY_PROFILES)
+            .map(|day| {
+                let price = 100.0 + f64::from(day % 10);
+                Kline {
+                    time: exchange::UnixMs::new(u64::from(day) * day_ms + 1_000),
+                    open: Price::from_f64(price),
+                    high: Price::from_f64(price + 1.0),
+                    low: Price::from_f64(price),
+                    close: Price::from_f64(price + 0.5),
+                    volume: Volume::empty_buy_sell(),
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let aggr = TickAggr::new_tpo_seeded(TpoConfig::default(), one_dollar_step(), &klines, &[]);
+
+        assert_eq!(
+            aggr.datapoints.len(),
+            usize::from(TpoConfig::MIN_HISTORY_PROFILES)
+        );
+        assert!(aggr.datapoints.iter().all(|point| point.tpo.is_some()));
     }
 
     #[test]

@@ -687,6 +687,7 @@ pub struct TickerStats {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct OpenInterest {
     pub time: UnixMs,
+    /// Notional open interest in quote USD.
     pub value: f64,
 }
 

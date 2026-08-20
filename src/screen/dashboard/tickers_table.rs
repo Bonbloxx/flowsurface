@@ -1113,6 +1113,7 @@ impl TickersTable {
                 init_content_btn(ContentKind::HeatmapChart, *ticker, 180.0),
                 init_content_btn(ContentKind::ShaderHeatmap, *ticker, 180.0),
                 init_content_btn(ContentKind::FootprintChart, *ticker, 180.0),
+                init_content_btn(ContentKind::FootprintHistory, *ticker, 180.0),
                 init_content_btn(ContentKind::RenkoChart, *ticker, 180.0),
                 init_content_btn(ContentKind::TpoChart, *ticker, 180.0),
                 init_content_btn(ContentKind::CandlestickChart, *ticker, 180.0),

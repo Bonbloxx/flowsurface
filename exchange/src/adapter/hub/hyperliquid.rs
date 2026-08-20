@@ -1,5 +1,5 @@
 use crate::{
-    Event, Kline, PushFrequency, TickerInfo, Timeframe, UnixMs,
+    Event, Kline, OpenInterest, PushFrequency, TickerInfo, Timeframe, UnixMs,
     adapter::limiter::FixedWindowRateLimiterConfig,
     adapter::{MarketKind, StreamTicksize},
     depth::DepthPayload,
@@ -140,6 +140,22 @@ impl HyperliquidHandle {
             .await
     }
 
+    pub async fn fetch_open_interest(
+        &self,
+        ticker: TickerInfo,
+        timeframe: Timeframe,
+        range: Option<(UnixMs, UnixMs)>,
+    ) -> Result<Vec<OpenInterest>, AdapterError> {
+        self.request_port
+            .request(move |reply| HyperliquidCommand::OpenInterest {
+                ticker,
+                timeframe,
+                range,
+                reply,
+            })
+            .await
+    }
+
     pub async fn fetch_depth_snapshot(
         &self,
         ticker: crate::Ticker,
@@ -215,6 +231,17 @@ impl super::FetchCommandHandler<MarketKind> for Worker {
         Box::pin(
             async move { fetch::fetch_klines(&mut self.hub, ticker_info, timeframe, range).await },
         )
+    }
+
+    fn fetch_open_interest(
+        &mut self,
+        ticker_info: TickerInfo,
+        timeframe: Timeframe,
+        range: Option<(UnixMs, UnixMs)>,
+    ) -> futures::future::BoxFuture<'_, Result<Vec<OpenInterest>, AdapterError>> {
+        Box::pin(async move {
+            fetch::fetch_open_interest(&mut self.hub, ticker_info, timeframe, range).await
+        })
     }
 
     fn fetch_depth_snapshot(

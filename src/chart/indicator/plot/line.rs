@@ -78,14 +78,6 @@ impl<V, T> LinePlot<V, T> {
         self
     }
 
-    /// Shift datapoint x-position by whole bucket units in screen-space.
-    ///
-    /// e.g. `shift(1)` moves each point one bucket to the right.
-    pub fn shift(mut self, buckets: i32) -> Self {
-        self.x_shift_buckets = buckets;
-        self
-    }
-
     /// Set a predicate that decides whether a datapoint is "valid".
     /// Invalid points break the line (no connection to neighbours)
     /// and show `invalid_point_message` if one is configured.

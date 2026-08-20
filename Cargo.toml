@@ -47,7 +47,6 @@ iced = { version = "0.14.0", default-features = false, features = [
     "canvas",
     "sipper",
     "advanced",
-    "unconditional-rendering",
     "crisp",
     "x11",
     "wayland",
@@ -79,3 +78,11 @@ data.workspace = true
 
 [features]
 debug = ["iced/hot"]
+
+# Keep `cargo run` usable for graphics-heavy panes without giving up the fast
+# edit/compile cycle of a development build.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

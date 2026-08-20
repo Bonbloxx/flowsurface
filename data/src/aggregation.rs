@@ -1,10 +1,14 @@
 use exchange::{
-    Kline, Ticker, TickerInfo, Timeframe, Volume,
+    Kline, PushFrequency, TickMultiplier, Ticker, TickerInfo, Timeframe, UnixMs, Volume,
     adapter::{Exchange, MarketKind, StreamKind, Venue},
+    depth::Depth,
+    unit::{Price, PriceStep, Qty},
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+
+const DEPTH_SOURCE_STALE_AFTER_MS: u64 = 5_000;
 
 /// Stable identity for a logical market-data feed.
 ///
@@ -80,11 +84,18 @@ pub fn equivalent_footprint_sources(
     let mut sources = candidates
         .into_iter()
         .filter(|candidate| {
+            let (raw_symbol, _) = candidate.ticker.to_full_symbol_and_type();
+            let is_builder_market =
+                candidate.exchange().venue() == Venue::Hyperliquid && raw_symbol.contains(':');
             candidate.market_type() == MarketKind::LinearPerps
                 && matches!(
                     candidate.exchange().venue(),
                     Venue::Binance | Venue::Bybit | Venue::Hyperliquid
                 )
+                // Builder-deployed Hyperliquid markets (for example
+                // `hyna:BTC`) may use a different collateral and must not
+                // silently replace Hyperliquid's native BTC perpetual.
+                && (!is_builder_market || candidate.ticker.same_market(&selected.ticker))
                 && canonical_base_asset(candidate.ticker).as_deref() == Some(base.as_str())
         })
         .collect::<Vec<_>>();
@@ -104,9 +115,22 @@ pub fn equivalent_footprint_sources(
             Venue::Hyperliquid => 2,
             Venue::Okex | Venue::Mexc => 3,
         };
-        (selected_rank, venue_rank)
+        let symbol = source
+            .ticker
+            .to_full_symbol_and_type()
+            .0
+            .to_ascii_uppercase();
+        let quote_rank = if symbol.ends_with("USDT") {
+            0
+        } else if symbol.ends_with("USDC") {
+            1
+        } else {
+            2
+        };
+        (selected_rank, venue_rank, quote_rank)
     });
-    sources.dedup_by(|left, right| left.ticker.same_market(&right.ticker));
+    let mut seen_venues = FxHashSet::default();
+    sources.retain(|source| seen_venues.insert(source.exchange().venue()));
     sources
 }
 
@@ -133,6 +157,11 @@ impl AggregateFeedId {
         match self {
             Self::BtcUsdtPerpetual => &BTCUSDT_PERPETUAL,
         }
+    }
+
+    /// Stable price grid shared by every venue in this logical market.
+    pub fn price_step(self) -> exchange::unit::PriceStep {
+        exchange::unit::MinTicksize::new(self.definition().price_tick_power).into()
     }
 
     pub fn for_seed_ticker(ticker: Ticker) -> Option<Self> {
@@ -247,7 +276,7 @@ impl ResolvedFeed {
     pub fn price_step(&self) -> exchange::unit::PriceStep {
         self.id.map_or_else(
             || self.primary().min_ticksize.into(),
-            |id| exchange::unit::MinTicksize::new(id.definition().price_tick_power).into(),
+            AggregateFeedId::price_step,
         )
     }
 
@@ -296,6 +325,121 @@ impl ResolvedFeed {
                 timeframe,
             })
             .collect()
+    }
+
+    pub fn depth_streams(&self) -> Vec<StreamKind> {
+        self.sources
+            .iter()
+            .copied()
+            .map(|ticker_info| StreamKind::Depth {
+                ticker_info,
+                depth_aggr: ticker_info
+                    .exchange()
+                    .stream_ticksize(Some(TickMultiplier(1)), TickMultiplier(1)),
+                push_freq: PushFrequency::ServerDefault,
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SourceDepth {
+    depth: Depth,
+    update_time: UnixMs,
+}
+
+/// Source-aware current-book merger for a logical market.
+///
+/// Every adapter has already normalized quantity units. The merger rebins each
+/// venue onto the shared price grid and sums every fresh book currently
+/// available. This lets the heatmap render immediately while slower or
+/// temporarily disconnected venues join the composite when they recover.
+#[derive(Debug, Clone)]
+pub struct DepthAggregator {
+    sources: Vec<TickerInfo>,
+    price_step: PriceStep,
+    books: FxHashMap<TickerInfo, SourceDepth>,
+}
+
+impl DepthAggregator {
+    pub fn new(sources: Vec<TickerInfo>, price_step: PriceStep) -> Self {
+        Self {
+            sources,
+            price_step,
+            books: FxHashMap::default(),
+        }
+    }
+
+    pub fn sources(&self) -> &[TickerInfo] {
+        &self.sources
+    }
+
+    pub fn insert(
+        &mut self,
+        source: TickerInfo,
+        depth: &Depth,
+        update_time: UnixMs,
+    ) -> Option<Depth> {
+        if !self.sources.contains(&source) {
+            return None;
+        }
+
+        if self
+            .books
+            .get(&source)
+            .is_some_and(|current| update_time < current.update_time)
+        {
+            return self.composite();
+        }
+
+        self.books.insert(
+            source,
+            SourceDepth {
+                depth: depth.clone(),
+                update_time,
+            },
+        );
+        self.composite()
+    }
+
+    fn composite(&self) -> Option<Depth> {
+        if self.sources.is_empty() || self.books.is_empty() {
+            return None;
+        }
+
+        let latest_time = self
+            .sources
+            .iter()
+            .filter_map(|source| self.books.get(source))
+            .map(|book| book.update_time.as_u64())
+            .max()?;
+
+        let mut combined = Depth::default();
+        for source in &self.sources {
+            let Some(book) = self.books.get(source) else {
+                continue;
+            };
+            if latest_time.saturating_sub(book.update_time.as_u64()) > DEPTH_SOURCE_STALE_AFTER_MS {
+                continue;
+            }
+
+            merge_depth_side(&mut combined.bids, &book.depth.bids, self.price_step, true);
+            merge_depth_side(&mut combined.asks, &book.depth.asks, self.price_step, false);
+        }
+
+        Some(combined)
+    }
+}
+
+fn merge_depth_side(
+    target: &mut BTreeMap<Price, Qty>,
+    source: &BTreeMap<Price, Qty>,
+    step: PriceStep,
+    is_bid: bool,
+) {
+    for (price, qty) in source {
+        let rounded = price.round_to_side_step(is_bid, step);
+        *target.entry(rounded).or_default() += *qty;
     }
 }
 
@@ -418,6 +562,19 @@ mod tests {
         }
     }
 
+    fn depth(bids: &[(f64, f64)], asks: &[(f64, f64)]) -> Depth {
+        Depth {
+            bids: bids
+                .iter()
+                .map(|(price, qty)| (Price::from_f64(*price), Qty::from_f64(*qty)))
+                .collect(),
+            asks: asks
+                .iter()
+                .map(|(price, qty)| (Price::from_f64(*price), Qty::from_f64(*qty)))
+                .collect(),
+        }
+    }
+
     #[test]
     fn btc_perpetual_starts_with_binance_linear() {
         let definition = AggregateFeedId::BtcUsdtPerpetual.definition();
@@ -472,6 +629,89 @@ mod tests {
         assert_eq!(feed.sources(), &[binance, bybit, hyperliquid]);
         assert_eq!(feed.trade_streams().len(), 3);
         assert_eq!(feed.kline_streams(Timeframe::M1).len(), 3);
+        assert_eq!(feed.depth_streams().len(), 3);
+    }
+
+    #[test]
+    fn depth_aggregator_renders_available_sources_then_sums_rebinned_levels() {
+        let binance = ticker_info(Exchange::BinanceLinear, "BTCUSDT");
+        let bybit = ticker_info(Exchange::BybitLinear, "BTCUSDT");
+        let hyperliquid = ticker_info(Exchange::HyperliquidLinear, "BTC");
+        let step: PriceStep = exchange::unit::MinTicksize::new(0).into();
+        let mut aggregator = DepthAggregator::new(vec![binance, bybit, hyperliquid], step);
+
+        let binance_only = aggregator
+            .insert(
+                binance,
+                &depth(&[(100.4, 1.0)], &[(101.0, 2.0)]),
+                UnixMs::new(1_000),
+            )
+            .expect("the first available source should render immediately");
+        assert_eq!(
+            binance_only.bids.get(&Price::from_f64(100.0)),
+            Some(&Qty::from_f64(1.0))
+        );
+
+        let two_sources = aggregator
+            .insert(
+                bybit,
+                &depth(&[(100.9, 3.0)], &[(101.7, 4.0)]),
+                UnixMs::new(1_001),
+            )
+            .expect("new sources should be added as they become ready");
+        assert_eq!(
+            two_sources.bids.get(&Price::from_f64(100.0)),
+            Some(&Qty::from_f64(4.0))
+        );
+        let combined = aggregator
+            .insert(
+                hyperliquid,
+                &depth(&[(100.2, 5.0)], &[(101.2, 6.0)]),
+                UnixMs::new(1_002),
+            )
+            .expect("all three source books are ready");
+
+        assert_eq!(
+            combined.bids.get(&Price::from_f64(100.0)),
+            Some(&Qty::from_f64(9.0))
+        );
+        assert_eq!(
+            combined.asks.get(&Price::from_f64(102.0)),
+            Some(&Qty::from_f64(10.0))
+        );
+        assert_eq!(
+            combined.asks.get(&Price::from_f64(101.0)),
+            Some(&Qty::from_f64(2.0))
+        );
+    }
+
+    #[test]
+    fn depth_aggregator_excludes_stale_books_after_initialization() {
+        let binance = ticker_info(Exchange::BinanceLinear, "BTCUSDT");
+        let bybit = ticker_info(Exchange::BybitLinear, "BTCUSDT");
+        let step: PriceStep = exchange::unit::MinTicksize::new(0).into();
+        let mut aggregator = DepthAggregator::new(vec![binance, bybit], step);
+        let initial = depth(&[(100.0, 1.0)], &[(101.0, 1.0)]);
+
+        assert!(
+            aggregator
+                .insert(binance, &initial, UnixMs::new(1_000))
+                .is_some()
+        );
+        assert!(
+            aggregator
+                .insert(bybit, &initial, UnixMs::new(1_000))
+                .is_some()
+        );
+
+        let fresh = depth(&[(100.0, 4.0)], &[(101.0, 4.0)]);
+        let combined = aggregator
+            .insert(binance, &fresh, UnixMs::new(7_001))
+            .expect("initialized aggregate remains available");
+        assert_eq!(
+            combined.bids.get(&Price::from_f64(100.0)),
+            Some(&Qty::from_f64(4.0))
+        );
     }
 
     #[test]
@@ -484,6 +724,73 @@ mod tests {
         let sources = equivalent_footprint_sources(bybit, [unrelated, hyperliquid, binance, bybit]);
 
         assert_eq!(sources, vec![bybit, binance, hyperliquid]);
+    }
+
+    #[test]
+    fn footprint_sources_keep_only_one_market_per_venue() {
+        let selected = ticker_info(Exchange::BinanceLinear, "BTCUSDT");
+        let binance_usdc = ticker_info(Exchange::BinanceLinear, "BTCUSDC");
+        let bybit = ticker_info(Exchange::BybitLinear, "BTCUSDT");
+        let hyperliquid = ticker_info(Exchange::HyperliquidLinear, "BTC");
+        let hyperliquid_alias = TickerInfo::new(
+            Ticker::new_with_display("BTC", Exchange::HyperliquidLinear, Some("BTC/USDC")),
+            1.0,
+            0.001,
+            None,
+        );
+
+        let sources = equivalent_footprint_sources(
+            selected,
+            [
+                selected,
+                binance_usdc,
+                bybit,
+                hyperliquid,
+                hyperliquid_alias,
+            ],
+        );
+        assert_eq!(sources.len(), 3);
+        assert_eq!(
+            sources
+                .iter()
+                .map(|source| source.exchange().venue())
+                .collect::<Vec<_>>(),
+            vec![Venue::Binance, Venue::Bybit, Venue::Hyperliquid]
+        );
+    }
+
+    #[test]
+    fn footprint_sources_exclude_hyperliquid_builder_market_aliases() {
+        let selected = ticker_info(Exchange::BinanceLinear, "BTCUSDT");
+        let native = TickerInfo::new(
+            Ticker::new_with_display("BTC", Exchange::HyperliquidLinear, Some("BTCUSDC")),
+            0.1,
+            0.001,
+            None,
+        );
+        let builder = TickerInfo::new(
+            Ticker::new_with_display(
+                "hyna:BTC",
+                Exchange::HyperliquidLinear,
+                Some("hyna:BTCUSDE"),
+            ),
+            0.1,
+            0.001,
+            None,
+        );
+
+        let sources = equivalent_footprint_sources(selected, [builder, native, selected]);
+
+        assert!(
+            sources
+                .iter()
+                .any(|source| source.ticker.same_market(&native.ticker))
+        );
+        assert!(
+            !sources
+                .iter()
+                .any(|source| source.ticker.same_market(&builder.ticker))
+        );
     }
 
     #[test]

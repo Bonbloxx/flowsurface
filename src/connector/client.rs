@@ -5,6 +5,10 @@ use exchange::{TickerInfo, Trade, UnixMs};
 
 use arrow_array::{Array, BooleanArray, Float64Array, Int64Array, RecordBatch};
 use arrow_ipc::reader::StreamReader;
+use rustc_hash::FxHashMap;
+use serde::Deserialize;
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 
 use exchange::adapter::{AdapterHandles, Venue};
 use exchange::proxy::Proxy;
@@ -90,7 +94,27 @@ pub struct ServerClient {
     base_url: String,
     client: reqwest::Client,
     auth_token: Option<String>,
+    coverage: Arc<RwLock<ServerCoverage>>,
 }
+
+#[derive(Debug, Default)]
+struct ServerCoverage {
+    fetched_at: Option<Instant>,
+    earliest_by_ticker: FxHashMap<String, Option<UnixMs>>,
+}
+
+#[derive(Deserialize)]
+struct ServerPairsResponse {
+    pairs: Vec<ServerPair>,
+}
+
+#[derive(Deserialize)]
+struct ServerPair {
+    ticker: String,
+    earliest: Option<u64>,
+}
+
+const SERVER_COVERAGE_TTL: Duration = Duration::from_secs(30);
 
 impl ServerClient {
     /// Create a new client targeting the given base URL
@@ -120,6 +144,7 @@ impl ServerClient {
             base_url: trimmed.to_string(),
             client,
             auth_token,
+            coverage: Arc::new(RwLock::new(ServerCoverage::default())),
         })
     }
 
@@ -136,6 +161,71 @@ impl ServerClient {
     /// Optional bearer token sent as `Authorization: Bearer <token>`.
     fn auth_token(&self) -> Option<&str> {
         self.auth_token.as_deref()
+    }
+
+    /// Earliest currently stored trade for this server ticker.
+    ///
+    /// The short TTL preserves newly imported history while preventing every
+    /// per-day backfill request from re-querying `/pairs`.
+    pub(crate) async fn earliest_trade_time(
+        &self,
+        ticker_info: TickerInfo,
+    ) -> Result<Option<UnixMs>, AdapterError> {
+        let Some(ticker_key) = server_ticker_key(ticker_info) else {
+            return Ok(None);
+        };
+
+        if let Ok(coverage) = self.coverage.read()
+            && coverage
+                .fetched_at
+                .is_some_and(|fetched| fetched.elapsed() < SERVER_COVERAGE_TTL)
+        {
+            return Ok(coverage
+                .earliest_by_ticker
+                .get(&ticker_key)
+                .copied()
+                .flatten());
+        }
+
+        let url = format!("{}/pairs", self.base_url());
+        let mut request = self.http_client().get(&url);
+        if let Some(token) = self.auth_token() {
+            request = request.header("Authorization", &format!("Bearer {token}"));
+        }
+        let response = request.send().await.map_err(|e| {
+            AdapterError::FetchError(FetchError::new(
+                format!("server coverage request failed: {e}"),
+                "External data source error. Check logs for details.",
+            ))
+        })?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(AdapterError::http_status_failed(
+                status,
+                format!("server coverage: {body}"),
+            ));
+        }
+        let payload = response
+            .json::<ServerPairsResponse>()
+            .await
+            .map_err(|e| AdapterError::ParseError(format!("server coverage response: {e}")))?;
+        let earliest_by_ticker = payload
+            .pairs
+            .into_iter()
+            .map(|pair| {
+                (
+                    pair.ticker.to_ascii_lowercase(),
+                    pair.earliest.map(UnixMs::new),
+                )
+            })
+            .collect::<FxHashMap<_, _>>();
+        let earliest = earliest_by_ticker.get(&ticker_key).copied().flatten();
+        if let Ok(mut coverage) = self.coverage.write() {
+            coverage.fetched_at = Some(Instant::now());
+            coverage.earliest_by_ticker = earliest_by_ticker;
+        }
+        Ok(earliest)
     }
 
     /// Build a [`ServerClient`] from the shared HTTP client and the current
@@ -233,6 +323,53 @@ impl ServerClient {
         })?;
 
         parse_arrow_trades(bytes, &ticker_info)
+    }
+}
+
+fn server_ticker_key(ticker_info: TickerInfo) -> Option<String> {
+    let serialized = serde_json::to_value(ticker_info.ticker).ok()?;
+    let (exchange, _) = serialized.as_str()?.split_once(':')?;
+    let symbol = ticker_info
+        .ticker
+        .display_symbol()
+        .map(str::to_owned)
+        .unwrap_or_else(|| ticker_info.ticker.to_string());
+    Some(format!("{exchange}:{}", symbol.to_ascii_lowercase()).to_ascii_lowercase())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use exchange::{Ticker, adapter::Exchange};
+
+    #[test]
+    fn server_coverage_key_uses_hyperliquid_display_symbol() {
+        let source = TickerInfo::new(
+            Ticker::new_with_display("BTC", Exchange::HyperliquidLinear, Some("BTCUSDC")),
+            1.0,
+            0.001,
+            None,
+        );
+
+        assert_eq!(
+            server_ticker_key(source).as_deref(),
+            Some("hyperliquidlinear:btcusdc")
+        );
+    }
+
+    #[test]
+    fn server_coverage_key_uses_native_symbol_without_alias() {
+        let source = TickerInfo::new(
+            Ticker::new("BTCUSDT", Exchange::BinanceLinear),
+            0.1,
+            0.001,
+            None,
+        );
+
+        assert_eq!(
+            server_ticker_key(source).as_deref(),
+            Some("binancelinear:btcusdt")
+        );
     }
 }
 

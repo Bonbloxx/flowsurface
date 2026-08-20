@@ -33,13 +33,15 @@ struct FetchedKline(
     String,
 );
 
-#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DeOpenInterest {
     #[serde(rename = "timestamp")]
     pub time: u64,
     #[serde(rename = "sumOpenInterest", deserialize_with = "de_string_to_number")]
     pub sum: f64,
+    #[serde(rename = "sumOpenInterestValue", default)]
+    pub notional: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -539,7 +541,17 @@ pub(super) async fn fetch_historical_oi(
         .iter()
         .map(|x| OpenInterest {
             time: x.time.into(),
-            value: contract_size.map_or(x.sum, |size| x.sum * size.as_f64()),
+            value: match market {
+                MarketKind::LinearPerps => x
+                    .notional
+                    .as_deref()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(x.sum),
+                MarketKind::InversePerps => {
+                    contract_size.map_or(x.sum, |size| x.sum * size.as_f64())
+                }
+                MarketKind::Spot => unreachable!("spot open interest was rejected above"),
+            },
         })
         .collect::<Vec<OpenInterest>>();
 
@@ -591,9 +603,10 @@ async fn fetch_intraday_trades(
     Ok(trades)
 }
 
-/// Hard cap per archive read. A single BTCUSDT futures day can be millions of
-/// rows — materializing the whole day OOMs the process with no panic log.
-const MAX_ARCHIVE_TRADES_PER_FETCH: usize = 50_000;
+/// Hard cap per archive read. Busy BTCUSDT days are ~0.5–2M aggTrades; 500k
+/// truncated the session high/low used by Daily Delta. Still bounded so a
+/// pathological file cannot grow without limit.
+const MAX_ARCHIVE_TRADES_PER_FETCH: usize = 2_000_000;
 
 async fn get_hist_trades_with_client(
     client: &reqwest::Client,
@@ -601,6 +614,7 @@ async fn get_hist_trades_with_client(
     date: chrono::NaiveDate,
     base_path: PathBuf,
     from_time: UnixMs,
+    until: Option<UnixMs>,
     limit: usize,
 ) -> Result<Vec<Trade>, AdapterError> {
     let ticker = ticker_info.ticker;
@@ -698,6 +712,7 @@ async fn get_hist_trades_with_client(
     // Never materialize a full BTCUSDT day in memory.
     let mut trades = Vec::with_capacity(limit.min(MAX_ARCHIVE_TRADES_PER_FETCH));
     let from_ms = from_time.as_u64();
+    let until_ms = until.map(|time| time.as_u64());
 
     for i in 0..archive.len() {
         if trades.len() >= limit {
@@ -721,6 +736,9 @@ async fn get_hist_trades_with_client(
             };
             if time < from_ms {
                 continue;
+            }
+            if until_ms.is_some_and(|until| time > until) {
+                break;
             }
 
             let Ok(is_sell) = record[6].parse::<bool>() else {
@@ -765,10 +783,6 @@ pub(super) async fn fetch_trades(
         ));
     };
 
-    if to_time.is_some() {
-        return fetch_intraday_trades(hub, ticker_info, from_time, to_time).await;
-    }
-
     let today_date = chrono::Utc::now().date_naive();
     let today_midnight = today_date
         .and_hms_opt(0, 0, 0)
@@ -781,6 +795,7 @@ pub(super) async fn fetch_trades(
         .map_err(|_| AdapterError::InvalidRequest("Timestamp exceeds i64 range".to_string()))?;
 
     if from_time_ms >= today_midnight.timestamp_millis() {
+        // Forward paging uses startTime; `to_time` is enforced by the caller.
         return fetch_intraday_trades(hub, ticker_info, from_time, None).await;
     }
 
@@ -794,16 +809,20 @@ pub(super) async fn fetch_trades(
     // Walk completed UTC days until we produce a non-empty page or reach today.
     // Each page is capped so BTCUSDT archives cannot OOM the process.
     //
-    // Missing archives (Binance often lags ~1 day) are skipped — we do NOT try
-    // to REST-page an entire missing day. Today is filled via REST after the
-    // archive walk.
+    // Binance REST aggTrades only covers ~2 recent days (`-4166` otherwise), so
+    // a missing/exhausted archive must not fall through to REST for older days.
+    // Return an empty page and let the caller stop; yesterday/today still REST.
     while cursor_date < today_date {
+        if to_time.is_some_and(|until| cursor_time > until) {
+            return Ok(Vec::new());
+        }
         match get_hist_trades_with_client(
             &client,
             ticker_info,
             cursor_date,
             data_path.clone(),
             cursor_time,
+            to_time,
             MAX_ARCHIVE_TRADES_PER_FETCH,
         )
         .await
@@ -815,7 +834,11 @@ pub(super) async fn fetch_trades(
                 // Archive day fully behind the cursor — advance to next midnight.
             }
             Err(e) => {
-                log::warn!("Historical trades unavailable for {cursor_date}: {e}; skipping day");
+                log::warn!("Historical trades archive unavailable for {cursor_date}: {e}");
+                if today_date.signed_duration_since(cursor_date).num_days() <= 2 {
+                    return fetch_intraday_trades(hub, ticker_info, cursor_time, None).await;
+                }
+                return Ok(Vec::new());
             }
         }
 

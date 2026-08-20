@@ -174,6 +174,23 @@ impl Scene {
         self.sync_cell_world_uniform();
     }
 
+    pub fn set_cell_world(&mut self, width: f32, height: f32) {
+        self.cell.set_width_world(width);
+        self.cell.set_height_world(height);
+        self.sync_cell_world_uniform();
+    }
+
+    pub fn set_overlay_cell_world(&mut self, width: f32, height: f32) {
+        self.cell.set_overlay_dimensions(width, height);
+        self.sync_cell_world_uniform();
+    }
+
+    pub fn set_heatmap_only(&mut self) {
+        self.set_circles(vec![]);
+        self.set_rectangles(vec![]);
+        self.set_draw_list(vec![DrawItem::new(DrawLayer::HEATMAP, DrawOp::Heatmap)]);
+    }
+
     fn sync_cell_world_uniform(&mut self) {
         self.params
             .set_cell_world(self.cell.width_world(), self.cell.height_world());

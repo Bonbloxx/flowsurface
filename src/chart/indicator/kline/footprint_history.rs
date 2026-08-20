@@ -6,35 +6,106 @@ use crate::{
 
 use data::{chart::PlotData, chart::kline::KlineDataPoint, util::abbr_large_numbers};
 use exchange::{
-    OpenInterest, Ticker, TickerInfo, Trade, UnixMs,
+    OpenInterest, SizeUnit, Ticker, TickerInfo, Trade, UnixMs,
     adapter::Venue,
-    unit::{Price, PriceStep},
+    unit::{Price, PriceStep, qty::volume_size_unit},
 };
 use iced::widget::canvas::{self, Cache, Geometry};
 use iced::{
     Alignment, Color, Element, Event, Length, Point, Rectangle, Renderer, Size, Theme, mouse,
-    widget::{Canvas, container, row, rule, space},
+    widget::{Canvas, container, responsive, row, rule, scrollable, space},
 };
 use rustc_hash::{FxHashMap, FxHashSet};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
-const DAY_MS: u64 = 24 * 60 * 60 * 1_000;
+pub(crate) const DAY_MS: u64 = 24 * 60 * 60 * 1_000;
 const FIVE_MIN_MS: u64 = 5 * 60 * 1_000;
-const DAYS: usize = 3;
+pub(crate) const DAYS: usize = 3;
+const CACHE_SCHEMA_VERSION: u16 = 1;
+const MAX_LOOKBACK_DAYS: usize = 732;
 
-#[derive(Debug, Clone, Copy, Default)]
-struct LevelStats {
+/// Inclusive UTC-day windows from `00:00:00.000` through `23:59:59.999`,
+/// oldest first. The last window is clipped to `cutoff` so today stops at now.
+pub(crate) fn utc_day_ranges(cutoff: UnixMs, days: u64) -> Vec<(UnixMs, UnixMs)> {
+    let today = day_start(cutoff);
+    let start = today.saturating_sub(days.saturating_sub(1) * DAY_MS);
+    utc_days_covering(UnixMs::new(start), cutoff, days.max(1) as usize)
+}
+
+/// UTC-day windows that overlap `[from, to]`, newest-capped at `cap`, oldest first.
+pub(crate) fn utc_days_covering(from: UnixMs, to: UnixMs, cap: usize) -> Vec<(UnixMs, UnixMs)> {
+    let to = if to.as_u64() < from.as_u64() {
+        from
+    } else {
+        to
+    };
+    let first = day_start(from);
+    let last = day_start(to);
+    let cap = cap.max(1);
+    let mut starts = Vec::new();
+    let mut start = last;
+    loop {
+        starts.push(start);
+        if start <= first || starts.len() >= cap {
+            break;
+        }
+        let prev = start.saturating_sub(DAY_MS);
+        if prev >= start {
+            break;
+        }
+        start = prev;
+    }
+    starts.reverse();
+    starts
+        .into_iter()
+        .map(|start| {
+            let end = start
+                .saturating_add(DAY_MS)
+                .saturating_sub(1)
+                .min(to.as_u64());
+            (UnixMs::new(start), UnixMs::new(end))
+        })
+        .collect()
+}
+
+pub(crate) fn missing_day_range(
+    start: UnixMs,
+    end: UnixMs,
+    covered_through: Option<UnixMs>,
+) -> Option<(UnixMs, UnixMs)> {
+    if covered_through.is_some_and(|through| through >= end) {
+        return None;
+    }
+    let missing_start = covered_through
+        .map(|through| through.saturating_add(1))
+        .unwrap_or(start)
+        .max(start);
+    (missing_start <= end).then_some((missing_start, end))
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Deserialize, Serialize)]
+pub(crate) struct LevelStats {
     bid: f64,
     ask: f64,
 }
 
 impl LevelStats {
-    fn volume(self) -> f64 {
+    pub(crate) fn volume(self) -> f64 {
         self.bid + self.ask
     }
 
-    fn delta(self) -> f64 {
+    pub(crate) fn delta(self) -> f64 {
         self.ask - self.bid
+    }
+
+    pub(crate) fn add_notional(&mut self, is_sell: bool, notional: f64) {
+        if is_sell {
+            self.bid += notional;
+        } else {
+            self.ask += notional;
+        }
     }
 
     fn merge(&mut self, other: Self) {
@@ -43,25 +114,24 @@ impl LevelStats {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
 struct LargestTrade {
     time: UnixMs,
     is_sell: bool,
     price: f64,
-    qty: f64,
     notional: f64,
 }
 
-#[derive(Debug, Clone, Default)]
-struct DayStats {
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
+pub(crate) struct DayStats {
     first: Option<(UnixMs, f64)>,
     last: Option<(UnixMs, f64)>,
-    high: Option<f64>,
-    low: Option<f64>,
+    pub(crate) high: Option<f64>,
+    pub(crate) low: Option<f64>,
     buy: f64,
     sell: f64,
     notional: f64,
-    levels: BTreeMap<i64, LevelStats>,
+    pub levels: BTreeMap<i64, LevelStats>,
     five_min_delta: BTreeMap<u64, f64>,
     largest_trade: Option<LargestTrade>,
 }
@@ -81,21 +151,22 @@ impl DayStats {
         self.high = Some(self.high.map_or(price, |value| value.max(price)));
         self.low = Some(self.low.map_or(price, |value| value.min(price)));
         if trade.is_sell {
-            self.sell += qty;
+            self.sell += notional;
         } else {
-            self.buy += qty;
+            self.buy += notional;
         }
         self.notional += notional;
 
         let level = self.levels.entry(trade.price.units).or_default();
         if trade.is_sell {
-            level.bid += qty;
+            level.bid += notional;
         } else {
-            level.ask += qty;
+            level.ask += notional;
         }
 
         let bucket = trade.time.as_u64() / FIVE_MIN_MS * FIVE_MIN_MS;
-        *self.five_min_delta.entry(bucket).or_default() += if trade.is_sell { -qty } else { qty };
+        *self.five_min_delta.entry(bucket).or_default() +=
+            if trade.is_sell { -notional } else { notional };
 
         if self
             .largest_trade
@@ -105,7 +176,6 @@ impl DayStats {
                 time: trade.time,
                 is_sell: trade.is_sell,
                 price,
-                qty,
                 notional,
             });
         }
@@ -212,9 +282,19 @@ struct SourceHistory {
     oi: BTreeMap<u64, OiDay>,
 }
 
-#[derive(Debug, Clone, Default)]
-struct DisplayDay {
+#[derive(Debug, Deserialize, Serialize)]
+struct CachedDayStats {
+    schema_version: u16,
+    source: Ticker,
+    day_start: u64,
+    covered_through: u64,
+    size_unit: SizeUnit,
     stats: DayStats,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct DisplayDay {
+    pub stats: DayStats,
     oi_delta: Option<f64>,
 }
 
@@ -222,9 +302,13 @@ pub struct FootprintHistoryIndicator {
     cache: Caches,
     sources: Vec<TickerInfo>,
     aggregate: bool,
+    lookback_days: usize,
     histories: FxHashMap<Ticker, SourceHistory>,
     history_cutoffs: FxHashMap<Ticker, UnixMs>,
     historical_started: FxHashSet<Ticker>,
+    historical_days_started: FxHashSet<(Ticker, u64)>,
+    completed_days: FxHashSet<(Ticker, u64)>,
+    cache_checkpoints: FxHashMap<(Ticker, u64), Option<UnixMs>>,
     pending_live: FxHashMap<Ticker, Vec<Trade>>,
 }
 
@@ -234,11 +318,226 @@ impl FootprintHistoryIndicator {
             cache: Caches::default(),
             sources: Vec::new(),
             aggregate: true,
+            lookback_days: DAYS,
             histories: FxHashMap::default(),
             history_cutoffs: FxHashMap::default(),
             historical_started: FxHashSet::default(),
+            historical_days_started: FxHashSet::default(),
+            completed_days: FxHashSet::default(),
+            cache_checkpoints: FxHashMap::default(),
             pending_live: FxHashMap::default(),
         }
+    }
+
+    pub(crate) fn set_lookback_days(&mut self, days: u16) {
+        self.lookback_days = usize::from(days).clamp(1, MAX_LOOKBACK_DAYS);
+    }
+
+    /// Keep only the data needed by Previous Value Area once a day is complete.
+    /// The shared disk cache remains at full trade-price granularity so other
+    /// indicators can still hydrate the original day book.
+    pub(crate) fn compact_day_for_value_area(
+        &mut self,
+        source: TickerInfo,
+        day: UnixMs,
+        step: PriceStep,
+    ) {
+        if step.units <= 0 {
+            return;
+        }
+        let day = day_start(day);
+        if !self.completed_days.contains(&(source.ticker, day)) {
+            return;
+        }
+        let Some(stats) = self
+            .histories
+            .get_mut(&source.ticker)
+            .and_then(|history| history.days.get_mut(&day))
+        else {
+            return;
+        };
+        let grouped = group_levels(stats, step);
+        stats.levels = grouped;
+        stats.five_min_delta.clear();
+    }
+
+    fn cache_path(source: TickerInfo, day: u64) -> PathBuf {
+        let unit = match volume_size_unit() {
+            SizeUnit::Base => "base",
+            SizeUnit::Quote => "quote",
+        };
+        let identity = source.ticker.symbol_and_exchange_string();
+        let safe_identity = identity
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                    ch
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>();
+        let relative = format!(
+            "market_data/footprint-days/v{CACHE_SCHEMA_VERSION}/{unit}/{safe_identity}/{day}.json"
+        );
+        if let Ok(override_path) = std::env::var("FLOWSURFACE_DATA_PATH") {
+            let override_path = PathBuf::from(override_path);
+            let base = if override_path.is_dir() || override_path.extension().is_none() {
+                override_path
+            } else {
+                override_path
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| PathBuf::from("."))
+            };
+            base.join(relative)
+        } else {
+            data::data_path(Some(&relative))
+        }
+    }
+
+    fn read_cached_day(path: &Path, source: TickerInfo, day: u64) -> Option<(DayStats, UnixMs)> {
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(err) => {
+                log::warn!("Failed to read footprint day cache {path:?}: {err}");
+                return None;
+            }
+        };
+        let cached = match serde_json::from_slice::<CachedDayStats>(&bytes) {
+            Ok(cached) => cached,
+            Err(err) => {
+                log::warn!("Ignoring corrupt footprint day cache {path:?}: {err}");
+                let _ = std::fs::remove_file(path);
+                return None;
+            }
+        };
+        if cached.schema_version != CACHE_SCHEMA_VERSION
+            || !cached.source.same_market(&source.ticker)
+            || cached.day_start != day
+            || cached.covered_through < day
+            || cached.covered_through >= day.saturating_add(DAY_MS)
+            || cached.size_unit != volume_size_unit()
+        {
+            log::warn!("Ignoring mismatched footprint day cache {path:?}");
+            let _ = std::fs::remove_file(path);
+            return None;
+        }
+        Some((cached.stats, UnixMs::new(cached.covered_through)))
+    }
+
+    fn write_cached_day(
+        path: &Path,
+        source: TickerInfo,
+        day: u64,
+        covered_through: UnixMs,
+        stats: &DayStats,
+    ) -> std::io::Result<()> {
+        if Self::read_cached_day(path, source, day)
+            .is_some_and(|(_, cached_through)| cached_through >= covered_through)
+        {
+            return Ok(());
+        }
+        let Some(parent) = path.parent() else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "footprint cache path has no parent",
+            ));
+        };
+        std::fs::create_dir_all(parent)?;
+        let payload = CachedDayStats {
+            schema_version: CACHE_SCHEMA_VERSION,
+            source: source.ticker,
+            day_start: day,
+            covered_through: covered_through.as_u64(),
+            size_unit: volume_size_unit(),
+            stats: stats.clone(),
+        };
+        let bytes = serde_json::to_vec(&payload).map_err(std::io::Error::other)?;
+        let temp_path = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+        std::fs::write(&temp_path, bytes)?;
+        if path.exists() {
+            std::fs::remove_file(path)?;
+        }
+        if let Err(err) = std::fs::rename(&temp_path, path) {
+            let target_won_race = path.exists();
+            let _ = std::fs::remove_file(&temp_path);
+            if !target_won_race {
+                return Err(err);
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn load_day_cache(&mut self, source: TickerInfo, day: UnixMs) -> Option<UnixMs> {
+        let day = day_start(day);
+        if day < self.retain_oldest(UnixMs::now()) {
+            // Another shared-history overlay may need this older day. Treat it
+            // as satisfied here without retaining an irrelevant duplicate.
+            return Some(UnixMs::new(day.saturating_add(DAY_MS).saturating_sub(1)));
+        }
+        let path = Self::cache_path(source, day);
+        self.load_day_cache_from_path(source, day, &path)
+    }
+
+    fn load_day_cache_from_path(
+        &mut self,
+        source: TickerInfo,
+        day: u64,
+        path: &Path,
+    ) -> Option<UnixMs> {
+        if let Some(checkpoint) = self.cache_checkpoints.get(&(source.ticker, day)) {
+            return *checkpoint;
+        }
+        let Some((stats, covered_through)) = Self::read_cached_day(path, source, day) else {
+            self.cache_checkpoints.insert((source.ticker, day), None);
+            return None;
+        };
+        self.histories
+            .entry(source.ticker)
+            .or_default()
+            .days
+            .insert(day, stats);
+        self.cache_checkpoints
+            .insert((source.ticker, day), Some(covered_through));
+        if covered_through.as_u64() >= day.saturating_add(DAY_MS).saturating_sub(1) {
+            self.completed_days.insert((source.ticker, day));
+        }
+        self.historical_days_started.insert((source.ticker, day));
+        log::debug!("Loaded footprint day cache for {} at {day}", source.ticker);
+        Some(covered_through)
+    }
+
+    pub(crate) fn persist_day_cache(
+        &mut self,
+        source: TickerInfo,
+        day: UnixMs,
+        covered_through: UnixMs,
+    ) {
+        let day = day_start(day);
+        let Some(stats) = self
+            .histories
+            .get(&source.ticker)
+            .and_then(|history| history.days.get(&day))
+        else {
+            return;
+        };
+        if covered_through.as_u64() >= day.saturating_add(DAY_MS).saturating_sub(1) {
+            self.completed_days.insert((source.ticker, day));
+        }
+        let path = Self::cache_path(source, day);
+        if let Err(err) = Self::write_cached_day(&path, source, day, covered_through, stats) {
+            log::warn!("Failed to write footprint day cache {path:?}: {err}");
+        } else {
+            self.cache_checkpoints
+                .insert((source.ticker, day), Some(covered_through));
+            log::debug!("Stored footprint day cache for {} at {day}", source.ticker);
+        }
+    }
+
+    fn retain_oldest(&self, now: UnixMs) -> u64 {
+        day_start(now).saturating_sub((self.lookback_days.saturating_sub(1) as u64) * DAY_MS)
     }
 
     fn active_sources(&self) -> &[TickerInfo] {
@@ -249,35 +548,129 @@ impl FootprintHistoryIndicator {
         }
     }
 
-    fn display_days(&self, now: UnixMs) -> [DisplayDay; DAYS] {
-        let today = day_start(now);
-        std::array::from_fn(|index| {
-            let day = today.saturating_sub(index as u64 * DAY_MS);
-            let mut result = DisplayDay::default();
-            let mut oi_delta = 0.0;
-            let mut has_oi = false;
-            for source in self.active_sources() {
-                if let Some(history) = self.histories.get(&source.ticker) {
-                    if let Some(stats) = history.days.get(&day) {
-                        result.stats.merge(stats);
-                    }
-                    if let Some(delta) = history.oi.get(&day).and_then(|oi| oi.delta()) {
-                        oi_delta += delta;
-                        has_oi = true;
-                    }
+    pub(crate) fn display_days(&self, now: UnixMs) -> [DisplayDay; DAYS] {
+        let days = self.display_day_list(now, DAYS);
+        std::array::from_fn(|index| days.get(index).cloned().unwrap_or_default())
+    }
+
+    pub(crate) fn display_day_at(&self, day: u64) -> DisplayDay {
+        let mut result = DisplayDay::default();
+        let mut oi_delta = 0.0;
+        let mut has_oi = false;
+        for source in self.active_sources() {
+            if let Some(history) = self.histories.get(&source.ticker) {
+                if let Some(stats) = history.days.get(&day) {
+                    result.stats.merge(stats);
+                }
+                if let Some(delta) = history.oi.get(&day).and_then(|oi| oi.delta()) {
+                    oi_delta += delta;
+                    has_oi = true;
                 }
             }
-            result.oi_delta = has_oi.then_some(oi_delta);
-            result
-        })
+        }
+        result.oi_delta = has_oi.then_some(oi_delta);
+        result
+    }
+
+    #[cfg(test)]
+    pub(crate) fn display_period(&self, start: UnixMs, end: UnixMs) -> DayStats {
+        let mut result = DayStats::default();
+        for source in self.active_sources() {
+            if let Some(history) = self.histories.get(&source.ticker) {
+                for (_, stats) in history.days.range(start.as_u64()..=day_start(end)) {
+                    result.merge(stats);
+                }
+            }
+        }
+        result
+    }
+
+    /// Merge only venues whose entire requested UTC period is available.
+    ///
+    /// An aggregate should not disappear while an additional venue is still
+    /// backfilling, but it must also never mix a partial venue into the value
+    /// area. Venues join the merged profile atomically once all of their days
+    /// are complete.
+    pub(crate) fn display_complete_period(&self, start: UnixMs, end: UnixMs) -> (DayStats, usize) {
+        let mut result = DayStats::default();
+        let mut complete_sources = 0;
+        for source in self.active_sources() {
+            if !self.source_period_complete(source.ticker, start, end) {
+                continue;
+            }
+            complete_sources += 1;
+            if let Some(history) = self.histories.get(&source.ticker) {
+                for (_, stats) in history.days.range(start.as_u64()..=day_start(end)) {
+                    result.merge(stats);
+                }
+            }
+        }
+        (result, complete_sources)
+    }
+
+    fn source_period_complete(&self, source: Ticker, start: UnixMs, end: UnixMs) -> bool {
+        let mut day = day_start(start);
+        let last = day_start(end);
+        loop {
+            if !self.completed_days.contains(&(source, day)) {
+                return false;
+            }
+            if day >= last {
+                return true;
+            }
+            let next = day.saturating_add(DAY_MS);
+            if next <= day {
+                return false;
+            }
+            day = next;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn period_coverage(&self, start: UnixMs, end: UnixMs) -> (usize, usize) {
+        let first = day_start(start);
+        let last = day_start(end);
+        let mut complete = 0;
+        let mut expected = 0;
+        for source in self.active_sources() {
+            let mut day = first;
+            loop {
+                expected += 1;
+                if self.completed_days.contains(&(source.ticker, day)) {
+                    complete += 1;
+                }
+                if day >= last {
+                    break;
+                }
+                let next = day.saturating_add(DAY_MS);
+                if next <= day {
+                    break;
+                }
+                day = next;
+            }
+        }
+        (complete, expected)
+    }
+
+    pub(crate) fn display_day_list(&self, now: UnixMs, days: usize) -> Vec<DisplayDay> {
+        let today = day_start(now);
+        let count = days.max(1);
+        (0..count)
+            .map(|index| {
+                let day = today.saturating_sub(index as u64 * DAY_MS);
+                self.display_day_at(day)
+            })
+            .collect()
     }
 
     fn source_label(&self) -> String {
-        let names = self
-            .active_sources()
-            .iter()
-            .map(|source| source.exchange().venue().to_string())
-            .collect::<Vec<_>>();
+        let mut names = Vec::new();
+        for source in self.active_sources() {
+            let venue = source.exchange().venue().to_string();
+            if !names.contains(&venue) {
+                names.push(venue);
+            }
+        }
         if self.aggregate && names.len() > 1 {
             format!("Aggregated · {}", names.join(" + "))
         } else {
@@ -295,9 +688,9 @@ impl FootprintHistoryIndicator {
                 if self
                     .active_sources()
                     .iter()
-                    .any(|source| source.exchange().venue() != Venue::Binance) =>
+                    .any(|source| source.exchange().venue() == Venue::Hyperliquid) =>
             {
-                Some("Bybit / Hyperliquid history requires Server trade fetching")
+                Some("Hyperliquid: live data only in Exchange mode · Server enables backfill")
             }
             TradeFetchMode::Server
                 if self
@@ -305,10 +698,53 @@ impl FootprintHistoryIndicator {
                     .iter()
                     .any(|source| source.exchange().venue() == Venue::Hyperliquid) =>
             {
-                Some("OI Δ uses Binance / Bybit · HL history unavailable")
+                Some("OI Δ uses Binance / Bybit · Hyperliquid OI is unavailable")
             }
             TradeFetchMode::Exchange | TradeFetchMode::Server => None,
         }
+    }
+
+    pub(crate) fn standalone_element(&self, block_step: PriceStep) -> Element<'_, Message> {
+        let days = self.display_days(UnixMs::now());
+        let sources = self.source_label();
+        let history_note = self.history_note();
+        let min_tick = self
+            .active_sources()
+            .iter()
+            .map(|source| PriceStep::from(source.min_ticksize))
+            .min_by_key(|step| step.units)
+            .unwrap_or(block_step);
+        let row_count = days
+            .iter()
+            .map(|day| price_row_count(day, min_tick, block_step))
+            .max()
+            .unwrap_or_default();
+
+        responsive(move |viewport| {
+            let content_height = standalone_content_height(row_count).max(viewport.height);
+            let canvas = Canvas::new(FootprintHistoryCanvas {
+                cache: &self.cache.main,
+                days: days.clone(),
+                sources: sources.clone(),
+                history_note,
+                min_tick,
+                block_step: Some(block_step),
+            })
+            .height(content_height)
+            .width(Length::Fill);
+
+            scrollable::Scrollable::with_direction(
+                canvas,
+                scrollable::Direction::Vertical(
+                    scrollable::Scrollbar::new().width(8).scroller_width(6),
+                ),
+            )
+            .height(Length::Fill)
+            .width(Length::Fill)
+            .style(style::scroll_bar)
+            .into()
+        })
+        .into()
     }
 }
 
@@ -337,6 +773,7 @@ impl KlineIndicatorImpl for FootprintHistoryIndicator {
                 .map(|source| PriceStep::from(source.min_ticksize))
                 .min_by_key(|step| step.units)
                 .unwrap_or(chart.tick_size),
+            block_step: None,
         })
         .height(Length::Fill)
         .width(Length::Fill);
@@ -351,12 +788,27 @@ impl KlineIndicatorImpl for FootprintHistoryIndicator {
 
     fn rebuild_from_source(&mut self, _source: &PlotData<KlineDataPoint>) {}
 
+    fn set_trade_history_lookback(&mut self, days: u16) {
+        self.set_lookback_days(days);
+        self.clear_all_caches();
+    }
+
+    fn reset_trade_history_backfill(&mut self) {
+        self.historical_started.clear();
+        self.historical_days_started.clear();
+        self.completed_days.clear();
+        self.cache_checkpoints.clear();
+        self.pending_live.clear();
+        self.histories.clear();
+        self.history_cutoffs.clear();
+        self.clear_all_caches();
+    }
+
     fn configure_footprint_history(&mut self, sources: &[TickerInfo], aggregate: bool) {
         self.sources = sources.to_vec();
         self.aggregate = aggregate;
-        self.history_cutoffs.clear();
-        self.historical_started.clear();
-        self.pending_live.clear();
+        // Histories are keyed by venue ticker and intentionally survive source
+        // toggles. Display aggregation is then an inexpensive merge of caches.
         self.clear_all_caches();
     }
 
@@ -364,12 +816,35 @@ impl KlineIndicatorImpl for FootprintHistoryIndicator {
         self.history_cutoffs.insert(source.ticker, cutoff);
     }
 
+    fn load_cached_footprint_day(
+        &mut self,
+        source: TickerInfo,
+        day_start: UnixMs,
+    ) -> Option<UnixMs> {
+        self.load_day_cache(source, day_start)
+    }
+
+    fn persist_cached_footprint_day(
+        &mut self,
+        source: TickerInfo,
+        day_start: UnixMs,
+        covered_through: UnixMs,
+    ) {
+        self.persist_day_cache(source, day_start, covered_through);
+    }
+
     fn on_source_trades(&mut self, source: TickerInfo, trades: &[Trade], historical: bool) {
-        if !self
-            .sources
-            .iter()
-            .any(|candidate| candidate.ticker.same_market(&source.ticker))
+        let oldest = self.retain_oldest(UnixMs::now());
+        if historical
+            && trades
+                .iter()
+                .map(|trade| trade.time.as_u64())
+                .max()
+                .is_some_and(|latest| latest < oldest)
         {
+            // Shared backfills can extend much farther than this indicator's
+            // lookback (for example Previous Value Area alongside Daily Delta).
+            // Do not scan or invalidate caches for an entirely irrelevant page.
             return;
         }
 
@@ -385,12 +860,20 @@ impl KlineIndicatorImpl for FootprintHistoryIndicator {
         } else {
             Vec::new()
         };
-        if first_historical_batch {
-            self.histories.entry(source_key).or_default().days.clear();
+        if historical {
+            let touched_days = trades
+                .iter()
+                .map(|trade| day_start(trade.time))
+                .collect::<FxHashSet<_>>();
+            let history = self.histories.entry(source_key).or_default();
+            for day in touched_days {
+                if self.historical_days_started.insert((source_key, day)) {
+                    history.days.remove(&day);
+                }
+            }
         }
 
         let cutoff = self.history_cutoffs.get(&source_key).copied();
-        let oldest = day_start(UnixMs::now()).saturating_sub((DAYS as u64 - 1) * DAY_MS);
         if !historical && !self.historical_started.contains(&source_key) {
             self.pending_live.entry(source_key).or_default().extend(
                 trades
@@ -425,7 +908,7 @@ impl KlineIndicatorImpl for FootprintHistoryIndicator {
         else {
             return;
         };
-        let oldest = day_start(UnixMs::now()).saturating_sub((DAYS as u64 - 1) * DAY_MS);
+        let oldest = self.retain_oldest(UnixMs::now());
         let history = self.histories.entry(source_key).or_default();
         for value in values {
             if value.time.as_u64() >= oldest {
@@ -447,6 +930,7 @@ struct FootprintHistoryCanvas<'a> {
     sources: String,
     history_note: Option<&'static str>,
     min_tick: PriceStep,
+    block_step: Option<PriceStep>,
 }
 
 impl canvas::Program<Message> for FootprintHistoryCanvas<'_> {
@@ -489,7 +973,7 @@ impl canvas::Program<Message> for FootprintHistoryCanvas<'_> {
                 frame,
                 &self.sources,
                 Point::new(6.0, 10.0),
-                10.0,
+                12.0,
                 muted,
                 Alignment::Start,
             );
@@ -498,15 +982,15 @@ impl canvas::Program<Message> for FootprintHistoryCanvas<'_> {
                     frame,
                     note,
                     Point::new(bounds.width - 6.0, 10.0),
-                    9.0,
+                    11.0,
                     warning,
                     Alignment::End,
                 );
             }
 
-            let top = 22.0;
-            let metrics_height = 178.0_f32.min((bounds.height * 0.48).max(116.0));
-            let row_h = ((metrics_height - 26.0) / 9.0).clamp(10.0, 17.0);
+            let top = 26.0;
+            let metrics_height = 156.0_f32.min((bounds.height * 0.34).max(118.0));
+            let row_h = ((metrics_height - 28.0) / 9.0).clamp(11.0, 16.0);
             let table_top = top + metrics_height;
 
             for index in 0..DAYS {
@@ -520,16 +1004,12 @@ impl canvas::Program<Message> for FootprintHistoryCanvas<'_> {
                     );
                 }
                 let day_start = today.saturating_sub(index as u64 * DAY_MS);
-                let title = match index {
-                    0 => "Current day",
-                    1 => "Previous day",
-                    _ => "Two days ago",
-                };
+                let title = day_title(index);
                 draw_text(
                     frame,
                     title,
                     Point::new(left + 7.0, top + 8.0),
-                    11.0,
+                    13.0,
                     fg,
                     Alignment::Start,
                 );
@@ -537,7 +1017,7 @@ impl canvas::Program<Message> for FootprintHistoryCanvas<'_> {
                     frame,
                     &format_day(day_start),
                     Point::new(right - 7.0, top + 8.0),
-                    9.0,
+                    11.0,
                     muted,
                     Alignment::End,
                 );
@@ -562,27 +1042,31 @@ impl canvas::Program<Message> for FootprintHistoryCanvas<'_> {
                 border,
             );
             let available_rows =
-                ((bounds.height - table_top - 34.0) / 15.0).floor().max(1.0) as usize;
-            let (step, rows) = shared_price_rows(&self.days, self.min_tick, available_rows);
-            let step_label = format_price_step(step);
+                ((bounds.height - table_top - 36.0) / 15.0).floor().max(1.0) as usize;
+            let price_rows = self
+                .days
+                .iter()
+                .map(|day| day_price_rows(day, self.min_tick, self.block_step, available_rows))
+                .collect::<Vec<_>>();
 
-            for index in 0..DAYS {
+            for (index, (step, _)) in price_rows.iter().enumerate() {
                 let left = width * index as f32;
                 draw_text(
                     frame,
-                    &format!("Daily footprint @ {step_label}"),
-                    Point::new(left + 7.0, table_top + 10.0),
-                    9.0,
+                    &format!("Daily footprint · USD @ {}", format_price_step(*step)),
+                    Point::new(left + 7.0, table_top + 12.0),
+                    11.0,
                     fg,
                     Alignment::Start,
                 );
-                draw_table_header(frame, left, width, table_top + 24.0, muted);
+                draw_table_header(frame, left, width, table_top + 29.0, muted);
             }
 
             let grouped = self
                 .days
                 .iter()
-                .map(|day| group_levels(&day.stats, step))
+                .zip(price_rows.iter())
+                .map(|(day, (step, _))| group_levels(&day.stats, *step))
                 .collect::<Vec<_>>();
             let maxima = grouped
                 .iter()
@@ -599,9 +1083,12 @@ impl canvas::Program<Message> for FootprintHistoryCanvas<'_> {
                 })
                 .collect::<Vec<_>>();
 
-            for (row_index, price_units) in rows.iter().enumerate() {
-                let y = table_top + 34.0 + row_index as f32 * 15.0;
+            for row_index in 0..available_rows {
+                let y = table_top + 38.0 + row_index as f32 * 15.0;
                 for day_index in 0..DAYS {
+                    let Some(price_units) = price_rows[day_index].1.get(row_index) else {
+                        continue;
+                    };
                     let left = width * day_index as f32;
                     draw_level_row(
                         frame,
@@ -648,7 +1135,7 @@ fn draw_day_metrics(
             frame,
             label,
             Point::new(left, y),
-            8.5,
+            10.0,
             muted,
             Alignment::Start,
         );
@@ -656,7 +1143,7 @@ fn draw_day_metrics(
             frame,
             &value,
             Point::new(value_x, y),
-            8.5,
+            10.0,
             color,
             Alignment::End,
         );
@@ -667,7 +1154,7 @@ fn draw_day_metrics(
         frame,
         "High",
         Point::new(mid + 5.0, top),
-        8.5,
+        10.0,
         muted,
         Alignment::Start,
     );
@@ -675,7 +1162,7 @@ fn draw_day_metrics(
         frame,
         &price(stats.high),
         Point::new(right_value_x, top),
-        8.5,
+        10.0,
         fg,
         Alignment::End,
     );
@@ -684,7 +1171,7 @@ fn draw_day_metrics(
         frame,
         "Close",
         Point::new(mid + 5.0, top + row_h),
-        8.5,
+        10.0,
         muted,
         Alignment::Start,
     );
@@ -692,15 +1179,15 @@ fn draw_day_metrics(
         frame,
         &price(stats.last.map(|(_, p)| p)),
         Point::new(right_value_x, top + row_h),
-        8.5,
+        10.0,
         fg,
         Alignment::End,
     );
 
     metric(
         frame,
-        "Volume",
-        abbr_large_numbers(stats.volume()),
+        "Volume USD",
+        usd(stats.volume()),
         top + row_h * 2.0,
         fg,
     );
@@ -708,15 +1195,15 @@ fn draw_day_metrics(
         frame,
         "Notional",
         Point::new(mid + 5.0, top + row_h * 2.0),
-        8.5,
+        10.0,
         muted,
         Alignment::Start,
     );
     draw_text(
         frame,
-        &format!("${}", abbr_large_numbers(stats.notional)),
+        &usd(stats.notional),
         Point::new(right_value_x, top + row_h * 2.0),
-        8.5,
+        10.0,
         fg,
         Alignment::End,
     );
@@ -730,7 +1217,7 @@ fn draw_day_metrics(
     metric(
         frame,
         "Delta",
-        format!("{} ({delta_pct:+.1}%)", signed(delta)),
+        format!("{} ({delta_pct:+.1}%)", signed_usd(delta)),
         top + row_h * 3.0,
         if delta >= 0.0 { buy } else { sell },
     );
@@ -739,15 +1226,15 @@ fn draw_day_metrics(
     metric(
         frame,
         "CVD range",
-        format!("L {}", signed(cvd_low)),
+        format!("L {}", signed_usd(cvd_low)),
         top + row_h * 4.0,
         sell,
     );
     draw_text(
         frame,
-        &format!("H {}", signed(cvd_high)),
+        &format!("H {}", signed_usd(cvd_high)),
         Point::new(right_value_x, top + row_h * 4.0),
-        8.5,
+        10.0,
         buy,
         Alignment::End,
     );
@@ -755,11 +1242,6 @@ fn draw_day_metrics(
         let line_left = left + 64.0;
         let line_right = right - 54.0;
         let y = top + row_h * 4.0;
-        frame.fill_rectangle(
-            Point::new(line_left, y),
-            Size::new((line_right - line_left).max(0.0), 1.0),
-            muted.scale_alpha(0.5),
-        );
         let ratio = ((delta - cvd_low) / (cvd_high - cvd_low)).clamp(0.0, 1.0) as f32;
         frame.fill_rectangle(
             Point::new(line_left + (line_right - line_left) * ratio - 2.0, y - 2.0),
@@ -785,7 +1267,7 @@ fn draw_day_metrics(
         metric(
             frame,
             label,
-            result.map_or_else(|| "—".to_string(), |(_, value)| signed(value)),
+            result.map_or_else(|| "—".to_string(), |(_, value)| signed_usd(value)),
             top + row_h * offset,
             if positive { buy } else { sell },
         );
@@ -794,7 +1276,7 @@ fn draw_day_metrics(
                 frame,
                 &format_time(time),
                 Point::new(right_value_x, top + row_h * offset),
-                8.0,
+                9.0,
                 muted,
                 Alignment::End,
             );
@@ -809,10 +1291,9 @@ fn draw_day_metrics(
             || "—".to_string(),
             |trade| {
                 format!(
-                    "{} {} · ${}",
+                    "{} {}",
                     if trade.is_sell { "Sell" } else { "Buy" },
-                    abbr_large_numbers(trade.qty),
-                    abbr_large_numbers(trade.notional)
+                    usd(trade.notional)
                 )
             },
         ),
@@ -828,7 +1309,7 @@ fn draw_day_metrics(
                 format_time(trade.time.as_u64())
             ),
             Point::new(right_value_x, top + row_h * 8.0),
-            7.5,
+            8.5,
             muted,
             Alignment::End,
         );
@@ -837,17 +1318,17 @@ fn draw_day_metrics(
 
 fn draw_table_header(frame: &mut canvas::Frame, left: f32, width: f32, y: f32, color: Color) {
     for (label, ratio, align) in [
-        ("Bid", 0.19, Alignment::Center),
+        ("Bid $", 0.19, Alignment::Center),
         ("Price", 0.39, Alignment::Center),
-        ("Ask", 0.57, Alignment::Center),
-        ("Delta", 0.75, Alignment::Center),
-        ("Volume", 0.97, Alignment::End),
+        ("Ask $", 0.57, Alignment::Center),
+        ("Delta $", 0.75, Alignment::Center),
+        ("Volume $", 0.97, Alignment::End),
     ] {
         draw_text(
             frame,
             label,
             Point::new(left + width * ratio, y),
-            8.0,
+            9.5,
             color,
             align,
         );
@@ -874,7 +1355,7 @@ fn draw_level_row(
             frame,
             &format_price(Price::from_units(price_units).to_f64()),
             Point::new(left + width * 0.39, y),
-            8.0,
+            9.5,
             muted,
             Alignment::Center,
         );
@@ -883,27 +1364,27 @@ fn draw_level_row(
     let side_max = maxima.0.max(f64::EPSILON);
     let cell_w = width * 0.16;
     frame.fill_rectangle(
-        Point::new(left + width * 0.11, y - 6.0),
-        Size::new(cell_w * (level.bid / side_max) as f32, 12.0),
+        Point::new(left + width * 0.11, y - 7.5),
+        Size::new(cell_w * (level.bid / side_max) as f32, 15.0),
         sell.scale_alpha(0.28),
     );
     frame.fill_rectangle(
-        Point::new(left + width * 0.49, y - 6.0),
-        Size::new(cell_w * (level.ask / side_max) as f32, 12.0),
+        Point::new(left + width * 0.49, y - 7.5),
+        Size::new(cell_w * (level.ask / side_max) as f32, 15.0),
         buy.scale_alpha(0.28),
     );
     if maxima.1 > 0.0 && (level.volume() - maxima.1).abs() <= f64::EPSILON {
         frame.fill_rectangle(
-            Point::new(left + width * 0.82, y - 6.0),
-            Size::new(width * 0.17, 12.0),
+            Point::new(left + width * 0.82, y - 7.5),
+            Size::new(width * 0.17, 15.0),
             warning.scale_alpha(0.28),
         );
     }
     draw_text(
         frame,
-        &abbr_large_numbers(level.bid),
+        &usd(level.bid),
         Point::new(left + width * 0.27, y),
-        8.0,
+        9.5,
         sell,
         Alignment::End,
     );
@@ -911,77 +1392,111 @@ fn draw_level_row(
         frame,
         &format_price(Price::from_units(price_units).to_f64()),
         Point::new(left + width * 0.39, y),
-        8.0,
+        9.5,
         fg,
         Alignment::Center,
     );
     draw_text(
         frame,
-        &abbr_large_numbers(level.ask),
+        &usd(level.ask),
         Point::new(left + width * 0.65, y),
-        8.0,
+        9.5,
         buy,
         Alignment::End,
     );
     let delta = level.delta();
     draw_text(
         frame,
-        &signed(delta),
+        &signed_usd(delta),
         Point::new(left + width * 0.80, y),
-        8.0,
+        9.5,
         if delta >= 0.0 { buy } else { sell },
         Alignment::End,
     );
     draw_text(
         frame,
-        &abbr_large_numbers(level.volume()),
+        &usd(level.volume()),
         Point::new(left + width * 0.98, y),
-        8.0,
+        9.5,
         fg,
         Alignment::End,
     );
 }
 
-fn shared_price_rows(
-    days: &[DisplayDay; DAYS],
+fn day_price_rows(
+    day: &DisplayDay,
     min_tick: PriceStep,
+    block_step: Option<PriceStep>,
     max_rows: usize,
 ) -> (PriceStep, Vec<i64>) {
-    let high = days
-        .iter()
-        .filter_map(|day| day.stats.high)
-        .fold(None, |acc: Option<f64>, value| {
-            Some(acc.map_or(value, |current| current.max(value)))
-        });
-    let low = days
-        .iter()
-        .filter_map(|day| day.stats.low)
-        .fold(None, |acc: Option<f64>, value| {
-            Some(acc.map_or(value, |current| current.min(value)))
-        });
-    let (Some(high), Some(low)) = (high, low) else {
-        return (min_tick, Vec::new());
+    let forced_step = block_step.map(|step| PriceStep {
+        units: step.units.max(min_tick.units).max(1),
+    });
+    let (Some(high), Some(low)) = (day.stats.high, day.stats.low) else {
+        return (forced_step.unwrap_or(min_tick), Vec::new());
     };
-    let raw_step = ((high - low) / max_rows.max(1) as f64).max(min_tick.to_f64_lossy());
-    let nice = nice_step(raw_step).max(min_tick.to_f64_lossy());
-    let step = PriceStep {
-        units: Price::from_f64(nice).units.max(min_tick.units),
-    };
+    let step = forced_step.unwrap_or_else(|| {
+        let raw_step = ((high - low) / max_rows.max(1) as f64).max(min_tick.to_f64_lossy());
+        let nice = nice_step(raw_step).max(min_tick.to_f64_lossy());
+        PriceStep {
+            units: Price::from_f64(nice).units.max(min_tick.units),
+        }
+    });
     let low_units = Price::from_f64(low).units.div_euclid(step.units) * step.units;
     let high_units = Price::from_f64(high).units.div_euclid(step.units) * step.units;
     let mut rows = Vec::new();
     let mut current = high_units;
-    while current >= low_units && rows.len() < max_rows.saturating_add(1) {
+    while current >= low_units {
         rows.push(current);
         let Some(next) = current.checked_sub(step.units) else {
             break;
         };
         current = next;
     }
+    if rows.len() > max_rows {
+        let focus = day
+            .stats
+            .last
+            .map(|(_, price)| Price::from_f64(price).units.div_euclid(step.units) * step.units)
+            .unwrap_or(rows[rows.len() / 2]);
+        let focus_idx = rows.iter().position(|price| *price <= focus).unwrap_or(0);
+        let half = max_rows / 2;
+        let start = focus_idx.saturating_sub(half);
+        let end = (start + max_rows).min(rows.len());
+        let start = end.saturating_sub(max_rows);
+        rows = rows[start..end].to_vec();
+    }
     (step, rows)
 }
 
-fn group_levels(stats: &DayStats, step: PriceStep) -> BTreeMap<i64, LevelStats> {
+fn price_row_count(day: &DisplayDay, min_tick: PriceStep, block_step: PriceStep) -> usize {
+    let step_units = block_step.units.max(min_tick.units).max(1);
+    let (Some(high), Some(low)) = (day.stats.high, day.stats.low) else {
+        return 0;
+    };
+    let low_units = Price::from_f64(low).units.div_euclid(step_units) * step_units;
+    let high_units = Price::from_f64(high).units.div_euclid(step_units) * step_units;
+    let rows = (i128::from(high_units) - i128::from(low_units)) / i128::from(step_units) + 1;
+    usize::try_from(rows.max(0)).unwrap_or(usize::MAX)
+}
+
+fn standalone_content_height(row_count: usize) -> f32 {
+    const CHROME_HEIGHT: f32 = 218.0;
+    const ROW_HEIGHT: f32 = 15.0;
+
+    CHROME_HEIGHT + row_count as f32 * ROW_HEIGHT
+}
+
+fn day_title(index: usize) -> &'static str {
+    match index {
+        0 => "Current day",
+        1 => "Previous day",
+        2 => "Two days ago",
+        _ => "Older day",
+    }
+}
+
+pub(crate) fn group_levels(stats: &DayStats, step: PriceStep) -> BTreeMap<i64, LevelStats> {
     let mut grouped = BTreeMap::new();
     for (price, level) in &stats.levels {
         let bucket = price.div_euclid(step.units) * step.units;
@@ -1011,7 +1526,7 @@ fn nice_step(value: f64) -> f64 {
     factor * magnitude
 }
 
-fn day_start(time: UnixMs) -> u64 {
+pub(crate) fn day_start(time: UnixMs) -> u64 {
     time.as_u64() / DAY_MS * DAY_MS
 }
 
@@ -1052,7 +1567,19 @@ fn signed(value: f64) -> String {
     }
 }
 
-fn draw_text(
+fn usd(value: f64) -> String {
+    format!("${}", abbr_large_numbers(value))
+}
+
+pub(crate) fn signed_usd(value: f64) -> String {
+    if value >= 0.0 {
+        format!("+${}", abbr_large_numbers(value))
+    } else {
+        format!("-${}", abbr_large_numbers(value.abs()))
+    }
+}
+
+pub(crate) fn draw_text(
     frame: &mut canvas::Frame,
     text: &str,
     position: Point,
@@ -1095,8 +1622,8 @@ mod tests {
         assert_eq!(stats.last.map(|(_, price)| price), Some(90.0));
         assert_eq!(stats.high, Some(100.0));
         assert_eq!(stats.low, Some(90.0));
-        assert_eq!(stats.volume(), 3.0);
-        assert_eq!(stats.delta(), 1.0);
+        assert_eq!(stats.volume(), 290.0);
+        assert_eq!(stats.delta(), 110.0);
         assert_eq!(stats.notional, 290.0);
     }
 
@@ -1120,7 +1647,365 @@ mod tests {
         indicator.on_source_trades(binance, &[trade(now.as_u64(), 100.0, 2.0, false)], false);
         indicator.on_source_trades(bybit, &[trade(now.as_u64(), 100.0, 1.0, true)], false);
         let days = indicator.display_days(now);
-        assert_eq!(days[0].stats.volume(), 3.0);
-        assert_eq!(days[0].stats.delta(), 1.0);
+        assert_eq!(days[0].stats.volume(), 300.0);
+        assert_eq!(days[0].stats.delta(), 100.0);
+    }
+
+    #[test]
+    fn source_toggles_recompose_cached_history_without_recalculation() {
+        let binance = TickerInfo::new(
+            Ticker::new("BTCUSDT", Exchange::BinanceLinear),
+            0.1,
+            0.001,
+            None,
+        );
+        let bybit = TickerInfo::new(
+            Ticker::new("BTCUSDT", Exchange::BybitLinear),
+            0.1,
+            0.001,
+            None,
+        );
+        let now = UnixMs::now();
+        let mut indicator = FootprintHistoryIndicator::new();
+        indicator.configure_footprint_history(&[binance, bybit], true);
+        indicator.on_source_trades(binance, &[trade(now.as_u64(), 100.0, 2.0, false)], false);
+        indicator.on_source_trades(bybit, &[trade(now.as_u64(), 100.0, 1.0, true)], false);
+
+        indicator.configure_footprint_history(&[binance], true);
+        assert_eq!(indicator.display_days(now)[0].stats.volume(), 200.0);
+
+        indicator.configure_footprint_history(&[binance, bybit], true);
+        assert_eq!(indicator.display_days(now)[0].stats.volume(), 300.0);
+    }
+
+    #[test]
+    fn utc_days_covering_keeps_a_scrolled_back_day() {
+        let from = UnixMs::new(5 * DAY_MS);
+        let to = UnixMs::new(5 * DAY_MS + 12 * 3_600_000);
+        let ranges = utc_days_covering(from, to, 5);
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0].0, from);
+        assert_eq!(ranges[0].1, to);
+    }
+
+    #[test]
+    fn utc_day_ranges_cover_four_full_days_clipped_to_cutoff() {
+        let cutoff = UnixMs::new(5 * DAY_MS + 1234);
+        let ranges = utc_day_ranges(cutoff, 4);
+        assert_eq!(ranges.len(), 4);
+        assert_eq!(
+            ranges[0],
+            (UnixMs::new(2 * DAY_MS), UnixMs::new(3 * DAY_MS - 1))
+        );
+        assert_eq!(
+            ranges[1],
+            (UnixMs::new(3 * DAY_MS), UnixMs::new(4 * DAY_MS - 1))
+        );
+        assert_eq!(
+            ranges[2],
+            (UnixMs::new(4 * DAY_MS), UnixMs::new(5 * DAY_MS - 1))
+        );
+        assert_eq!(ranges[3], (UnixMs::new(5 * DAY_MS), cutoff));
+    }
+
+    #[test]
+    fn cached_day_resumes_after_its_checkpoint() {
+        let start = UnixMs::new(5 * DAY_MS);
+        let end = UnixMs::new(6 * DAY_MS - 1);
+        let checkpoint = UnixMs::new(5 * DAY_MS + 12_345);
+
+        assert_eq!(
+            missing_day_range(start, end, Some(checkpoint)),
+            Some((checkpoint.saturating_add(1), end))
+        );
+        assert_eq!(missing_day_range(start, end, Some(end)), None);
+        assert_eq!(missing_day_range(start, end, None), Some((start, end)));
+    }
+
+    #[test]
+    fn completed_day_cache_round_trips_derived_stats() {
+        let source = TickerInfo::new(
+            Ticker::new("BTCUSDT", Exchange::BinanceLinear),
+            0.1,
+            0.001,
+            None,
+        );
+        let day = DAY_MS;
+        let mut stats = DayStats::default();
+        stats.insert_trade(trade(day + 1_000, 100.0, 2.0, false));
+        stats.insert_trade(trade(day + 2_000, 90.0, 1.0, true));
+        let root = std::env::temp_dir().join(format!(
+            "flowsurface-footprint-cache-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let path = root.join("day.json");
+
+        let covered_through = UnixMs::new(day + 12_345);
+        FootprintHistoryIndicator::write_cached_day(&path, source, day, covered_through, &stats)
+            .expect("write cache");
+        let (loaded, loaded_through) =
+            FootprintHistoryIndicator::read_cached_day(&path, source, day).expect("read cache");
+
+        assert_eq!(loaded, stats);
+        assert_eq!(loaded_through, covered_through);
+        std::fs::remove_file(&path).expect("remove cache file");
+        std::fs::remove_dir(&root).expect("remove cache directory");
+    }
+
+    #[test]
+    fn repeated_cache_hydration_preserves_newer_in_memory_trades() {
+        let source = TickerInfo::new(
+            Ticker::new("BTCUSDT", Exchange::BinanceLinear),
+            0.1,
+            0.001,
+            None,
+        );
+        let day = day_start(UnixMs::now());
+        let mut cached = DayStats::default();
+        cached.insert_trade(trade(day + 1_000, 100.0, 2.0, false));
+        let root = std::env::temp_dir().join(format!(
+            "flowsurface-footprint-cache-hydration-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let path = root.join("day.json");
+        let covered_through = UnixMs::new(day + 12_345);
+        FootprintHistoryIndicator::write_cached_day(&path, source, day, covered_through, &cached)
+            .expect("write cache");
+
+        let mut indicator = FootprintHistoryIndicator::new();
+        indicator.configure_footprint_history(&[source], true);
+        assert_eq!(
+            indicator.load_day_cache_from_path(source, day, &path),
+            Some(covered_through)
+        );
+        indicator.on_source_trades(source, &[trade(day + 2_000, 101.0, 3.0, false)], true);
+        assert_eq!(indicator.display_day_at(day).stats.volume(), 503.0);
+
+        assert_eq!(
+            indicator.load_day_cache_from_path(source, day, &path),
+            Some(covered_through)
+        );
+        assert_eq!(indicator.display_day_at(day).stats.volume(), 503.0);
+
+        std::fs::remove_file(&path).expect("remove cache file");
+        std::fs::remove_dir(&root).expect("remove cache directory");
+    }
+
+    #[test]
+    fn period_coverage_requires_every_day_from_every_active_venue() {
+        let binance = TickerInfo::new(
+            Ticker::new("BTCUSDT", Exchange::BinanceLinear),
+            0.1,
+            0.001,
+            None,
+        );
+        let bybit = TickerInfo::new(
+            Ticker::new("BTCUSDT", Exchange::BybitLinear),
+            0.1,
+            0.001,
+            None,
+        );
+        let mut indicator = FootprintHistoryIndicator::new();
+        indicator.configure_footprint_history(&[binance, bybit], true);
+        let start = 10 * DAY_MS;
+        let end = 16 * DAY_MS + DAY_MS - 1;
+
+        for offset in 0..7 {
+            indicator
+                .completed_days
+                .insert((binance.ticker, start + offset * DAY_MS));
+        }
+        assert_eq!(
+            indicator.period_coverage(UnixMs::new(start), UnixMs::new(end)),
+            (7, 14)
+        );
+
+        for offset in 0..7 {
+            indicator
+                .completed_days
+                .insert((bybit.ticker, start + offset * DAY_MS));
+        }
+        assert_eq!(
+            indicator.period_coverage(UnixMs::new(start), UnixMs::new(end)),
+            (14, 14)
+        );
+    }
+
+    #[test]
+    fn complete_period_merge_does_not_include_a_partially_loaded_venue() {
+        let binance = TickerInfo::new(
+            Ticker::new("BTCUSDT", Exchange::BinanceLinear),
+            0.1,
+            0.001,
+            None,
+        );
+        let bybit = TickerInfo::new(
+            Ticker::new("BTCUSDT", Exchange::BybitLinear),
+            0.1,
+            0.001,
+            None,
+        );
+        let mut indicator = FootprintHistoryIndicator::new();
+        indicator.configure_footprint_history(&[binance, bybit], true);
+        let start = 10 * DAY_MS;
+        let end = 16 * DAY_MS + DAY_MS - 1;
+
+        indicator
+            .histories
+            .entry(binance.ticker)
+            .or_default()
+            .days
+            .entry(start)
+            .or_default()
+            .insert_trade(trade(start + 1_000, 100.0, 2.0, false));
+        indicator
+            .histories
+            .entry(bybit.ticker)
+            .or_default()
+            .days
+            .entry(start)
+            .or_default()
+            .insert_trade(trade(start + 1_000, 100.0, 3.0, false));
+        for offset in 0..7 {
+            indicator
+                .completed_days
+                .insert((binance.ticker, start + offset * DAY_MS));
+        }
+        indicator.completed_days.insert((bybit.ticker, start));
+
+        let (binance_only, complete_sources) =
+            indicator.display_complete_period(UnixMs::new(start), UnixMs::new(end));
+        assert_eq!(complete_sources, 1);
+        assert_eq!(binance_only.volume(), 200.0);
+
+        for offset in 1..7 {
+            indicator
+                .completed_days
+                .insert((bybit.ticker, start + offset * DAY_MS));
+        }
+        let (aggregate, complete_sources) =
+            indicator.display_complete_period(UnixMs::new(start), UnixMs::new(end));
+        assert_eq!(complete_sources, 2);
+        assert_eq!(aggregate.volume(), 500.0);
+    }
+
+    #[test]
+    fn fetching_one_day_preserves_already_loaded_days() {
+        let source = TickerInfo::new(
+            Ticker::new("BTCUSDT", Exchange::BinanceLinear),
+            0.1,
+            0.001,
+            None,
+        );
+        let today = day_start(UnixMs::now());
+        let older_day = today.saturating_sub(2 * DAY_MS);
+        let newer_day = today.saturating_sub(DAY_MS);
+        let mut indicator = FootprintHistoryIndicator::new();
+        indicator.configure_footprint_history(&[source], true);
+        indicator
+            .histories
+            .entry(source.ticker)
+            .or_default()
+            .days
+            .entry(older_day)
+            .or_default()
+            .insert_trade(trade(older_day + 1_000, 100.0, 1.0, false));
+
+        indicator.on_source_trades(source, &[trade(newer_day + 1_000, 110.0, 1.0, false)], true);
+
+        let history = indicator.histories.get(&source.ticker).expect("history");
+        assert!(history.days.contains_key(&older_day));
+        assert!(history.days.contains_key(&newer_day));
+    }
+
+    #[test]
+    fn short_lookback_skips_wholly_irrelevant_historical_batches() {
+        let source = TickerInfo::new(
+            Ticker::new("BTCUSDT", Exchange::BinanceLinear),
+            0.1,
+            0.001,
+            None,
+        );
+        let mut indicator = FootprintHistoryIndicator::new();
+        indicator.configure_footprint_history(&[source], true);
+        indicator.set_lookback_days(1);
+
+        indicator.on_source_trades(source, &[trade(DAY_MS, 100.0, 1.0, false)], true);
+
+        assert!(indicator.histories.is_empty());
+        assert!(indicator.historical_started.is_empty());
+    }
+
+    #[test]
+    fn completed_value_area_days_keep_only_coarse_price_levels() {
+        let source = TickerInfo::new(
+            Ticker::new("BTCUSDT", Exchange::BinanceLinear),
+            0.1,
+            0.001,
+            None,
+        );
+        let day = day_start(UnixMs::now()).saturating_sub(DAY_MS);
+        let mut indicator = FootprintHistoryIndicator::new();
+        indicator.configure_footprint_history(&[source], true);
+        indicator.on_source_trades(
+            source,
+            &[
+                trade(day + 1_000, 100.1, 1.0, false),
+                trade(day + 6 * 60_000, 100.9, 2.0, false),
+            ],
+            true,
+        );
+        indicator.completed_days.insert((source.ticker, day));
+
+        indicator.compact_day_for_value_area(
+            source,
+            UnixMs::new(day),
+            PriceStep {
+                units: Price::from_f64(1.0).units,
+            },
+        );
+
+        let stats = &indicator.histories[&source.ticker].days[&day];
+        assert_eq!(stats.levels.len(), 1);
+        assert!(stats.five_min_delta.is_empty());
+        assert_eq!(stats.volume(), 301.9);
+    }
+
+    #[test]
+    fn each_day_builds_its_own_price_ladder() {
+        let mut current = DisplayDay::default();
+        current.stats.insert_trade(trade(1_000, 100.0, 1.0, false));
+        let mut older = DisplayDay::default();
+        older.stats.insert_trade(trade(1_000, 200.0, 1.0, false));
+        let step = PriceStep {
+            units: Price::from_f64(1.0).units,
+        };
+
+        let (_, current_rows) = day_price_rows(&current, step, Some(step), 10);
+        let (_, older_rows) = day_price_rows(&older, step, Some(step), 10);
+
+        assert_eq!(
+            current_rows.first().copied(),
+            Some(Price::from_f64(100.0).units)
+        );
+        assert_eq!(
+            older_rows.first().copied(),
+            Some(Price::from_f64(200.0).units)
+        );
+    }
+
+    #[test]
+    fn standalone_height_grows_to_show_the_full_price_ladder() {
+        let mut day = DisplayDay::default();
+        day.stats.insert_trade(trade(1_000, 100.0, 1.0, false));
+        day.stats.insert_trade(trade(2_000, 90.0, 1.0, true));
+        let step = PriceStep {
+            units: Price::from_f64(1.0).units,
+        };
+
+        let rows = price_row_count(&day, step, step);
+
+        assert_eq!(rows, 11);
+        assert_eq!(standalone_content_height(rows), 383.0);
     }
 }

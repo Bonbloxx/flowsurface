@@ -69,6 +69,14 @@ pub enum Pane {
         #[serde(deserialize_with = "ok_or_default", default)]
         link_group: Option<LinkGroup>,
     },
+    FootprintHistory {
+        #[serde(deserialize_with = "ok_or_default", default)]
+        stream_type: Vec<PersistStreamKind>,
+        #[serde(deserialize_with = "ok_or_default")]
+        settings: Settings,
+        #[serde(deserialize_with = "ok_or_default", default)]
+        link_group: Option<LinkGroup>,
+    },
     ComparisonChart {
         stream_type: Vec<PersistStreamKind>,
         #[serde(deserialize_with = "ok_or_default")]
@@ -110,6 +118,8 @@ pub struct Settings {
     pub footprint_history_sources: Option<Vec<Ticker>>,
     /// Combine selected Footprint History venues into one composite footprint.
     pub footprint_history_aggregate: bool,
+    /// Venue books combined by the toggleable kline liquidity heatmap.
+    pub liquidity_heatmap_sources: Option<Vec<Ticker>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
@@ -209,6 +219,7 @@ pub enum ContentKind {
     HeatmapChart,
     ShaderHeatmap,
     FootprintChart,
+    FootprintHistory,
     RenkoChart,
     TpoChart,
     CandlestickChart,
@@ -218,11 +229,12 @@ pub enum ContentKind {
 }
 
 impl ContentKind {
-    pub const ALL: [ContentKind; 10] = [
+    pub const ALL: [ContentKind; 11] = [
         ContentKind::Starter,
         ContentKind::HeatmapChart,
         ContentKind::ShaderHeatmap,
         ContentKind::FootprintChart,
+        ContentKind::FootprintHistory,
         ContentKind::RenkoChart,
         ContentKind::TpoChart,
         ContentKind::CandlestickChart,
@@ -235,7 +247,7 @@ impl ContentKind {
     /// Add future aggregate-aware tools here; their stream planning stays in
     /// the shared aggregation layer.
     pub fn supports_aggregate_feed(self) -> bool {
-        matches!(self, ContentKind::TpoChart)
+        matches!(self, ContentKind::FootprintChart | ContentKind::TpoChart)
     }
 }
 
@@ -246,6 +258,7 @@ impl std::fmt::Display for ContentKind {
             ContentKind::HeatmapChart => "Heatmap Chart (Legacy)",
             ContentKind::ShaderHeatmap => "Heatmap Chart",
             ContentKind::FootprintChart => "Footprint · Executed Trades",
+            ContentKind::FootprintHistory => "Footprint History",
             ContentKind::RenkoChart => "Renko Chart",
             ContentKind::TpoChart => "TPO · Market Profile",
             ContentKind::CandlestickChart => "Candlestick Chart",
@@ -319,7 +332,9 @@ impl PaneSetup {
                         Basis::default_kline_time(Some(base_ticker), Timeframe::M15)
                     }))
                 }
-                ContentKind::Starter | ContentKind::TimeAndSales => None,
+                ContentKind::Starter
+                | ContentKind::FootprintHistory
+                | ContentKind::TimeAndSales => None,
             };
 
         let tick_multiplier = match content_kind {
@@ -337,6 +352,9 @@ impl PaneSetup {
             }
             ContentKind::FootprintChart => {
                 Some(current_tick_multiplier.unwrap_or(TickMultiplier(50)))
+            }
+            ContentKind::FootprintHistory => {
+                Some(current_tick_multiplier.unwrap_or(TickMultiplier(1000)))
             }
             ContentKind::RenkoChart | ContentKind::TpoChart => None,
             ContentKind::CandlestickChart
@@ -389,18 +407,21 @@ mod tests {
             aggregate_sources: Some(selected.clone()),
             footprint_history_sources: Some(selected.clone()),
             footprint_history_aggregate: true,
+            liquidity_heatmap_sources: Some(selected.clone()),
             ..Settings::default()
         };
 
         let encoded = serde_json::to_string(&settings).expect("settings serialize");
         let decoded: Settings = serde_json::from_str(&encoded).expect("settings deserialize");
         assert_eq!(decoded.aggregate_sources, Some(selected.clone()));
-        assert_eq!(decoded.footprint_history_sources, Some(selected));
+        assert_eq!(decoded.footprint_history_sources, Some(selected.clone()));
+        assert_eq!(decoded.liquidity_heatmap_sources, Some(selected));
         assert!(decoded.footprint_history_aggregate);
 
         let legacy: Settings = serde_json::from_str("{}").expect("legacy settings deserialize");
         assert_eq!(legacy.aggregate_sources, None);
         assert_eq!(legacy.footprint_history_sources, None);
+        assert_eq!(legacy.liquidity_heatmap_sources, None);
         assert!(!legacy.footprint_history_aggregate);
     }
 }

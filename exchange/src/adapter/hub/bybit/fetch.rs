@@ -1,9 +1,12 @@
 use crate::{
-    Kline, OpenInterest, Price, Qty, Ticker, TickerInfo, TickerStats, Timeframe, UnixMs,
+    Kline, OpenInterest, Price, Qty, Ticker, TickerInfo, TickerStats, Timeframe, Trade, UnixMs,
     adapter::hub::TickerMetadataMap,
     serde_util,
     unit::qty::{QtyNormalization, SizeUnit, volume_size_unit},
 };
+use csv::ReaderBuilder;
+use flate2::read::GzDecoder;
+use std::{io::BufReader, path::PathBuf};
 
 use super::{
     BybitLimiter, FETCH_DOMAIN, HttpHub, MarketKind, exchange_from_market_type,
@@ -14,7 +17,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DeOpenInterest {
     #[serde(
@@ -22,6 +25,8 @@ struct DeOpenInterest {
         deserialize_with = "serde_util::de_string_to_number"
     )]
     pub value: f64,
+    #[serde(rename = "singleOpenInterest", default)]
+    pub single_side_value: Option<String>,
     #[serde(deserialize_with = "serde_util::de_string_to_number")]
     pub timestamp: u64,
 }
@@ -330,11 +335,31 @@ pub(super) async fn fetch_historical_oi(
             AdapterError::ParseError(format!("Failed to parse open interest: {e}"))
         })?;
 
+    let prices = fetch_klines(hub, ticker_info, period, range).await?;
+    let prices = prices
+        .into_iter()
+        .map(|kline| (kline.time, kline.close.to_f64()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let market = ticker_info.market_type();
     let open_interest: Vec<OpenInterest> = bybit_oi
         .into_iter()
-        .map(|x| OpenInterest {
-            time: x.timestamp.into(),
-            value: x.value,
+        .filter_map(|x| {
+            let time = UnixMs::from(x.timestamp);
+            let contracts = x
+                .single_side_value
+                .as_deref()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(x.value);
+            let value = match market {
+                MarketKind::LinearPerps => prices
+                    .range(..=time)
+                    .next_back()
+                    .or_else(|| prices.first_key_value())
+                    .map(|(_, price)| contracts * price)?,
+                MarketKind::InversePerps => contracts,
+                MarketKind::Spot => return None,
+            };
+            Some(OpenInterest { time, value })
         })
         .collect();
 
@@ -347,4 +372,225 @@ pub(super) async fn fetch_historical_oi(
     }
 
     Ok(open_interest)
+}
+
+const MAX_ARCHIVE_TRADES_PER_FETCH: usize = 2_000_000;
+
+async fn fetch_recent_trades(
+    hub: &mut HttpHub<BybitLimiter>,
+    ticker_info: TickerInfo,
+    from_time: UnixMs,
+    to_time: Option<UnixMs>,
+) -> Result<Vec<Trade>, AdapterError> {
+    let (symbol, market_type) = ticker_info.ticker.to_full_symbol_and_type();
+    let category = match market_type {
+        MarketKind::Spot => "spot",
+        MarketKind::LinearPerps => "linear",
+        MarketKind::InversePerps => "inverse",
+    };
+    let limit = if market_type == MarketKind::Spot {
+        60
+    } else {
+        1000
+    };
+    let url = format!(
+        "{FETCH_DOMAIN}/v5/market/recent-trade?category={category}&symbol={}&limit={limit}",
+        symbol.to_uppercase()
+    );
+    let response: Value = hub.http_json_with_limiter(&url, 1, None, None).await?;
+    let list = response["result"]["list"]
+        .as_array()
+        .ok_or_else(|| AdapterError::ParseError("Bybit recent trades list is missing".into()))?;
+    let qty_norm = QtyNormalization::with_raw_qty_unit(
+        volume_size_unit() == SizeUnit::Quote,
+        ticker_info,
+        raw_qty_unit_from_market_type(market_type),
+    );
+    let from_ms = from_time.as_u64();
+    let to_ms = to_time.map(UnixMs::as_u64).unwrap_or(u64::MAX);
+    let mut trades = list
+        .iter()
+        .filter_map(|item| {
+            let time = item["time"].as_str()?.parse::<u64>().ok()?;
+            if time < from_ms || time > to_ms {
+                return None;
+            }
+            let price_f64 = item["price"].as_str()?.parse::<f64>().ok()?;
+            let qty_f64 = item["size"].as_str()?.parse::<f64>().ok()?;
+            Some(Trade {
+                time: UnixMs::new(time),
+                is_sell: item["side"].as_str()? == "Sell",
+                price: Price::from_f64(price_f64).round_to_min_tick(ticker_info.min_ticksize),
+                qty: qty_norm.normalize_qty(qty_f64, price_f64),
+            })
+        })
+        .collect::<Vec<_>>();
+    trades.sort_by_key(|trade| trade.time);
+    Ok(trades)
+}
+
+async fn fetch_archive_trades(
+    hub: &mut HttpHub<BybitLimiter>,
+    ticker_info: TickerInfo,
+    date: chrono::NaiveDate,
+    from_time: UnixMs,
+    to_time: Option<UnixMs>,
+    data_path: PathBuf,
+) -> Result<Vec<Trade>, AdapterError> {
+    let (symbol, market_type) = ticker_info.ticker.to_full_symbol_and_type();
+    if market_type == MarketKind::Spot {
+        return Err(AdapterError::InvalidRequest(
+            "Bybit spot trade archives are not supported yet".into(),
+        ));
+    }
+
+    let symbol = symbol.to_uppercase();
+    let filename = format!("{symbol}{}.csv.gz", date.format("%Y-%m-%d"));
+    let cache_dir = data_path.join(&symbol);
+    std::fs::create_dir_all(&cache_dir)
+        .map_err(|err| AdapterError::ParseError(format!("Failed to create Bybit cache: {err}")))?;
+    let archive_path = cache_dir.join(&filename);
+    let missing_path = cache_dir.join(format!("{filename}.missing"));
+
+    if missing_path.exists() {
+        let marker_is_fresh = std::fs::metadata(&missing_path)
+            .ok()
+            .and_then(|meta| meta.modified().ok())
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age < std::time::Duration::from_secs(12 * 60 * 60));
+        if marker_is_fresh {
+            return Ok(Vec::new());
+        }
+        let _ = std::fs::remove_file(&missing_path);
+    }
+
+    if !archive_path.exists() {
+        let url = format!("https://public.bybit.com/trading/{symbol}/{filename}");
+        log::info!("Downloading Bybit trade archive from {url}");
+        let response = hub
+            .client()
+            .get(&url)
+            .header(
+                reqwest::header::USER_AGENT,
+                concat!("flowsurface/", env!("CARGO_PKG_VERSION")),
+            )
+            .send()
+            .await
+            .map_err(AdapterError::from)?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            let _ = std::fs::write(&missing_path, b"");
+            return Ok(Vec::new());
+        }
+        if !response.status().is_success() {
+            return Err(AdapterError::InvalidRequest(format!(
+                "Failed to fetch {url}: {}",
+                response.status()
+            )));
+        }
+        let body = response.bytes().await.map_err(AdapterError::from)?;
+        std::fs::write(&archive_path, body).map_err(|err| {
+            AdapterError::ParseError(format!("Failed to cache Bybit archive: {err}"))
+        })?;
+        let _ = std::fs::remove_file(&missing_path);
+    }
+
+    let file = std::fs::File::open(&archive_path)
+        .map_err(|err| AdapterError::ParseError(format!("Failed to open Bybit archive: {err}")))?;
+    let decoder = GzDecoder::new(BufReader::new(file));
+    let mut csv = ReaderBuilder::new().has_headers(true).from_reader(decoder);
+    let qty_norm = QtyNormalization::with_raw_qty_unit(
+        volume_size_unit() == SizeUnit::Quote,
+        ticker_info,
+        raw_qty_unit_from_market_type(market_type),
+    );
+    let from_ms = from_time.as_u64();
+    let to_ms = to_time.map(UnixMs::as_u64).unwrap_or(u64::MAX);
+    let mut trades = Vec::with_capacity(MAX_ARCHIVE_TRADES_PER_FETCH);
+
+    for record in csv.records() {
+        let Ok(record) = record else { continue };
+        let Some(timestamp) = record.get(0).and_then(|value| value.parse::<f64>().ok()) else {
+            continue;
+        };
+        let time = if timestamp >= 1_000_000_000_000.0 {
+            timestamp as u64
+        } else {
+            (timestamp * 1000.0).round() as u64
+        };
+        if time < from_ms {
+            continue;
+        }
+        if time > to_ms {
+            break;
+        }
+        let Some(side) = record.get(2) else { continue };
+        let Some(qty_f64) = record.get(3).and_then(|value| value.parse::<f64>().ok()) else {
+            continue;
+        };
+        let Some(price_f64) = record.get(4).and_then(|value| value.parse::<f64>().ok()) else {
+            continue;
+        };
+        trades.push(Trade {
+            time: UnixMs::new(time),
+            is_sell: side == "Sell",
+            price: Price::from_f64(price_f64).round_to_min_tick(ticker_info.min_ticksize),
+            qty: qty_norm.normalize_qty(qty_f64, price_f64),
+        });
+        if trades.len() >= MAX_ARCHIVE_TRADES_PER_FETCH {
+            break;
+        }
+    }
+    trades.sort_by_key(|trade| trade.time);
+    Ok(trades)
+}
+
+pub(super) async fn fetch_trades(
+    hub: &mut HttpHub<BybitLimiter>,
+    ticker_info: TickerInfo,
+    from_time: UnixMs,
+    to_time: Option<UnixMs>,
+    data_path: Option<PathBuf>,
+) -> Result<Vec<Trade>, AdapterError> {
+    let from_ms = i64::try_from(from_time.as_u64())
+        .map_err(|_| AdapterError::InvalidRequest("Timestamp exceeds i64 range".into()))?;
+    let mut date = chrono::DateTime::from_timestamp_millis(from_ms)
+        .ok_or_else(|| AdapterError::ParseError("Invalid Bybit archive timestamp".into()))?
+        .date_naive();
+    let today = chrono::Utc::now().date_naive();
+    let data_path = data_path.ok_or_else(|| {
+        AdapterError::InvalidRequest("Bybit trade archive fetch requires data_path".into())
+    })?;
+    let end_date = to_time
+        .and_then(|time| i64::try_from(time.as_u64()).ok())
+        .and_then(chrono::DateTime::from_timestamp_millis)
+        .map(|time| time.date_naive())
+        .unwrap_or(today);
+    let mut cursor = from_time;
+
+    while date <= end_date {
+        if date >= today {
+            return fetch_recent_trades(hub, ticker_info, cursor, to_time).await;
+        }
+
+        let trades =
+            fetch_archive_trades(hub, ticker_info, date, cursor, to_time, data_path.clone())
+                .await?;
+        if !trades.is_empty() {
+            return Ok(trades);
+        }
+
+        let Some(next_date) = date.succ_opt() else {
+            break;
+        };
+        date = next_date;
+        let Some(next_midnight) = date.and_hms_opt(0, 0, 0) else {
+            break;
+        };
+        let next_ms = next_midnight.and_utc().timestamp_millis();
+        cursor = UnixMs::new(u64::try_from(next_ms).map_err(|_| {
+            AdapterError::InvalidRequest("Bybit archive timestamp is before Unix epoch".into())
+        })?);
+    }
+
+    Ok(Vec::new())
 }

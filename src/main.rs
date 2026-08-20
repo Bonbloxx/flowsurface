@@ -280,7 +280,10 @@ impl Flowsurface {
             }
             Message::WindowEvent(event) => match event {
                 window::Event::CloseRequested(window) => {
-                    log::info!("window close requested: {window:?} (main={:?})", self.main_window.id);
+                    log::info!(
+                        "window close requested: {window:?} (main={:?})",
+                        self.main_window.id
+                    );
                     log::logger().flush();
                     let main_window = self.main_window.id;
                     let dashboard = self.active_dashboard_mut();
@@ -301,7 +304,10 @@ impl Flowsurface {
                 }
             },
             Message::ExitRequested(windows) => {
-                log::info!("exit requested ({} window specs); saving state", windows.len());
+                log::info!(
+                    "exit requested ({} window specs); saving state",
+                    windows.len()
+                );
                 log::logger().flush();
                 self.save_state_to_disk(&windows);
                 log::info!("state save finished; calling iced::exit()");
@@ -424,6 +430,9 @@ impl Flowsurface {
                                     }
                                 }
                                 Err(err) => {
+                                    log::info!(
+                                        "stream resolution pending for pane {pane_id}: {err}"
+                                    );
                                     if self.sidebar.is_metadata_loading() {
                                         // Metadata fetches are still in flight
                                         log::debug!(
@@ -689,33 +698,43 @@ impl Flowsurface {
                         let task = {
                             if let Some(kind) = content {
                                 let ticker_infos =
-                                    data::aggregation::AggregateFeedId::for_seed_ticker(
-                                        ticker_info.ticker,
-                                    )
-                                    .filter(|_| kind.supports_aggregate_feed())
-                                    .map(|feed| {
-                                        feed.source_tickers()
-                                            .filter_map(|ticker| {
-                                                let tickers_info = self.sidebar.tickers_info();
-                                                tickers_info
-                                                    .get(&ticker)
-                                                    .copied()
-                                                    .flatten()
-                                                    .or_else(|| {
-                                                        tickers_info.iter().find_map(
-                                                            |(candidate, info)| {
-                                                                ticker
-                                                                    .same_market(candidate)
-                                                                    .then_some(*info)
-                                                                    .flatten()
-                                                            },
-                                                        )
-                                                    })
-                                            })
-                                            .collect::<Vec<_>>()
-                                    })
-                                    .filter(|sources| !sources.is_empty())
-                                    .unwrap_or_else(|| vec![ticker_info]);
+                                    if kind == data::layout::pane::ContentKind::FootprintHistory {
+                                        data::aggregation::equivalent_footprint_sources(
+                                            ticker_info,
+                                            self.sidebar
+                                                .tickers_info()
+                                                .values()
+                                                .filter_map(|info| *info),
+                                        )
+                                    } else {
+                                        data::aggregation::AggregateFeedId::for_seed_ticker(
+                                            ticker_info.ticker,
+                                        )
+                                        .filter(|_| kind.supports_aggregate_feed())
+                                        .map(|feed| {
+                                            feed.source_tickers()
+                                                .filter_map(|ticker| {
+                                                    let tickers_info = self.sidebar.tickers_info();
+                                                    tickers_info
+                                                        .get(&ticker)
+                                                        .copied()
+                                                        .flatten()
+                                                        .or_else(|| {
+                                                            tickers_info.iter().find_map(
+                                                                |(candidate, info)| {
+                                                                    ticker
+                                                                        .same_market(candidate)
+                                                                        .then_some(*info)
+                                                                        .flatten()
+                                                                },
+                                                            )
+                                                        })
+                                                })
+                                                .collect::<Vec<_>>()
+                                        })
+                                        .filter(|sources| !sources.is_empty())
+                                        .unwrap_or_else(|| vec![ticker_info])
+                                    };
 
                                 self.active_dashboard_mut().init_focused_pane_with_sources(
                                     &handles,
@@ -867,11 +886,16 @@ impl Flowsurface {
             .market_subscriptions(&self.data_sources.exchange)
             .map(Message::MarketWsEvent);
 
-        let tick = iced::window::frames().map(Message::Tick);
+        // Drive invalidation only as quickly as the visible panes require. The
+        // shader heatmap uses a 60 Hz timer; ordinary panes stay event-driven
+        // between their much slower maintenance ticks.
+        let interval_ms = self.active_dashboard().tick_interval_ms().unwrap_or(16);
+        let tick =
+            iced::time::every(std::time::Duration::from_millis(interval_ms)).map(Message::Tick);
 
         // Every 30s so a silent death leaves a last-alive line in the log.
-        let heartbeat = iced::time::every(std::time::Duration::from_secs(30))
-            .map(Message::Heartbeat);
+        let heartbeat =
+            iced::time::every(std::time::Duration::from_secs(30)).map(Message::Heartbeat);
 
         let hotkeys = keyboard::listen().filter_map(|event| {
             let keyboard::Event::KeyPressed { key, .. } = event else {

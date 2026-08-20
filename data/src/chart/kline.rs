@@ -1,6 +1,6 @@
 use crate::{aggr::time::DataPoint, chart::indicator::KlineIndicator};
 use exchange::{
-    Kline, Trade, UnixMs,
+    Kline, TickMultiplier, Trade, UnixMs,
     unit::price::{Price, PriceStep},
     unit::qty::Qty,
 };
@@ -342,6 +342,25 @@ pub enum KlineChartKind {
 
 impl KlineChartKind {
     pub fn allows_indicator(&self, indicator: KlineIndicator) -> bool {
+        if matches!(
+            indicator,
+            KlineIndicator::DailyDelta
+                | KlineIndicator::PreviousValueArea
+                | KlineIndicator::LiquidityHeatmap
+        ) {
+            if indicator == KlineIndicator::LiquidityHeatmap {
+                return matches!(
+                    self,
+                    KlineChartKind::Candles | KlineChartKind::Footprint { .. }
+                );
+            }
+            return matches!(
+                self,
+                KlineChartKind::Candles
+                    | KlineChartKind::Renko { .. }
+                    | KlineChartKind::Footprint { .. }
+            );
+        }
         if indicator == KlineIndicator::FootprintHistory {
             return true;
         }
@@ -375,7 +394,8 @@ impl KlineChartKind {
             KlineChartKind::Footprint { .. } => 360.0,
             // Allow a single day profile to fill most of the pane when zoomed in.
             KlineChartKind::Tpo { .. } => 520.0,
-            KlineChartKind::Candles | KlineChartKind::Renko { .. } => 16.0,
+            KlineChartKind::Candles => 16.0,
+            KlineChartKind::Renko { .. } => 24.0,
         }
     }
 
@@ -383,7 +403,8 @@ impl KlineChartKind {
         match self {
             KlineChartKind::Footprint { .. } => 80.0,
             KlineChartKind::Tpo { .. } => 18.0,
-            KlineChartKind::Candles | KlineChartKind::Renko { .. } => 1.0,
+            KlineChartKind::Candles => 1.0,
+            KlineChartKind::Renko { .. } => 3.0,
         }
     }
 
@@ -413,10 +434,11 @@ impl KlineChartKind {
             KlineChartKind::Tpo { config }
                 if config.profile_period == super::tpo::ProfilePeriod::Day =>
             {
-                160.0
+                240.0
             }
-            KlineChartKind::Tpo { .. } => 72.0,
-            KlineChartKind::Candles | KlineChartKind::Renko { .. } => 4.0,
+            KlineChartKind::Tpo { .. } => 108.0,
+            KlineChartKind::Candles => 4.0,
+            KlineChartKind::Renko { .. } => 12.0,
         }
     }
 }
@@ -472,10 +494,10 @@ impl std::fmt::Display for RenkoConfig {
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
 pub enum ClusterKind {
-    #[default]
     BidAsk,
     VolumeProfile,
     DeltaProfile,
+    #[default]
     Table,
 }
 
@@ -518,6 +540,32 @@ pub struct Config {
     pub show_footprint_summary: bool,
     // Whether Renko candles show the traded high/low beyond their fixed body.
     pub show_renko_wicks: bool,
+    /// Daily Delta grouping in exchange min-ticks. `1` is one price level per min tick.
+    pub daily_delta_ticks: u16,
+    /// How many UTC days of Daily Delta history to keep and fetch, including today.
+    pub daily_delta_days: u16,
+    /// Previous-period volume-profile grouping in exchange min-ticks.
+    pub previous_value_area_ticks: u16,
+    /// Minimum displayed liquidity order size in quote currency (USD for USDT/USDC markets).
+    pub liquidity_heatmap_order_size_filter: f32,
+}
+
+impl Config {
+    pub const DAILY_DELTA_DAY_PRESETS: [u16; 7] = [1, 2, 3, 4, 5, 7, 14];
+    pub const DAILY_DELTA_TICK_PRESETS: [TickMultiplier; 12] = [
+        TickMultiplier(1),
+        TickMultiplier(2),
+        TickMultiplier(5),
+        TickMultiplier(10),
+        TickMultiplier(25),
+        TickMultiplier(50),
+        TickMultiplier(100),
+        TickMultiplier(200),
+        TickMultiplier(500),
+        TickMultiplier(1000),
+        TickMultiplier(1500),
+        TickMultiplier(2000),
+    ];
 }
 
 impl Default for Config {
@@ -526,6 +574,10 @@ impl Default for Config {
             data_labels_always_visible: false,
             show_footprint_summary: false,
             show_renko_wicks: true,
+            daily_delta_ticks: 10,
+            daily_delta_days: 4,
+            previous_value_area_ticks: 10,
+            liquidity_heatmap_order_size_filter: 0.0,
         }
     }
 }
@@ -634,6 +686,21 @@ impl Default for PointOfControl {
             volume: Qty::ZERO,
             status: NPoc::default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::Config;
+
+    #[test]
+    fn legacy_config_defaults_liquidity_order_filter() {
+        let config: Config = serde_json::from_str(
+            r#"{"data_labels_always_visible":true,"show_footprint_summary":false,"show_renko_wicks":true,"daily_delta_ticks":10,"daily_delta_days":4,"previous_value_area_ticks":10}"#,
+        )
+        .expect("legacy kline config should deserialize");
+
+        assert_eq!(config.liquidity_heatmap_order_size_filter, 0.0);
     }
 }
 

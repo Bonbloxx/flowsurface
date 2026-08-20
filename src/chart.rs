@@ -1,4 +1,5 @@
 pub mod comparison;
+pub mod footprint_history;
 pub mod heatmap;
 pub mod indicator;
 pub mod kline;
@@ -9,8 +10,8 @@ use crate::style;
 use crate::widget::multi_split::{DRAG_SIZE, MultiSplit};
 use crate::widget::tooltip;
 use data::chart::{Autoscale, Basis, PlotData, ViewConfig, indicator::Indicator};
-use exchange::TickerInfo;
 use exchange::unit::{Price, PriceStep};
+use exchange::{TickerInfo, UnixMs};
 use scale::linear::PriceInfoLabel;
 use scale::{AxisLabelsX, AxisLabelsY};
 
@@ -79,6 +80,14 @@ pub trait Chart: PlotConstants + canvas::Program<Message> {
     fn autoscaled_coords(&self) -> Vector;
 
     fn supports_fit_autoscaling(&self) -> bool;
+
+    fn plot_background(&self) -> Option<Element<'_, Message>> {
+        None
+    }
+
+    fn allows_vertical_navigation_from_fit(&self) -> bool {
+        false
+    }
 
     fn is_empty(&self) -> bool;
 }
@@ -175,6 +184,17 @@ fn canvas_interaction<T: Chart>(
                     };
 
                     if let Some(Autoscale::FitToVisible) = state.layout.autoscale {
+                        if chart.allows_vertical_navigation_from_fit() {
+                            return Some(
+                                canvas::Action::publish(Message::YScaling(
+                                    *y,
+                                    cursor_to_center.y,
+                                    true,
+                                ))
+                                .and_capture(),
+                            );
+                        }
+
                         return Some(
                             canvas::Action::publish(Message::XScaling(
                                 y / 2.0,
@@ -306,9 +326,12 @@ pub fn update<T: Chart>(chart: &mut T, message: &Message) {
             }
         }
         Message::Translated(translation) => {
+            let allows_vertical_navigation = chart.allows_vertical_navigation_from_fit();
             let state = chart.mut_state();
 
-            if let Some(Autoscale::FitToVisible) = state.layout.autoscale {
+            if let Some(Autoscale::FitToVisible) = state.layout.autoscale
+                && !allows_vertical_navigation
+            {
                 state.translation.x = translation.x;
             } else {
                 state.translation = *translation;
@@ -572,8 +595,17 @@ pub fn view<'a, T: Chart>(
         .width(Length::Fill)
         .height(Length::Fill);
 
+        let foreground: Element<_> = Canvas::new(chart)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into();
+        let plot: Element<_> = match chart.plot_background() {
+            Some(background) => iced::widget::stack![background, foreground].into(),
+            None => foreground,
+        };
+
         let main_chart: Element<_> = row![
-            container(Canvas::new(chart).width(Length::Fill).height(Length::Fill))
+            container(plot)
                 .width(Length::FillPortion(10))
                 .height(Length::FillPortion(120)),
             rule::vertical(1).style(style::split_ruler),
@@ -790,6 +822,45 @@ impl ViewState {
         let delta_units = self.base_price_y.units - price.units;
         let ticks = (delta_units as f32) / (self.effective_tick_units() as f32);
         ticks * self.cell_height
+    }
+
+    pub(crate) fn heatmap_overlay_transform(
+        &self,
+        reference_time: UnixMs,
+        reference_price: Price,
+        heatmap_step: PriceStep,
+    ) -> Option<HeatmapOverlayTransform> {
+        let Basis::Time(_) = self.basis else {
+            return None;
+        };
+        if self.bounds.width <= 1.0
+            || self.bounds.height <= 1.0
+            || self.scaling <= 0.0
+            || self.tick_size.units <= 0
+            || heatmap_step.units <= 0
+        {
+            return None;
+        }
+
+        let step_ratio = heatmap_step.units as f64 / self.tick_size.units as f64;
+        let column_width_px = self.cell_width * self.scaling;
+        let row_height_px = (f64::from(self.cell_height * self.scaling) * step_ratio) as f32;
+        if !column_width_px.is_finite()
+            || !row_height_px.is_finite()
+            || column_width_px <= 0.0
+            || row_height_px <= 0.0
+        {
+            return None;
+        }
+
+        Some(HeatmapOverlayTransform {
+            viewport: self.bounds.size(),
+            anchor_x_px: (self.interval_to_x(reference_time.as_u64()) + self.translation.x)
+                * self.scaling,
+            anchor_y_px: (self.price_to_y(reference_price) + self.translation.y) * self.scaling,
+            column_width_px,
+            row_height_px,
+        })
     }
 
     fn y_to_price(&self, y: f32) -> Price {
@@ -1132,6 +1203,15 @@ impl ViewState {
             }
         }
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HeatmapOverlayTransform {
+    pub viewport: Size,
+    pub anchor_x_px: f32,
+    pub anchor_y_px: f32,
+    pub column_width_px: f32,
+    pub row_height_px: f32,
 }
 
 fn request_fetch(handler: &mut RequestHandler, range: FetchRange) -> Option<Action> {

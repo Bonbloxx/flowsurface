@@ -1,5 +1,5 @@
 use crate::{
-    Kline, Price, Qty, Ticker, TickerInfo, TickerStats, Timeframe, UnixMs, Volume,
+    Kline, OpenInterest, Price, Qty, Ticker, TickerInfo, TickerStats, Timeframe, UnixMs, Volume,
     adapter::{Exchange, MarketKind},
     depth::{DeOrder, DepthPayload},
     serde_util::de_string_to_number,
@@ -48,6 +48,68 @@ struct HyperliquidAssetContext {
     mid_price: f64,
     #[serde(rename = "prevDayPx", deserialize_with = "de_string_to_number")]
     prev_day_price: f64,
+    #[serde(rename = "openInterest", default)]
+    open_interest: Option<String>,
+}
+
+pub(super) async fn fetch_open_interest(
+    hub: &mut HttpHub<HyperliquidLimiter>,
+    ticker_info: TickerInfo,
+    timeframe: Timeframe,
+    range: Option<(UnixMs, UnixMs)>,
+) -> Result<Vec<OpenInterest>, AdapterError> {
+    if ticker_info.market_type() != MarketKind::LinearPerps {
+        return Err(AdapterError::InvalidRequest(
+            "Hyperliquid open interest is only available for linear perpetuals".to_string(),
+        ));
+    }
+
+    let (symbol, _) = ticker_info.ticker.to_full_symbol_and_type();
+    let dex = symbol.split_once(':').map(|(dex, _)| dex);
+    let raw_symbol = symbol
+        .rsplit_once(':')
+        .map_or(symbol.as_str(), |(_, coin)| coin);
+    let body = dex.map_or_else(
+        || json!({ "type": "metaAndAssetCtxs" }),
+        |dex| json!({ "type": "metaAndAssetCtxs", "dex": dex }),
+    );
+    let response: Value = post_info(hub, &body).await?;
+    let universe = response
+        .get(0)
+        .and_then(|meta| meta.get("universe"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| AdapterError::ParseError("Missing Hyperliquid universe".to_string()))?;
+    let contexts = response.get(1).and_then(Value::as_array).ok_or_else(|| {
+        AdapterError::ParseError("Missing Hyperliquid asset contexts".to_string())
+    })?;
+    let index = universe
+        .iter()
+        .position(|asset| asset.get("name").and_then(Value::as_str) == Some(raw_symbol))
+        .ok_or_else(|| {
+            AdapterError::InvalidRequest(format!("Unknown Hyperliquid market {symbol}"))
+        })?;
+    let context: HyperliquidAssetContext =
+        serde_json::from_value(contexts.get(index).cloned().ok_or_else(|| {
+            AdapterError::ParseError("Missing Hyperliquid asset context".to_string())
+        })?)
+        .map_err(|error| AdapterError::ParseError(error.to_string()))?;
+    let time = UnixMs::now();
+    if range.is_some_and(|(from, to)| {
+        time < from || time > to.saturating_add(timeframe.to_milliseconds())
+    }) {
+        return Ok(Vec::new());
+    }
+    let Some(base_open_interest) = context
+        .open_interest
+        .as_deref()
+        .and_then(|value| value.parse::<f64>().ok())
+    else {
+        return Ok(Vec::new());
+    };
+    Ok(vec![OpenInterest {
+        time,
+        value: base_open_interest * context.mark_price,
+    }])
 }
 
 impl HyperliquidAssetContext {

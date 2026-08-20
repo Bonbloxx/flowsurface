@@ -1,12 +1,12 @@
 use crate::{
-    Event, Kline, OpenInterest, PushFrequency, TickerInfo, Timeframe, UnixMs,
+    Event, Kline, OpenInterest, PushFrequency, TickerInfo, Timeframe, Trade, UnixMs,
     adapter::limiter::FixedWindowRateLimiterConfig,
     adapter::{Exchange, MarketKind, StreamTicksize},
     unit::qty::RawQtyUnit,
 };
 
 use super::{AdapterError, HttpHub, RequestPort};
-use std::time::Duration;
+use std::{path::PathBuf, time::Duration};
 
 pub mod fetch;
 pub mod stream;
@@ -140,6 +140,24 @@ impl BybitHandle {
             .await
     }
 
+    pub async fn fetch_trades(
+        &self,
+        ticker: TickerInfo,
+        from_time: UnixMs,
+        to_time: Option<UnixMs>,
+        data_path: Option<PathBuf>,
+    ) -> Result<Vec<Trade>, AdapterError> {
+        self.request_port
+            .request(move |reply| BybitCommand::Trades {
+                ticker,
+                from_time,
+                to_time,
+                data_path,
+                reply,
+            })
+            .await
+    }
+
     pub fn connect_depth_stream(
         self,
         ticker_info: TickerInfo,
@@ -215,6 +233,18 @@ impl super::FetchCommandHandler<MarketKind> for Worker {
     ) -> futures::future::BoxFuture<'_, Result<Vec<OpenInterest>, AdapterError>> {
         Box::pin(async move {
             fetch::fetch_historical_oi(&mut self.hub, ticker_info, range, timeframe).await
+        })
+    }
+
+    fn fetch_trades(
+        &mut self,
+        ticker_info: TickerInfo,
+        from_time: UnixMs,
+        to_time: Option<UnixMs>,
+        data_path: Option<PathBuf>,
+    ) -> futures::future::BoxFuture<'_, Result<Vec<Trade>, AdapterError>> {
+        Box::pin(async move {
+            fetch::fetch_trades(&mut self.hub, ticker_info, from_time, to_time, data_path).await
         })
     }
 }

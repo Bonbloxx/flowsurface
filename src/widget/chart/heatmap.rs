@@ -14,10 +14,10 @@ use ui::axisy::AxisYLabelCanvas;
 use ui::overlay::OverlayCanvas;
 use ui::{CanvasCaches, CanvasInvalidation};
 use view::{ViewConfig, ViewInputs, ViewWindow};
-use widget::{DEFAULT_Y_AXIS_GUTTER, HeatmapShaderWidget};
+use widget::{DEFAULT_Y_AXIS_GUTTER, HeatmapShaderLayer, HeatmapShaderWidget};
 
 use crate::{
-    chart::Action,
+    chart::{Action, HeatmapOverlayTransform},
     modal::pane::settings::study::{self, Study},
 };
 use data::aggr::time::TimeSeries;
@@ -37,6 +37,7 @@ const STRIP_HEIGHT_FRAC: f32 = 0.10;
 
 // Debounce heavy CPU rebuilds (notably `rebuild_from_historical`) during interaction
 const REBUILD_DEBOUNCE_MS: u64 = 250;
+const OVERLAY_GRID_HORIZON_BUCKETS: u32 = 2_048;
 
 // If rendering stalls longer than this, assume GPU heatmap texture may have been lost/desynced
 const HEATMAP_RESYNC_AFTER_STALL_MS: u64 = 750;
@@ -156,6 +157,114 @@ impl HeatmapShader {
             studies,
             study_configurator: study::Configurator::new(),
         }
+    }
+
+    pub fn new_overlay(
+        basis: Basis,
+        step: PriceStep,
+        ticker_info: TickerInfo,
+        config: Option<data::chart::heatmap::Config>,
+    ) -> Self {
+        let mut overlay = Self::new(basis, step, ticker_info, vec![], vec![], config);
+        // The embedded layer only needs the chart's visible history. The
+        // standalone 8,192 x 2,048 ring wastes hundreds of MB once CPU upload
+        // copies and GPU textures are included.
+        overlay.depth_grid = GridRing::with_horizon_buckets(OVERLAY_GRID_HORIZON_BUCKETS);
+        overlay.scene.set_heatmap_only();
+        overlay
+    }
+
+    pub fn overlay_view(&self) -> iced::Element<'_, crate::chart::Message> {
+        HeatmapShaderLayer::new(&self.scene).into()
+    }
+
+    fn sync_overlay_transform(
+        &mut self,
+        transform: HeatmapOverlayTransform,
+        now: Instant,
+    ) -> Option<Action> {
+        if self.palette.is_none() {
+            return Some(Action::RequestPalette);
+        }
+
+        let latest_time = self.latest_time?;
+        let base_price = self.base_price?;
+        let width = transform.viewport.width;
+        let height = transform.viewport.height;
+        if width <= 1.0 || height <= 1.0 {
+            return None;
+        }
+
+        const OVERLAY_CAMERA_SCALE: f32 = 100.0;
+        let camera_scale = OVERLAY_CAMERA_SCALE;
+
+        self.viewport = Some(iced::Rectangle::new(
+            iced::Point::ORIGIN,
+            transform.viewport,
+        ));
+        self.scene.camera.set_scale(camera_scale);
+        self.scene.camera.right_pad_frac = 0.0;
+        self.scene.set_overlay_cell_world(
+            transform.column_width_px / camera_scale,
+            transform.row_height_px / camera_scale,
+        );
+
+        let center_x = -transform.anchor_x_px / camera_scale;
+        self.scene.camera.offset[0] = center_x + width / (2.0 * camera_scale);
+        self.scene.camera.offset[1] = -transform.anchor_y_px / camera_scale;
+
+        let aggr_time = self.depth_history.aggr_time_ms().max(1);
+        let latest_bucket = (latest_time / aggr_time) as i64;
+        self.anchor.set_scroll_ref_bucket_if_zero(latest_bucket);
+        let scroll_ref_bucket = self.anchor.scroll_ref_bucket();
+        let origin_x = overlay_origin_x(latest_bucket, scroll_ref_bucket);
+        self.scene.params.set_origin_x(origin_x);
+        let window = self.compute_view_window(transform.viewport)?;
+        let previous_steps_per_y_bin = self.scene.params.steps_per_y_bin();
+        let next_steps_per_y_bin = window.steps_per_y_bin.max(1);
+        let recenter_target = self.scene.price_at_center(base_price, self.step);
+        let needs_full_rebuild = self.depth_grid.should_full_rebuild(
+            previous_steps_per_y_bin,
+            next_steps_per_y_bin,
+            recenter_target,
+            self.step,
+            false,
+        );
+
+        if needs_full_rebuild {
+            self.rebuild_policy = self.rebuild_policy.promote_to_immediate();
+            self.rebuild_all(Some(window));
+        } else {
+            self.scene.params.set_steps_per_y_bin(next_steps_per_y_bin);
+            self.scene.sync_heatmap_texture(
+                &self.depth_grid,
+                base_price,
+                self.step,
+                self.qty_scale,
+                latest_time,
+                aggr_time,
+                scroll_ref_bucket,
+            );
+            self.scene
+                .sync_heatmap_upload_from_grid(&mut self.depth_grid, false);
+        }
+
+        self.rebuild_policy = view::RebuildPolicy::Idle;
+        self.update_depth_norm_and_params(window, now);
+        self.scene.params.set_origin_x(origin_x);
+        self.scene.set_heatmap_only();
+        None
+    }
+
+    pub fn sync_overlay(
+        &mut self,
+        chart: &crate::chart::ViewState,
+        now: Instant,
+    ) -> Option<Action> {
+        let latest_time = UnixMs::new(self.latest_time?);
+        let base_price = self.base_price?;
+        let transform = chart.heatmap_overlay_transform(latest_time, base_price, self.step)?;
+        self.sync_overlay_transform(transform, now)
     }
 
     pub fn update(&mut self, message: Message) {
@@ -391,6 +500,11 @@ impl HeatmapShader {
 
     pub fn tick_size(&self) -> PriceStep {
         self.step
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_depth_data(&self) -> bool {
+        self.latest_time.is_some() && self.base_price.is_some()
     }
 
     /// called periodically on every window frame
@@ -1044,5 +1158,25 @@ impl HeatmapShader {
             self.ticker_info.min_ticksize,
         )
         .unwrap_or(DEFAULT_Y_AXIS_GUTTER);
+    }
+}
+
+/// The texture shader treats `world.x = 0` as the live bucket's right edge.
+/// Advancing the origin by one places the latest bucket in
+/// `[-column_width, 0)`, so it is visible immediately after enabling the overlay.
+fn overlay_origin_x(latest_bucket: i64, scroll_ref_bucket: i64) -> f32 {
+    (latest_bucket - scroll_ref_bucket) as f32 + 1.0
+}
+
+#[cfg(test)]
+mod overlay_tests {
+    use super::overlay_origin_x;
+
+    #[test]
+    fn live_overlay_maps_the_column_left_of_zero_to_the_latest_bucket() {
+        let origin = overlay_origin_x(0, 0);
+        let rendered_bucket = (origin - 0.5).floor() as i64;
+
+        assert_eq!(rendered_bucket, 0);
     }
 }
