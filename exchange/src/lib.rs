@@ -393,6 +393,17 @@ impl Ticker {
             self.as_str()
         )
     }
+
+    /// Parse the canonical `"Exchange:Symbol"` string produced by
+    /// [`Self::symbol_and_exchange_string`].
+    ///
+    /// Unlike the serde deserializer this avoids untagged introspection, so it
+    /// also works with non-self-describing formats such as bincode.
+    pub fn parse_symbol_and_exchange(s: &str) -> Option<Self> {
+        let (exchange_str, symbol) = s.split_once(':')?;
+        let exchange = SerTicker::string_to_exchange(exchange_str).ok()?;
+        Some(Ticker::new(symbol, exchange))
+    }
 }
 
 impl fmt::Display for Ticker {

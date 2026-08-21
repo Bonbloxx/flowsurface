@@ -78,6 +78,45 @@ pub enum FetchedData {
     },
 }
 
+/// Minimum wall-clock span for trade fetch windows. Live-edge bookkeeping can
+/// produce gaps of a few milliseconds; each such request would otherwise cost
+/// a full rate-limited REST page for near-zero data.
+const MIN_TRADE_FETCH_WINDOW_MS: u64 = 1_000;
+
+fn clamp_trade_window(fetch: FetchRange) -> FetchRange {
+    let expand = |from: UnixMs, to: UnixMs| {
+        let span = to.as_u64().saturating_sub(from.as_u64());
+        if span >= MIN_TRADE_FETCH_WINDOW_MS {
+            (from, to)
+        } else {
+            (from.saturating_sub(MIN_TRADE_FETCH_WINDOW_MS - span), to)
+        }
+    };
+
+    match fetch {
+        FetchRange::Trades(from, to) => {
+            let (from, to) = expand(from, to);
+            FetchRange::Trades(from, to)
+        }
+        FetchRange::FootprintTrades(from, to) => {
+            let (from, to) = expand(from, to);
+            FetchRange::FootprintTrades(from, to)
+        }
+        FetchRange::TradesRecent(from, to) => {
+            let (from, to) = expand(from, to);
+            FetchRange::TradesRecent(from, to)
+        }
+        other => other,
+    }
+}
+
+fn range_contains(
+    (outer_from, outer_to): (UnixMs, UnixMs),
+    (inner_from, inner_to): (UnixMs, UnixMs),
+) -> bool {
+    outer_from <= inner_from && outer_to >= inner_to
+}
+
 #[derive(thiserror::Error, Debug, Clone)]
 pub enum ReqError {
     #[error("Request overlaps with an existing request")]
@@ -93,6 +132,8 @@ pub enum ReqError {
 /// Lifecycle of a fetch request.
 ///
 /// * `Failed` is retried after the cooldown (transient errors may resolve).
+///   After [`RequestHandler::MAX_FETCH_ATTEMPTS`] the request is treated as
+///   `NoData` so a permanently broken range cannot retry forever.
 /// * `Completed` and `NoData` are never retried — the data is either
 ///   already present or the source confirmed the range is empty.
 #[derive(PartialEq, Clone, Debug)]
@@ -103,7 +144,10 @@ enum RequestStatus {
     /// The source returned an empty result for this range.
     NoData,
     /// The fetch failed (network error, parse error, etc.).
-    Failed(u64),
+    Failed {
+        at: u64,
+        attempts: u32,
+    },
 }
 
 #[derive(Default)]
@@ -113,13 +157,14 @@ pub struct RequestHandler {
 
 impl RequestHandler {
     const RETRY_AFTER_MS: u64 = 30_000;
+    const MAX_FETCH_ATTEMPTS: u32 = 5;
 
     pub fn add_request(
         &mut self,
         fetch: FetchRange,
         stream: Option<StreamKind>,
     ) -> Result<Option<Uuid>, ReqError> {
-        let request = FetchRequest::new(fetch, stream);
+        let request = FetchRequest::new(clamp_trade_window(fetch), stream);
         let id = Uuid::new_v4();
 
         if let Some((existing_id, existing_req)) = self.requests.iter_mut().find_map(|(k, v)| {
@@ -137,8 +182,13 @@ impl RequestHandler {
                 RequestStatus::Completed => Ok(None),
                 RequestStatus::Pending => Err(ReqError::Overlaps),
                 RequestStatus::NoData => Err(ReqError::NoData),
-                RequestStatus::Failed(ts) => {
-                    if now_ms - ts > retry_after_ms {
+                RequestStatus::Failed { at: _, attempts }
+                    if attempts >= Self::MAX_FETCH_ATTEMPTS =>
+                {
+                    Err(ReqError::NoData)
+                }
+                RequestStatus::Failed { at, .. } => {
+                    if now_ms - at > retry_after_ms {
                         existing_req.status = RequestStatus::Pending;
                         Ok(Some(existing_id))
                     } else {
@@ -146,6 +196,20 @@ impl RequestHandler {
                     }
                 }
             };
+        }
+
+        // A range already covered by a tracked request must not burn another
+        // rate-limited page. Only Failed ranges fall through so the cooldown
+        // logic above stays in charge of retries.
+        let covered = self
+            .requests
+            .iter()
+            .find_map(|(k, v)| v.contains(&request).then_some((*k, v.status.clone())));
+        match covered {
+            Some((_, RequestStatus::Completed)) => return Ok(None),
+            Some((_, RequestStatus::Pending)) => return Err(ReqError::Overlaps),
+            Some((_, RequestStatus::NoData)) => return Err(ReqError::NoData),
+            _ => {}
         }
 
         self.requests.insert(id, request);
@@ -182,10 +246,32 @@ impl RequestHandler {
         });
     }
 
+    /// Drop every tracked request issued on `stream`.
+    ///
+    /// Used when a seeded bar store goes stale (for example Previous Value
+    /// Areas after a UTC-day rollover): the completed ranges would otherwise
+    /// suppress the top-up fetches that cover the newly elapsed time.
+    pub fn drop_requests_for_stream(&mut self, stream: StreamKind) {
+        self.requests
+            .retain(|_, request| request.stream != Some(stream));
+    }
+
     pub fn mark_failed(&mut self, id: Uuid) {
         if let Some(request) = self.requests.get_mut(&id) {
             let timestamp = chrono::Utc::now().timestamp_millis() as u64;
-            request.status = RequestStatus::Failed(timestamp);
+            let attempts = match &request.status {
+                RequestStatus::Failed { attempts, .. } => attempts + 1,
+                _ => 1,
+            };
+            request.status = RequestStatus::Failed {
+                at: timestamp,
+                attempts,
+            };
+            log::debug!(
+                "Fetch request failed (attempt {attempts}/{}): {:?}",
+                Self::MAX_FETCH_ATTEMPTS,
+                request.fetch_type
+            );
         } else {
             log::warn!("Request not found: {:?}", id);
         }
@@ -253,6 +339,29 @@ impl FetchRequest {
             }
             _ => false,
         }
+    }
+
+    /// Check whether the stored [`FetchRange`] fully covers a given range of
+    /// the same kind. Used to skip redundant sub-range requests.
+    fn contains(&self, other: &FetchRequest) -> bool {
+        if self.stream != other.stream {
+            return false;
+        }
+        let bounds = |range: &FetchRange| match range {
+            FetchRange::Kline(from, to)
+            | FetchRange::OpenInterest(from, to)
+            | FetchRange::Trades(from, to)
+            | FetchRange::FootprintTrades(from, to)
+            | FetchRange::FootprintHistoryTrades(from, to)
+            | FetchRange::FootprintHistoryOpenInterest(from, to)
+            | FetchRange::TradesRecent(from, to) => Some((*from, *to)),
+        };
+        let (Some(outer), Some(inner)) = (bounds(&self.fetch_type), bounds(&other.fetch_type))
+        else {
+            return false;
+        };
+        std::mem::discriminant(&self.fetch_type) == std::mem::discriminant(&other.fetch_type)
+            && range_contains(outer, inner)
     }
 }
 
@@ -1094,6 +1203,163 @@ mod tests {
 
         assert_eq!(limits, None);
         assert!(!fetch_limit_reached(limits, usize::MAX, usize::MAX));
+    }
+
+    #[test]
+    fn failed_footprint_days_retry_with_bounded_attempts() {
+        let stream = StreamKind::Trades {
+            ticker_info: TickerInfo::new(
+                Ticker::new("BTCUSDT", Exchange::BinanceLinear),
+                0.1,
+                0.001,
+                None,
+            ),
+        };
+        let range = FetchRange::FootprintHistoryTrades(UnixMs::new(1_000), UnixMs::new(2_000));
+        let mut handler = RequestHandler::default();
+        let id = handler.add_request(range, Some(stream)).unwrap().unwrap();
+
+        // A failure must not be treated as completed — the day would
+        // otherwise silently never populate.
+        handler.mark_failed(id);
+        assert!(matches!(
+            handler.add_request(range, Some(stream)),
+            Err(ReqError::Failed)
+        ));
+
+        // After the bounded attempt count the range is treated as NoData so
+        // a permanently broken source cannot retry forever.
+        for _ in 0..RequestHandler::MAX_FETCH_ATTEMPTS {
+            handler.mark_failed(id);
+        }
+        assert!(matches!(
+            handler.add_request(range, Some(stream)),
+            Err(ReqError::NoData)
+        ));
+    }
+
+    #[test]
+    fn sub_range_of_completed_request_is_skipped_silently() {
+        let stream = StreamKind::Trades {
+            ticker_info: TickerInfo::new(
+                Ticker::new("BTCUSDT", Exchange::BinanceLinear),
+                0.1,
+                0.001,
+                None,
+            ),
+        };
+        let mut handler = RequestHandler::default();
+        let id = handler
+            .add_request(
+                FetchRange::Trades(UnixMs::new(1_000), UnixMs::new(10_000)),
+                Some(stream),
+            )
+            .unwrap()
+            .unwrap();
+        handler.mark_completed(id);
+
+        assert!(matches!(
+            handler.add_request(
+                FetchRange::Trades(UnixMs::new(4_000), UnixMs::new(5_000)),
+                Some(stream),
+            ),
+            Ok(None)
+        ));
+    }
+
+    #[test]
+    fn sub_range_of_pending_request_reports_overlap() {
+        let stream = StreamKind::Trades {
+            ticker_info: TickerInfo::new(
+                Ticker::new("BTCUSDT", Exchange::BinanceLinear),
+                0.1,
+                0.001,
+                None,
+            ),
+        };
+        let mut handler = RequestHandler::default();
+        handler
+            .add_request(
+                FetchRange::Trades(UnixMs::new(1_000), UnixMs::new(10_000)),
+                Some(stream),
+            )
+            .unwrap()
+            .unwrap();
+
+        assert!(matches!(
+            handler.add_request(
+                FetchRange::Trades(UnixMs::new(2_000), UnixMs::new(3_000)),
+                Some(stream),
+            ),
+            Err(ReqError::Overlaps)
+        ));
+    }
+
+    #[test]
+    fn tiny_trade_windows_are_expanded_to_the_minimum_span() {
+        let clamped = clamp_trade_window(FetchRange::Trades(
+            UnixMs::new(1787295759801),
+            UnixMs::new(1787295759820),
+        ));
+
+        let span = match clamped {
+            FetchRange::Trades(from, to) => to.as_u64() - from.as_u64(),
+            other => panic!("unexpected range {other:?}"),
+        };
+        assert!(span >= MIN_TRADE_FETCH_WINDOW_MS);
+
+        // Non-trade ranges are left untouched.
+        let kline = FetchRange::Kline(UnixMs::new(1_000), UnixMs::new(1_010));
+        assert_eq!(clamp_trade_window(kline), kline);
+    }
+
+    #[test]
+    fn containment_respects_stream_and_range_kind() {
+        let binance = StreamKind::Trades {
+            ticker_info: TickerInfo::new(
+                Ticker::new("BTCUSDT", Exchange::BinanceLinear),
+                0.1,
+                0.001,
+                None,
+            ),
+        };
+        let bybit = StreamKind::Trades {
+            ticker_info: TickerInfo::new(
+                Ticker::new("BTCUSDT", Exchange::BybitLinear),
+                0.1,
+                0.001,
+                None,
+            ),
+        };
+        let outer = FetchRequest::new(
+            FetchRange::Trades(UnixMs::new(1_000), UnixMs::new(10_000)),
+            Some(binance),
+        );
+
+        // Same stream, contained range of the same kind.
+        assert!(outer.contains(&FetchRequest::new(
+            FetchRange::Trades(UnixMs::new(2_000), UnixMs::new(3_000)),
+            Some(binance),
+        )));
+
+        // Different stream is never contained.
+        assert!(!outer.contains(&FetchRequest::new(
+            FetchRange::Trades(UnixMs::new(2_000), UnixMs::new(3_000)),
+            Some(bybit),
+        )));
+
+        // Same bounds but a different kind is not contained either.
+        assert!(!outer.contains(&FetchRequest::new(
+            FetchRange::FootprintTrades(UnixMs::new(2_000), UnixMs::new(3_000)),
+            Some(StreamKind::Trades {
+                ticker_info: TickerInfo::new(
+                    Ticker::new("BTCUSDT", Exchange::BinanceLinear),
+                    0.1,
+                    0.001,
+                    None,
+                ),
+            }),
+        )));
     }
 
     #[test]

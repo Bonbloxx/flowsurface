@@ -23,7 +23,10 @@ use std::path::{Path, PathBuf};
 pub(crate) const DAY_MS: u64 = 24 * 60 * 60 * 1_000;
 const FIVE_MIN_MS: u64 = 5 * 60 * 1_000;
 pub(crate) const DAYS: usize = 3;
-const CACHE_SCHEMA_VERSION: u16 = 1;
+/// v2: binary (bincode) encoding. A busy day serializes an order of magnitude
+/// faster than the previous JSON format, which blocked the UI thread for
+/// seconds per file when loading or persisting day caches.
+pub(crate) const CACHE_SCHEMA_VERSION: u16 = 2;
 const MAX_LOOKBACK_DAYS: usize = 732;
 
 /// Inclusive UTC-day windows from `00:00:00.000` through `23:59:59.999`,
@@ -285,7 +288,10 @@ struct SourceHistory {
 #[derive(Debug, Deserialize, Serialize)]
 struct CachedDayStats {
     schema_version: u16,
-    source: Ticker,
+    /// Canonical `"Exchange:Symbol"` string. Stored as text because `Ticker`'s
+    /// backwards-compatible untagged deserializer is unusable with binary
+    /// formats like bincode.
+    source: String,
     day_start: u64,
     covered_through: u64,
     size_unit: SizeUnit,
@@ -333,34 +339,6 @@ impl FootprintHistoryIndicator {
         self.lookback_days = usize::from(days).clamp(1, MAX_LOOKBACK_DAYS);
     }
 
-    /// Keep only the data needed by Previous Value Area once a day is complete.
-    /// The shared disk cache remains at full trade-price granularity so other
-    /// indicators can still hydrate the original day book.
-    pub(crate) fn compact_day_for_value_area(
-        &mut self,
-        source: TickerInfo,
-        day: UnixMs,
-        step: PriceStep,
-    ) {
-        if step.units <= 0 {
-            return;
-        }
-        let day = day_start(day);
-        if !self.completed_days.contains(&(source.ticker, day)) {
-            return;
-        }
-        let Some(stats) = self
-            .histories
-            .get_mut(&source.ticker)
-            .and_then(|history| history.days.get_mut(&day))
-        else {
-            return;
-        };
-        let grouped = group_levels(stats, step);
-        stats.levels = grouped;
-        stats.five_min_delta.clear();
-    }
-
     fn cache_path(source: TickerInfo, day: u64) -> PathBuf {
         let unit = match volume_size_unit() {
             SizeUnit::Base => "base",
@@ -378,7 +356,7 @@ impl FootprintHistoryIndicator {
             })
             .collect::<String>();
         let relative = format!(
-            "market_data/footprint-days/v{CACHE_SCHEMA_VERSION}/{unit}/{safe_identity}/{day}.json"
+            "market_data/footprint-days/v{CACHE_SCHEMA_VERSION}/{unit}/{safe_identity}/{day}.fpbin"
         );
         if let Ok(override_path) = std::env::var("FLOWSURFACE_DATA_PATH") {
             let override_path = PathBuf::from(override_path);
@@ -405,16 +383,20 @@ impl FootprintHistoryIndicator {
                 return None;
             }
         };
-        let cached = match serde_json::from_slice::<CachedDayStats>(&bytes) {
-            Ok(cached) => cached,
+        let (cached, _) = match bincode::serde::decode_from_slice::<CachedDayStats, _>(
+            &bytes,
+            bincode::config::standard(),
+        ) {
+            Ok(result) => result,
             Err(err) => {
                 log::warn!("Ignoring corrupt footprint day cache {path:?}: {err}");
                 let _ = std::fs::remove_file(path);
                 return None;
             }
         };
+        let parsed_source = Ticker::parse_symbol_and_exchange(&cached.source);
         if cached.schema_version != CACHE_SCHEMA_VERSION
-            || !cached.source.same_market(&source.ticker)
+            || !parsed_source.is_some_and(|ticker| ticker.same_market(&source.ticker))
             || cached.day_start != day
             || cached.covered_through < day
             || cached.covered_through >= day.saturating_add(DAY_MS)
@@ -448,13 +430,14 @@ impl FootprintHistoryIndicator {
         std::fs::create_dir_all(parent)?;
         let payload = CachedDayStats {
             schema_version: CACHE_SCHEMA_VERSION,
-            source: source.ticker,
+            source: source.ticker.symbol_and_exchange_string(),
             day_start: day,
             covered_through: covered_through.as_u64(),
             size_unit: volume_size_unit(),
             stats: stats.clone(),
         };
-        let bytes = serde_json::to_vec(&payload).map_err(std::io::Error::other)?;
+        let bytes = bincode::serde::encode_to_vec(&payload, bincode::config::standard())
+            .map_err(std::io::Error::other)?;
         let temp_path = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
         std::fs::write(&temp_path, bytes)?;
         if path.exists() {
@@ -527,13 +510,26 @@ impl FootprintHistoryIndicator {
             self.completed_days.insert((source.ticker, day));
         }
         let path = Self::cache_path(source, day);
-        if let Err(err) = Self::write_cached_day(&path, source, day, covered_through, stats) {
-            log::warn!("Failed to write footprint day cache {path:?}: {err}");
-        } else {
-            self.cache_checkpoints
-                .insert((source.ticker, day), Some(covered_through));
-            log::debug!("Stored footprint day cache for {} at {day}", source.ticker);
-        }
+        // Encoding a busy day still costs tens of milliseconds and the write
+        // itself blocks on disk — keep both off the UI thread. The clone is
+        // the only main-thread cost and is far cheaper than encoding.
+        let stats = stats.clone();
+        self.cache_checkpoints
+            .insert((source.ticker, day), Some(covered_through));
+        std::thread::Builder::new()
+            .name("footprint-cache-writer".to_string())
+            .spawn(move || {
+                if let Err(err) =
+                    Self::write_cached_day(&path, source, day, covered_through, &stats)
+                {
+                    log::warn!("Failed to write footprint day cache {path:?}: {err}");
+                }
+            })
+            .map(|_| ())
+            .unwrap_or_else(|err| {
+                log::warn!("Failed to spawn footprint cache writer: {err}");
+            });
+        log::debug!("Stored footprint day cache for {} at {day}", source.ticker);
     }
 
     fn retain_oldest(&self, now: UnixMs) -> u64 {
@@ -572,25 +568,13 @@ impl FootprintHistoryIndicator {
         result
     }
 
-    #[cfg(test)]
-    pub(crate) fn display_period(&self, start: UnixMs, end: UnixMs) -> DayStats {
-        let mut result = DayStats::default();
-        for source in self.active_sources() {
-            if let Some(history) = self.histories.get(&source.ticker) {
-                for (_, stats) in history.days.range(start.as_u64()..=day_start(end)) {
-                    result.merge(stats);
-                }
-            }
-        }
-        result
-    }
-
     /// Merge only venues whose entire requested UTC period is available.
     ///
     /// An aggregate should not disappear while an additional venue is still
     /// backfilling, but it must also never mix a partial venue into the value
     /// area. Venues join the merged profile atomically once all of their days
     /// are complete.
+    #[cfg(test)]
     pub(crate) fn display_complete_period(&self, start: UnixMs, end: UnixMs) -> (DayStats, usize) {
         let mut result = DayStats::default();
         let mut complete_sources = 0;
@@ -608,6 +592,7 @@ impl FootprintHistoryIndicator {
         (result, complete_sources)
     }
 
+    #[cfg(test)]
     fn source_period_complete(&self, source: Ticker, start: UnixMs, end: UnixMs) -> bool {
         let mut day = day_start(start);
         let last = day_start(end);
@@ -1934,41 +1919,6 @@ mod tests {
 
         assert!(indicator.histories.is_empty());
         assert!(indicator.historical_started.is_empty());
-    }
-
-    #[test]
-    fn completed_value_area_days_keep_only_coarse_price_levels() {
-        let source = TickerInfo::new(
-            Ticker::new("BTCUSDT", Exchange::BinanceLinear),
-            0.1,
-            0.001,
-            None,
-        );
-        let day = day_start(UnixMs::now()).saturating_sub(DAY_MS);
-        let mut indicator = FootprintHistoryIndicator::new();
-        indicator.configure_footprint_history(&[source], true);
-        indicator.on_source_trades(
-            source,
-            &[
-                trade(day + 1_000, 100.1, 1.0, false),
-                trade(day + 6 * 60_000, 100.9, 2.0, false),
-            ],
-            true,
-        );
-        indicator.completed_days.insert((source.ticker, day));
-
-        indicator.compact_day_for_value_area(
-            source,
-            UnixMs::new(day),
-            PriceStep {
-                units: Price::from_f64(1.0).units,
-            },
-        );
-
-        let stats = &indicator.histories[&source.ticker].days[&day];
-        assert_eq!(stats.levels.len(), 1);
-        assert!(stats.five_min_delta.is_empty());
-        assert_eq!(stats.volume(), 301.9);
     }
 
     #[test]

@@ -50,6 +50,11 @@ fn main() {
     }
 
     std::thread::spawn(data::cleanup_old_market_data);
+    std::thread::spawn(|| {
+        data::cleanup_legacy_footprint_caches(
+            chart::indicator::kline::footprint_history::CACHE_SCHEMA_VERSION,
+        )
+    });
 
     let daemon = iced::daemon(Flowsurface::new, Flowsurface::update, Flowsurface::view)
         .settings(iced::Settings {

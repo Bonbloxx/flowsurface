@@ -44,6 +44,19 @@ impl<T: Copy> Window<T> {
     }
 }
 
+impl Window<f32> {
+    /// Windows reports this sentinel position while a window is minimized.
+    /// Persisting it makes the next process reopen beyond the desktop bounds.
+    pub fn has_restorable_position(&self) -> bool {
+        const MINIMIZED_SENTINEL_THRESHOLD: f32 = -30_000.0;
+
+        self.pos_x.is_finite()
+            && self.pos_y.is_finite()
+            && !(self.pos_x <= MINIMIZED_SENTINEL_THRESHOLD
+                && self.pos_y <= MINIMIZED_SENTINEL_THRESHOLD)
+    }
+}
+
 impl Default for Window<f32> {
     fn default() -> Self {
         Self {
@@ -65,5 +78,32 @@ impl From<(&iced_core::Point, &iced_core::Size)> for WindowSpec {
             pos_x: point.x,
             pos_y: point.y,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WindowSpec;
+
+    #[test]
+    fn rejects_windows_minimized_position_sentinel() {
+        let spec = WindowSpec {
+            pos_x: -32_000.0,
+            pos_y: -32_000.0,
+            ..WindowSpec::default()
+        };
+
+        assert!(!spec.has_restorable_position());
+    }
+
+    #[test]
+    fn accepts_negative_positions_on_an_adjacent_monitor() {
+        let spec = WindowSpec {
+            pos_x: -1_920.0,
+            pos_y: 120.0,
+            ..WindowSpec::default()
+        };
+
+        assert!(spec.has_restorable_position());
     }
 }

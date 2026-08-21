@@ -558,22 +558,55 @@ pub(super) async fn fetch_historical_oi(
     Ok(open_interest)
 }
 
+fn aggtrades_request_weight(market: MarketKind) -> usize {
+    match market {
+        MarketKind::Spot => 4,
+        MarketKind::LinearPerps | MarketKind::InversePerps => 20,
+    }
+}
+
+fn aggtrades_base_url(market: MarketKind) -> String {
+    match market {
+        MarketKind::Spot => format!("{SPOT_DOMAIN}/api/v3/aggTrades"),
+        MarketKind::LinearPerps => format!("{LINEAR_PERP_DOMAIN}/fapi/v1/aggTrades"),
+        MarketKind::InversePerps => format!("{INVERSE_PERP_DOMAIN}/dapi/v1/aggTrades"),
+    }
+}
+
+fn map_de_trades(
+    de_trades: Vec<DeTrade>,
+    ticker_info: TickerInfo,
+    market_type: MarketKind,
+) -> Vec<Trade> {
+    let qty_norm = QtyNormalization::with_raw_qty_unit(
+        volume_size_unit() == SizeUnit::Quote,
+        ticker_info,
+        raw_qty_unit_from_market_type(market_type),
+    );
+
+    de_trades
+        .into_iter()
+        .map(|de_trade| Trade {
+            time: de_trade.time.into(),
+            is_sell: de_trade.is_sell,
+            price: Price::from_f64(de_trade.price).round_to_min_tick(ticker_info.min_ticksize),
+            qty: qty_norm.normalize_qty(de_trade.qty, de_trade.price),
+        })
+        .collect()
+}
+
 async fn fetch_intraday_trades(
     hub: &mut HttpHub<BinanceLimiter>,
     ticker_info: TickerInfo,
     from: UnixMs,
     to: Option<UnixMs>,
 ) -> Result<Vec<Trade>, AdapterError> {
-    let ticker = ticker_info.ticker;
-    let (symbol_str, market_type) = ticker.to_full_symbol_and_type();
+    let (symbol_str, market_type) = ticker_info.ticker.to_full_symbol_and_type();
 
-    let (base_url, weight) = match market_type {
-        MarketKind::Spot => (format!("{SPOT_DOMAIN}/api/v3/aggTrades"), 4),
-        MarketKind::LinearPerps => (format!("{LINEAR_PERP_DOMAIN}/fapi/v1/aggTrades"), 20),
-        MarketKind::InversePerps => (format!("{INVERSE_PERP_DOMAIN}/dapi/v1/aggTrades"), 20),
-    };
-
-    let mut url = format!("{base_url}?symbol={symbol_str}&limit=1000");
+    let mut url = format!(
+        "{}?symbol={symbol_str}&limit=1000",
+        aggtrades_base_url(market_type)
+    );
     if let Some(to) = to {
         // Supplying only endTime asks Binance for the newest page ending at
         // this cursor. This lets callers page backward from the live edge.
@@ -582,28 +615,118 @@ async fn fetch_intraday_trades(
         url.push_str(&format!("&startTime={}", from.as_u64()));
     }
 
-    let de_trades: Vec<DeTrade> = hub.http_json_with_limiter(&url, weight, None, None).await?;
+    let de_trades: Vec<DeTrade> = hub
+        .http_json_with_limiter(&url, aggtrades_request_weight(market_type), None, None)
+        .await?;
 
-    let qty_norm = QtyNormalization::with_raw_qty_unit(
-        volume_size_unit() == SizeUnit::Quote,
-        ticker_info,
-        raw_qty_unit_from_market_type(market_type),
-    );
-
-    let trades = de_trades
-        .into_iter()
-        .map(|de_trade| Trade {
-            time: de_trade.time.into(),
-            is_sell: de_trade.is_sell,
-            price: Price::from_f64(de_trade.price).round_to_min_tick(ticker_info.min_ticksize),
-            qty: qty_norm.normalize_qty(de_trade.qty, de_trade.price),
-        })
-        .collect();
-
-    Ok(trades)
+    Ok(map_de_trades(de_trades, ticker_info, market_type))
 }
 
-/// Hard cap per archive read. Busy BTCUSDT days are ~0.5–2M aggTrades; 500k
+/// Binance caps an aggTrades page at 1000 rows; a full page means the slice
+/// may hold more trades and must be split again.
+const AGGTRADES_PAGE_LIMIT: usize = 1000;
+/// How many slice requests to keep in flight per wave. At weight 20 per
+/// aggTrades page this is 200 weight per wave — well inside the ~2300/min
+/// effective perps budget.
+const PARALLEL_SLICE_WAVE: usize = 10;
+/// Slices narrower than this are never split further â€” a capped page this
+/// small is kept as-is instead of recursing forever.
+const MIN_SLICE_SPAN_MS: u64 = 1_000;
+
+/// Split the inclusive range `[from, to]` into `[from, mid]` and
+/// `[mid + 1, to]`. Returns `(mid, mid + 1)` so both sub-ranges stay disjoint.
+fn split_intraday_slice(from: UnixMs, to: UnixMs) -> Option<(UnixMs, UnixMs)> {
+    let from_ms = from.as_u64();
+    let to_ms = to.as_u64();
+    if to_ms <= from_ms || to_ms - from_ms < MIN_SLICE_SPAN_MS {
+        return None;
+    }
+    let mid = from_ms + (to_ms - from_ms) / 2;
+    Some((UnixMs::new(mid), UnixMs::new(mid + 1)))
+}
+
+async fn fetch_intraday_page(
+    hub: &HttpHub<BinanceLimiter>,
+    ticker_info: TickerInfo,
+    from: UnixMs,
+    to: UnixMs,
+) -> Result<Vec<Trade>, AdapterError> {
+    let (symbol_str, market_type) = ticker_info.ticker.to_full_symbol_and_type();
+
+    let url = format!(
+        "{}?symbol={symbol_str}&limit=1000&startTime={}&endTime={}",
+        aggtrades_base_url(market_type),
+        from.as_u64(),
+        to.as_u64()
+    );
+
+    let de_trades: Vec<DeTrade> = hub
+        .http_json_with_limiter(&url, aggtrades_request_weight(market_type), None, None)
+        .await?;
+
+    Ok(map_de_trades(de_trades, ticker_info, market_type))
+}
+
+/// Fetch today's trades by fetching several time slices concurrently instead
+/// of walking a serial cursor one 1000-row page at a time. Slices whose page
+/// comes back full are split in half and requeued until either the data fits
+/// or the minimum span is reached.
+async fn fetch_intraday_trades_parallel(
+    hub: &HttpHub<BinanceLimiter>,
+    ticker_info: TickerInfo,
+    from: UnixMs,
+    to: UnixMs,
+) -> Result<Vec<Trade>, AdapterError> {
+    let mut merged: Vec<Trade> = Vec::new();
+    let mut pending: Vec<(UnixMs, UnixMs)> = vec![(from, to)];
+
+    while !pending.is_empty() {
+        let wave_len = pending.len().min(PARALLEL_SLICE_WAVE);
+        let wave: Vec<(UnixMs, UnixMs)> = pending.drain(..wave_len).collect();
+
+        let pages = futures::future::join_all(wave.iter().map(|(slice_from, slice_to)| {
+            fetch_intraday_page(hub, ticker_info, *slice_from, *slice_to)
+        }))
+        .await;
+
+        for ((slice_from, slice_to), page) in wave.into_iter().zip(pages) {
+            let trades = page?;
+            if trades.len() >= AGGTRADES_PAGE_LIMIT
+                && let Some((mid, next)) = split_intraday_slice(slice_from, slice_to)
+            {
+                // Full page â€” likely truncated. Requeue the halves rather
+                // than keeping a capped window.
+                pending.insert(0, (next, slice_to));
+                pending.insert(0, (slice_from, mid));
+                continue;
+            }
+            merged.extend(trades);
+        }
+    }
+
+    merged.sort_by_key(|trade| trade.time);
+    // Slice boundaries are disjoint, but guard against an exchange returning
+    // records outside its requested window.
+    merged.dedup_by(|a, b| a.time == b.time && a.price == b.price && a.qty == b.qty);
+    Ok(merged)
+}
+
+/// Intraday fetch used while paging forward into today. With a known upper
+/// bound the parallel slicer is used; without one the single-cursor page is
+/// returned so callers can keep advancing.
+async fn fetch_intraday_range(
+    hub: &mut HttpHub<BinanceLimiter>,
+    ticker_info: TickerInfo,
+    from: UnixMs,
+    to: Option<UnixMs>,
+) -> Result<Vec<Trade>, AdapterError> {
+    match to {
+        Some(to) if to >= from => fetch_intraday_trades_parallel(hub, ticker_info, from, to).await,
+        _ => fetch_intraday_trades(hub, ticker_info, from, None).await,
+    }
+}
+
+/// Hard cap per archive read. Busy BTCUSDT days are ~0.5â€“2M aggTrades; 500k
 /// truncated the session high/low used by Daily Delta. Still bounded so a
 /// pathological file cannot grow without limit.
 const MAX_ARCHIVE_TRADES_PER_FETCH: usize = 2_000_000;
@@ -645,7 +768,7 @@ async fn get_hist_trades_with_client(
     let missing_marker_path = base_path.join(format!("{zip_file_name}.missing"));
 
     if missing_marker_path.exists() {
-        // Re-check periodically — Binance often publishes yesterday's zip later.
+        // Re-check periodically â€” Binance often publishes yesterday's zip later.
         let marker_is_fresh = std::fs::metadata(&missing_marker_path)
             .ok()
             .and_then(|meta| meta.modified().ok())
@@ -796,7 +919,7 @@ pub(super) async fn fetch_trades(
 
     if from_time_ms >= today_midnight.timestamp_millis() {
         // Forward paging uses startTime; `to_time` is enforced by the caller.
-        return fetch_intraday_trades(hub, ticker_info, from_time, None).await;
+        return fetch_intraday_range(hub, ticker_info, from_time, to_time).await;
     }
 
     let mut cursor_time = from_time;
@@ -812,46 +935,124 @@ pub(super) async fn fetch_trades(
     // Binance REST aggTrades only covers ~2 recent days (`-4166` otherwise), so
     // a missing/exhausted archive must not fall through to REST for older days.
     // Return an empty page and let the caller stop; yesterday/today still REST.
+    //
+    // Archive days are downloaded in small concurrent windows; results are
+    // processed strictly in order, so paging semantics match a serial walk.
+    const ARCHIVE_PREFETCH_DAYS: usize = 4;
+
     while cursor_date < today_date {
         if to_time.is_some_and(|until| cursor_time > until) {
             return Ok(Vec::new());
         }
-        match get_hist_trades_with_client(
-            &client,
-            ticker_info,
-            cursor_date,
-            data_path.clone(),
-            cursor_time,
-            to_time,
-            MAX_ARCHIVE_TRADES_PER_FETCH,
-        )
-        .await
+
+        let mut window: Vec<(chrono::NaiveDate, UnixMs)> = Vec::new();
         {
-            Ok(batch) if !batch.is_empty() => {
-                return Ok(batch);
-            }
-            Ok(_) => {
-                // Archive day fully behind the cursor — advance to next midnight.
-            }
-            Err(e) => {
-                log::warn!("Historical trades archive unavailable for {cursor_date}: {e}");
-                if today_date.signed_duration_since(cursor_date).num_days() <= 2 {
-                    return fetch_intraday_trades(hub, ticker_info, cursor_time, None).await;
-                }
-                return Ok(Vec::new());
+            let mut probe_date = cursor_date;
+            let mut probe_time = cursor_time;
+            while probe_date < today_date
+                && window.len() < ARCHIVE_PREFETCH_DAYS
+                && to_time.is_none_or(|until| probe_time <= until)
+            {
+                window.push((probe_date, probe_time));
+                let Some(next_date) = probe_date.succ_opt() else {
+                    break;
+                };
+                let Some(next_midnight) = next_date.and_hms_opt(0, 0, 0) else {
+                    break;
+                };
+                probe_time = UnixMs::new(
+                    u64::try_from(next_midnight.and_utc().timestamp_millis()).unwrap_or(u64::MAX),
+                );
+                probe_date = next_date;
             }
         }
 
-        cursor_date = cursor_date
-            .checked_add_signed(chrono::Duration::days(1))
-            .ok_or_else(|| AdapterError::ParseError("Date overflow while paging trades".into()))?;
-        let next_midnight_ms = cursor_date
-            .and_hms_opt(0, 0, 0)
-            .ok_or_else(|| AdapterError::ParseError("Failed to construct day boundary".into()))?
-            .and_utc()
-            .timestamp_millis();
-        cursor_time = UnixMs::new(u64::try_from(next_midnight_ms).unwrap_or(u64::MAX));
+        let downloads = window.iter().map(|(window_date, window_from)| {
+            let client = client.clone();
+            let data_path = data_path.clone();
+            async move {
+                get_hist_trades_with_client(
+                    &client,
+                    ticker_info,
+                    *window_date,
+                    data_path,
+                    *window_from,
+                    to_time,
+                    MAX_ARCHIVE_TRADES_PER_FETCH,
+                )
+                .await
+            }
+        });
+        let results = futures::future::join_all(downloads).await;
+
+        for ((window_date, window_from), result) in window.into_iter().zip(results) {
+            match result {
+                Ok(batch) if !batch.is_empty() => {
+                    return Ok(batch);
+                }
+                Ok(_) => {
+                    // Archive day fully behind the cursor - advance to next midnight.
+                }
+                Err(e) => {
+                    log::warn!("Historical trades archive unavailable for {window_date}: {e}");
+                    if today_date.signed_duration_since(window_date).num_days() <= 2 {
+                        return fetch_intraday_range(hub, ticker_info, window_from, to_time).await;
+                    }
+                    return Ok(Vec::new());
+                }
+            }
+
+            cursor_date = window_date
+                .checked_add_signed(chrono::Duration::days(1))
+                .ok_or_else(|| {
+                    AdapterError::ParseError("Date overflow while paging trades".into())
+                })?;
+            let next_midnight_ms = cursor_date
+                .and_hms_opt(0, 0, 0)
+                .ok_or_else(|| AdapterError::ParseError("Failed to construct day boundary".into()))?
+                .and_utc()
+                .timestamp_millis();
+            cursor_time = UnixMs::new(u64::try_from(next_midnight_ms).unwrap_or(u64::MAX));
+        }
     }
 
-    fetch_intraday_trades(hub, ticker_info, cursor_time, None).await
+    fetch_intraday_range(hub, ticker_info, cursor_time, to_time).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slice_split_keeps_subranges_disjoint_and_covering() {
+        let from = UnixMs::new(1_000);
+        let to = UnixMs::new(9_000);
+        let (mid, next) = split_intraday_slice(from, to).expect("splittable range");
+
+        assert_eq!(mid.as_u64(), 5_000);
+        assert_eq!(next.as_u64(), 5_001);
+
+        // Left: [from, mid], right: [next, to] - no gap, no overlap.
+        assert!(mid >= from && next <= to);
+        assert_eq!(next.as_u64() - mid.as_u64(), 1);
+    }
+
+    #[test]
+    fn slices_below_minimum_span_are_never_split() {
+        let from = UnixMs::new(1_000);
+        let to = UnixMs::new(1_000 + MIN_SLICE_SPAN_MS - 1);
+
+        assert!(split_intraday_slice(from, to).is_none());
+        assert!(split_intraday_slice(to, from).is_none()); // inverted range
+    }
+
+    #[test]
+    fn minimum_span_slices_still_split_at_the_boundary() {
+        let from = UnixMs::new(0);
+        let to = UnixMs::new(MIN_SLICE_SPAN_MS);
+
+        let (mid, next) = split_intraday_slice(from, to).expect("exactly minimum span");
+        assert_eq!(mid.as_u64(), MIN_SLICE_SPAN_MS / 2);
+        assert_eq!(next.as_u64(), MIN_SLICE_SPAN_MS / 2 + 1);
+    }
 }

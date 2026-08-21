@@ -5,12 +5,9 @@ use super::{
 use crate::chart::indicator::kline::KlineIndicatorImpl;
 use crate::chart::indicator::kline::daily_delta::delta_history_colors;
 use crate::chart::indicator::kline::footprint_history::{
-    DAYS as FOOTPRINT_HISTORY_DAYS, missing_day_range, utc_day_ranges, utc_days_covering,
+    DAYS as FOOTPRINT_HISTORY_DAYS, day_start, missing_day_range, utc_day_ranges,
 };
-use crate::chart::indicator::kline::previous_value_area::{
-    required_lookback_days as previous_value_area_lookback_days,
-    trade_history_ranges as previous_value_area_ranges,
-};
+use crate::chart::indicator::kline::previous_value_area::value_area_history_earliest;
 use crate::connector::fetcher::{
     FetchRange, FetchSpec, ReqError, RequestHandler, TradeFetchMode, is_trade_fetch_enabled,
     trade_fetch_mode,
@@ -81,34 +78,14 @@ fn previous_value_area_price_step(
 
 type DayRange = (UnixMs, UnixMs);
 
-fn footprint_history_day_ranges(
-    cutoff: UnixMs,
-    recent_lookback_days: u64,
-    include_value_areas: bool,
-) -> (Vec<DayRange>, Vec<DayRange>) {
-    let recent = if recent_lookback_days > 0 {
-        utc_day_ranges(cutoff, recent_lookback_days)
-            .into_iter()
-            .rev()
-            .collect::<Vec<_>>()
-    } else {
-        Vec::new()
-    };
-    let mut seen_days = recent
-        .iter()
-        .map(|(start, _)| *start)
-        .collect::<FxHashSet<_>>();
-    let mut value_areas = Vec::new();
-    if include_value_areas {
-        for (start, end) in previous_value_area_ranges(cutoff) {
-            for range in utc_days_covering(start, end, 366).into_iter().rev() {
-                if seen_days.insert(range.0) {
-                    value_areas.push(range);
-                }
-            }
-        }
+fn footprint_history_day_ranges(cutoff: UnixMs, recent_lookback_days: u64) -> Vec<DayRange> {
+    if recent_lookback_days == 0 {
+        return Vec::new();
     }
-    (recent, value_areas)
+    utc_day_ranges(cutoff, recent_lookback_days)
+        .into_iter()
+        .rev()
+        .collect()
 }
 
 struct FootprintHistoryRuntime {
@@ -301,6 +278,12 @@ pub struct KlineChart {
     raw_trades: Vec<Trade>,
     /// Compact OHLC history used to seed Renko closes and TPO letters.
     tpo_klines: Box<KlineAggregator>,
+    /// Letter-timeframe OHLC history backing the Previous Value Areas overlay.
+    pva_klines: Box<KlineAggregator>,
+    /// Composite PVA bars changed since the last indicator sync.
+    pva_dirty: bool,
+    /// UTC day the PVA bar store was anchored at; re-anchored on rollover.
+    pva_anchor_day: u64,
     indicators: Box<EnumMap<KlineIndicator, Option<Box<dyn KlineIndicatorImpl>>>>,
     open_interest_sources: Vec<TickerInfo>,
     footprint_history: Box<FootprintHistoryRuntime>,
@@ -420,21 +403,8 @@ impl KlineChart {
                     if i.needs_trade_history() {
                         indi.configure_footprint_history(&[ticker_info], true);
                     }
-                    match i {
-                        KlineIndicator::DailyDelta => {
-                            indi.set_trade_history_lookback(visual_config.daily_delta_days);
-                        }
-                        KlineIndicator::PreviousValueArea => {
-                            indi.set_trade_history_lookback(previous_value_area_lookback_days(
-                                UnixMs::now(),
-                            ));
-                            indi.set_trade_history_price_step(previous_value_area_price_step(
-                                &[ticker_info],
-                                step,
-                                visual_config.previous_value_area_ticks,
-                            ));
-                        }
-                        _ => {}
+                    if i == KlineIndicator::DailyDelta {
+                        indi.set_trade_history_lookback(visual_config.daily_delta_days);
                     }
                     indi.rebuild_from_source(&data_source);
                     indicators[i] = Some(indi);
@@ -443,6 +413,9 @@ impl KlineChart {
                 KlineChart {
                     chart,
                     tpo_klines: Box::new(KlineAggregator::new(&feed)),
+                    pva_klines: Box::new(KlineAggregator::new(&feed)),
+                    pva_dirty: false,
+                    pva_anchor_day: day_start(UnixMs::now()),
                     feed: Box::new(feed),
                     visual_config,
                     data_source,
@@ -530,21 +503,8 @@ impl KlineChart {
                     if i.needs_trade_history() {
                         indi.configure_footprint_history(&[ticker_info], true);
                     }
-                    match i {
-                        KlineIndicator::DailyDelta => {
-                            indi.set_trade_history_lookback(visual_config.daily_delta_days);
-                        }
-                        KlineIndicator::PreviousValueArea => {
-                            indi.set_trade_history_lookback(previous_value_area_lookback_days(
-                                UnixMs::now(),
-                            ));
-                            indi.set_trade_history_price_step(previous_value_area_price_step(
-                                &[ticker_info],
-                                step,
-                                visual_config.previous_value_area_ticks,
-                            ));
-                        }
-                        _ => {}
+                    if i == KlineIndicator::DailyDelta {
+                        indi.set_trade_history_lookback(visual_config.daily_delta_days);
                     }
                     indi.rebuild_from_source(&data_source);
                     indicators[i] = Some(indi);
@@ -552,6 +512,9 @@ impl KlineChart {
 
                 KlineChart {
                     chart,
+                    pva_klines: Box::new(KlineAggregator::new(&feed)),
+                    pva_dirty: false,
+                    pva_anchor_day: day_start(UnixMs::now()),
                     feed: Box::new(feed),
                     visual_config,
                     data_source,
@@ -575,9 +538,16 @@ impl KlineChart {
         let existing = self.tpo_klines.composite_klines();
         let mut tpo_klines = KlineAggregator::new(&feed);
         tpo_klines.insert(feed.primary(), &existing);
+        // Letter-timeframe bars stay valid across feed swaps; the aggregator
+        // only re-scopes which sources it accepts.
+        let existing_pva = self.pva_klines.composite_klines();
+        let mut pva_klines = KlineAggregator::new(&feed);
+        pva_klines.insert(feed.primary(), &existing_pva);
         self.chart.ticker_info = feed.primary();
         *self.feed = feed;
         *self.tpo_klines = tpo_klines;
+        *self.pva_klines = pva_klines;
+        self.pva_dirty = true;
     }
 
     pub fn feed(&self) -> &ResolvedFeed {
@@ -696,24 +666,12 @@ impl KlineChart {
         }
         self.footprint_history.sources = sources;
         self.footprint_history.aggregate = aggregate;
-        let value_area_step = previous_value_area_price_step(
-            &self.footprint_history.sources,
-            self.chart.tick_size,
-            self.visual_config.previous_value_area_ticks,
-        );
-        for kind in [
-            KlineIndicator::FootprintHistory,
-            KlineIndicator::DailyDelta,
-            KlineIndicator::PreviousValueArea,
-        ] {
+        for kind in [KlineIndicator::FootprintHistory, KlineIndicator::DailyDelta] {
             if let Some(indicator) = self.indicators[kind].as_mut() {
                 indicator.configure_footprint_history(
                     &self.footprint_history.sources,
                     self.footprint_history.aggregate,
                 );
-                if kind == KlineIndicator::PreviousValueArea {
-                    indicator.set_trade_history_price_step(value_area_step);
-                }
             }
         }
         // Clear the rendered overlay now, but let the dashboard's next tick
@@ -725,15 +683,10 @@ impl KlineChart {
     fn uses_trade_history(&self) -> bool {
         self.indicators[KlineIndicator::FootprintHistory].is_some()
             || self.indicators[KlineIndicator::DailyDelta].is_some()
-            || self.indicators[KlineIndicator::PreviousValueArea].is_some()
     }
 
     fn for_each_trade_history(&mut self, mut f: impl FnMut(&mut dyn KlineIndicatorImpl)) {
-        for kind in [
-            KlineIndicator::FootprintHistory,
-            KlineIndicator::DailyDelta,
-            KlineIndicator::PreviousValueArea,
-        ] {
+        for kind in [KlineIndicator::FootprintHistory, KlineIndicator::DailyDelta] {
             if let Some(indicator) = self.indicators[kind].as_mut() {
                 f(indicator.as_mut());
             }
@@ -834,11 +787,7 @@ impl KlineChart {
             (Some(days), None) | (None, Some(days)) => days,
             (None, None) => 0,
         };
-        let (recent_day_ranges, value_area_day_ranges) = footprint_history_day_ranges(
-            cutoff,
-            recent_lookback_days,
-            self.indicators[KlineIndicator::PreviousValueArea].is_some(),
-        );
+        let recent_day_ranges = footprint_history_day_ranges(cutoff, recent_lookback_days);
         let from = recent_day_ranges
             .last()
             .map(|(start, _)| *start)
@@ -865,12 +814,8 @@ impl KlineChart {
                     indicator.prepare_footprint_history(source, cutoff);
                 });
                 // Keep one UTC-day backfill active per venue. Venues still fetch
-                // in parallel, while each venue fills recent profiles before the
-                // much longer Previous Value Areas history. A terminal no-data
-                // result must not pin the scheduler to that day forever: skip it
-                // and keep scanning, while period-completeness tracking still
-                // prevents partial value areas from being rendered.
-                for (start, end) in recent_day_ranges.iter().chain(value_area_day_ranges.iter()) {
+                // in parallel, while each venue fills recent profiles first.
+                for (start, end) in recent_day_ranges.iter() {
                     let cached_through = self.load_cached_footprint_day(source, *start);
                     let Some((fetch_start, fetch_end)) =
                         missing_day_range(*start, *end, cached_through)
@@ -937,6 +882,11 @@ impl KlineChart {
             PlotData::TickBased(_) => true,
         };
         if can_fetch_footprint_history && let Some(action) = self.fetch_footprint_history() {
+            return Some(action);
+        }
+
+        // Previous Value Areas letter-timeframe bar seeding.
+        if let Some(action) = self.fetch_pva_seed_klines() {
             return Some(action);
         }
 
@@ -1152,6 +1102,139 @@ impl KlineChart {
         None
     }
 
+    /// Page letter-timeframe OHLC bars for the Previous Value Areas overlay.
+    ///
+    /// Mirrors the TPO seeding loop: one backward page per tick per source
+    /// until the earliest required period is covered, plus a top-up fetch when
+    /// time has moved past the newest stored bar (UTC-day rollover).
+    fn fetch_pva_seed_klines(&mut self) -> Option<Action> {
+        self.indicators[KlineIndicator::PreviousValueArea].as_ref()?;
+        let config = self.visual_config.previous_value_area_tpo_config();
+        let letter_tf = config.letter_timeframe();
+        let now = UnixMs::now();
+
+        // Re-anchor once per UTC day so completed periods keep tracking `now`.
+        let today = day_start(now);
+        if today != self.pva_anchor_day {
+            self.pva_anchor_day = today;
+            self.request_handler
+                .drop_requests_for_stream(StreamKind::Kline {
+                    ticker_info: self.feed.primary(),
+                    timeframe: letter_tf,
+                });
+            for source in self.feed.sources().iter().copied() {
+                self.request_handler
+                    .drop_requests_for_stream(StreamKind::Kline {
+                        ticker_info: source,
+                        timeframe: letter_tf,
+                    });
+            }
+        }
+
+        let need_earliest = value_area_history_earliest(config, now);
+        let page_ms = letter_tf.to_milliseconds().saturating_mul(1_000);
+
+        for source in self.feed.sources().iter().copied() {
+            match self.pva_klines.latest(source) {
+                Some(latest) if latest.as_u64().saturating_add(page_ms) > now.as_u64() => {
+                    // Newest bar is fresh; only older pages may be missing.
+                }
+                latest => {
+                    // Top-up (or first page) ending at the newest missing bar.
+                    let page_end = latest
+                        .map(|time| time.saturating_add(1))
+                        .unwrap_or(now)
+                        .min(now);
+                    if page_end <= need_earliest {
+                        continue;
+                    }
+                    let page_start = page_end.saturating_sub(page_ms).max(need_earliest);
+                    let range = FetchRange::Kline(page_start, page_end);
+                    let stream = StreamKind::Kline {
+                        ticker_info: source,
+                        timeframe: letter_tf,
+                    };
+                    if let Some(action) =
+                        request_fetch_with_stream(&mut self.request_handler, range, Some(stream))
+                    {
+                        return Some(action);
+                    }
+                }
+            }
+
+            if !self.pva_klines.source_is_complete(source, need_earliest) {
+                // Backward paging toward the previous year's start.
+                let page_end = self
+                    .pva_klines
+                    .earliest(source)
+                    .map(|time| time.saturating_sub(1))
+                    .unwrap_or(now);
+                if page_end <= need_earliest {
+                    continue;
+                }
+                let page_start = page_end.saturating_sub(page_ms).max(need_earliest);
+                let range = FetchRange::Kline(page_start, page_end);
+                let stream = StreamKind::Kline {
+                    ticker_info: source,
+                    timeframe: letter_tf,
+                };
+                if let Some(action) =
+                    request_fetch_with_stream(&mut self.request_handler, range, Some(stream))
+                {
+                    return Some(action);
+                }
+            }
+        }
+
+        None
+    }
+
+    /// True when historical klines on `timeframe` feed the PVA bar store.
+    pub fn accepts_pva_seed_klines(&self, timeframe: Timeframe) -> bool {
+        self.indicators[KlineIndicator::PreviousValueArea].is_some()
+            && timeframe
+                == self
+                    .visual_config
+                    .previous_value_area_tpo_config()
+                    .letter_timeframe()
+    }
+
+    /// Route fetched letter-timeframe bars into the PVA bar store.
+    pub fn insert_pva_seed_klines(
+        &mut self,
+        req_id: uuid::Uuid,
+        source: TickerInfo,
+        klines_raw: &[Kline],
+    ) {
+        if klines_raw.is_empty() {
+            self.request_handler.mark_no_data(req_id);
+            self.pva_klines.mark_exhausted(source);
+        } else {
+            self.request_handler.mark_completed(req_id);
+            self.pva_klines.insert(source, klines_raw);
+            self.pva_dirty = true;
+        }
+        self.invalidate(None);
+    }
+
+    /// Push composite PVA bars into the indicator and refresh its caches.
+    ///
+    /// Called from the periodic tick; cheap unless bars changed or a period
+    /// boundary rolled over.
+    fn sync_previous_value_areas(&mut self) {
+        if self.indicators[KlineIndicator::PreviousValueArea].is_none() {
+            return;
+        }
+        let config = self.visual_config.previous_value_area_tpo_config();
+        let row_step = config.row_step(self.chart.tick_size);
+        let now = UnixMs::now();
+        let dirty = std::mem::take(&mut self.pva_dirty);
+        let bars = dirty.then(|| self.pva_klines.composite_klines());
+        if let Some(indicator) = self.indicators[KlineIndicator::PreviousValueArea].as_mut() {
+            indicator.sync_value_areas(bars.as_deref(), config, row_step, now);
+        }
+    }
+
     pub fn reset_request_handler(&mut self) {
         self.request_handler.drop_non_footprint_history();
         self.fetching_trades = (false, None);
@@ -1183,19 +1266,14 @@ impl KlineChart {
 
     /// Mark a fetch request as failed to unblock re-fetches of the same range.
     pub fn mark_fetch_failed(&mut self, req_id: uuid::Uuid) {
-        if self
-            .footprint_history
-            .trade_requests
-            .remove(&req_id)
-            .is_some()
-            || self.footprint_history.oi_requests.remove(&req_id)
-        {
-            // A bounded Footprint History snapshot must not retry forever in
-            // the background. Keep generic chart gap fetches retryable.
-            self.request_handler.mark_completed(req_id);
-        } else {
-            self.request_handler.mark_failed(req_id);
-        }
+        self.footprint_history.trade_requests.remove(&req_id);
+        self.footprint_history.oi_requests.remove(&req_id);
+        // Retry after the handler's cooldown instead of pretending the
+        // snapshot completed: a transient failure (rate-limit burst, network
+        // blip) must not permanently hole a UTC-day profile. RequestHandler
+        // bounds total attempts, so a permanently broken range still cannot
+        // retry forever.
+        self.request_handler.mark_failed(req_id);
     }
 
     /// Mark a fetch request as having no data. The source confirmed the
@@ -1276,8 +1354,24 @@ impl KlineChart {
     pub fn set_visual_config(&mut self, visual_config: Config) {
         let lookback_changed =
             self.visual_config.daily_delta_days != visual_config.daily_delta_days;
-        let value_area_step_changed =
-            self.visual_config.previous_value_area_ticks != visual_config.previous_value_area_ticks;
+        let letter_tf_changed = self
+            .visual_config
+            .previous_value_area_tpo_config()
+            .letter_timeframe()
+            != visual_config
+                .previous_value_area_tpo_config()
+                .letter_timeframe();
+        let pva_config_changed = letter_tf_changed
+            || self.visual_config.previous_value_area_ticks
+                != visual_config.previous_value_area_ticks
+            || self.visual_config.previous_value_area_block_size
+                != visual_config.previous_value_area_block_size
+            || self
+                .visual_config
+                .previous_value_area_session_start_minutes_utc
+                != visual_config.previous_value_area_session_start_minutes_utc
+            || self.visual_config.previous_value_area_value_area_percent
+                != visual_config.previous_value_area_value_area_percent;
         let liquidity_filter_changed = self
             .visual_config
             .liquidity_heatmap_order_size_filter
@@ -1292,25 +1386,17 @@ impl KlineChart {
             self.for_each_trade_history(|indicator| {
                 indicator.reset_trade_history_backfill();
             });
-        } else if value_area_step_changed {
+        } else if pva_config_changed {
+            // Letter-timeframe changes invalidate every stored bar; other knob
+            // changes only need a rebuild from the existing bars.
             self.request_handler = RequestHandler::default();
-            self.footprint_history.cutoff = None;
-            self.footprint_history.trade_requests.clear();
-            self.footprint_history.fetch_handles.clear();
-            if let Some(indicator) = self.indicators[KlineIndicator::PreviousValueArea].as_mut() {
-                indicator.reset_trade_history_backfill();
+            if letter_tf_changed {
+                *self.pva_klines = KlineAggregator::new(&self.feed);
             }
+            self.pva_dirty = true;
         }
         if let Some(indicator) = self.indicators[KlineIndicator::DailyDelta].as_mut() {
             indicator.set_trade_history_lookback(self.visual_config.daily_delta_days);
-        }
-        let value_area_step = previous_value_area_price_step(
-            self.active_footprint_history_sources(),
-            self.chart.tick_size,
-            self.visual_config.previous_value_area_ticks,
-        );
-        if let Some(indicator) = self.indicators[KlineIndicator::PreviousValueArea].as_mut() {
-            indicator.set_trade_history_price_step(value_area_step);
         }
         if liquidity_filter_changed && let Some(runtime) = self.footprint_history.liquidity.as_mut()
         {
@@ -2109,6 +2195,7 @@ impl KlineChart {
 
         if let Some(t) = now {
             self.last_tick = t;
+            self.sync_previous_value_areas();
             // A newly-enabled GPU overlay has no palette until the dashboard
             // services RequestPalette. Give that one-time request priority so
             // ongoing history fetches cannot leave the overlay permanently blank.
@@ -2151,22 +2238,12 @@ impl KlineChart {
                     &self.footprint_history.sources,
                     self.footprint_history.aggregate,
                 );
-                match indicator {
-                    KlineIndicator::DailyDelta => {
-                        box_indi.set_trade_history_lookback(self.visual_config.daily_delta_days);
-                    }
-                    KlineIndicator::PreviousValueArea => {
-                        box_indi.set_trade_history_lookback(previous_value_area_lookback_days(
-                            UnixMs::now(),
-                        ));
-                        box_indi.set_trade_history_price_step(previous_value_area_price_step(
-                            self.active_footprint_history_sources(),
-                            self.chart.tick_size,
-                            self.visual_config.previous_value_area_ticks,
-                        ));
-                    }
-                    _ => {}
+                if indicator == KlineIndicator::DailyDelta {
+                    box_indi.set_trade_history_lookback(self.visual_config.daily_delta_days);
                 }
+            }
+            if indicator == KlineIndicator::PreviousValueArea {
+                self.pva_dirty = true;
             }
             box_indi.rebuild_from_source(&self.data_source);
             self.indicators[indicator] = Some(box_indi);
@@ -4295,22 +4372,6 @@ mod tests {
             TickMultiplier(1500).multiply_step(step).to_ui_string(),
             "150"
         );
-    }
-
-    #[test]
-    fn recent_profiles_are_prioritized_ahead_of_value_area_history() {
-        let cutoff = UnixMs::now();
-        let today = crate::chart::indicator::kline::footprint_history::day_start(cutoff);
-        let (recent, value_areas) = footprint_history_day_ranges(cutoff, 5, true);
-
-        assert_eq!(recent.len(), 5);
-        assert_eq!(recent[0].0.as_u64(), today);
-        assert_eq!(
-            recent[4].0.as_u64(),
-            today - 4 * crate::chart::indicator::kline::footprint_history::DAY_MS
-        );
-        assert!(!value_areas.is_empty());
-        assert!(value_areas.iter().all(|range| !recent.contains(range)));
     }
 
     #[test]

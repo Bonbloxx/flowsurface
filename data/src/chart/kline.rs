@@ -544,14 +544,37 @@ pub struct Config {
     pub daily_delta_ticks: u16,
     /// How many UTC days of Daily Delta history to keep and fetch, including today.
     pub daily_delta_days: u16,
-    /// Previous-period volume-profile grouping in exchange min-ticks.
+    /// Previous-period value-area row grouping in exchange min-ticks.
+    ///
+    /// Previous Value Areas builds its profiles with the same TPO machinery
+    /// (`data::chart::tpo`), so this is the TPO "ticks per row" knob.
     pub previous_value_area_ticks: u16,
+    /// Previous Value Areas letter/block size (TPO block size).
+    pub previous_value_area_block_size: super::tpo::BlockSize,
+    /// UTC minute-of-day anchoring Previous Value Areas day/week periods.
+    pub previous_value_area_session_start_minutes_utc: u16,
+    /// Previous Value Areas value-area coverage percent.
+    pub previous_value_area_value_area_percent: u8,
     /// Minimum displayed liquidity order size in quote currency (USD for USDT/USDC markets).
     pub liquidity_heatmap_order_size_filter: f32,
 }
 
 impl Config {
     pub const DAILY_DELTA_DAY_PRESETS: [u16; 7] = [1, 2, 3, 4, 5, 7, 14];
+
+    /// TPO config used to build Previous Value Areas profiles.
+    ///
+    /// Reuses the exact market-profile machinery behind the TPO chart so both
+    /// surfaces agree on VAH/VAL/POC when the knobs match.
+    pub fn previous_value_area_tpo_config(&self) -> super::tpo::Config {
+        super::tpo::Config {
+            ticks_per_row: u32::from(self.previous_value_area_ticks.max(1)),
+            block_size: self.previous_value_area_block_size,
+            session_start_minutes_utc: self.previous_value_area_session_start_minutes_utc,
+            value_area_percent: self.previous_value_area_value_area_percent,
+            ..super::tpo::Config::default()
+        }
+    }
     pub const DAILY_DELTA_TICK_PRESETS: [TickMultiplier; 12] = [
         TickMultiplier(1),
         TickMultiplier(2),
@@ -577,6 +600,9 @@ impl Default for Config {
             daily_delta_ticks: 10,
             daily_delta_days: 4,
             previous_value_area_ticks: 10,
+            previous_value_area_block_size: super::tpo::BlockSize::default(),
+            previous_value_area_session_start_minutes_utc: 0,
+            previous_value_area_value_area_percent: 70,
             liquidity_heatmap_order_size_filter: 0.0,
         }
     }

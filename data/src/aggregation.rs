@@ -487,6 +487,12 @@ impl KlineAggregator {
             .and_then(|bars| bars.first_key_value().map(|(time, _)| *time))
     }
 
+    pub fn latest(&self, source: TickerInfo) -> Option<exchange::UnixMs> {
+        self.bars
+            .get(&source)
+            .and_then(|bars| bars.last_key_value().map(|(time, _)| *time))
+    }
+
     pub fn source_is_complete(&self, source: TickerInfo, need_earliest: exchange::UnixMs) -> bool {
         self.exhausted.contains(&source)
             || self

@@ -164,10 +164,12 @@ impl FootprintHistory {
     pub fn mark_fetch_failed(&mut self, req_id: uuid::Uuid) {
         self.trade_requests.remove(&req_id);
         self.oi_requests.remove(&req_id);
-        // Footprint history is a bounded snapshot. Do not turn a source error
-        // into an invisible 30-second retry loop; a later explicit
-        // reconfiguration or chart recreation can request it again.
-        self.request_handler.mark_completed(req_id);
+        // Retry via the handler's cooldown instead of pretending the day
+        // completed: a transient failure (rate-limit burst, network blip)
+        // must not permanently hole a UTC-day profile. The handler gives up
+        // after its bounded attempt count, so a permanently broken range
+        // cannot loop forever.
+        self.request_handler.mark_failed(req_id);
     }
 
     pub fn mark_fetch_no_data(&mut self, req_id: uuid::Uuid) {

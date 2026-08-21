@@ -80,7 +80,9 @@ where
             let specs: HashMap<window::Id, WindowSpec> = results
                 .into_iter()
                 .filter_map(|(id, (pos, size))| {
-                    pos.map(|position| (id, WindowSpec::from((&position, &size))))
+                    pos.map(|position| WindowSpec::from((&position, &size)))
+                        .filter(WindowSpec::has_restorable_position)
+                        .map(|spec| (id, spec))
                 })
                 .collect();
 

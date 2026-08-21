@@ -857,6 +857,9 @@ mod tests {
             daily_delta_ticks: 10,
             daily_delta_days: 5,
             previous_value_area_ticks: 10,
+            previous_value_area_block_size: BlockSize::default(),
+            previous_value_area_session_start_minutes_utc: 0,
+            previous_value_area_value_area_percent: 70,
             liquidity_heatmap_order_size_filter: 125_000.0,
         };
 

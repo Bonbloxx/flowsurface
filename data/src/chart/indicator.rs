@@ -63,10 +63,7 @@ impl KlineIndicator {
 
     /// Needs the shared multi-venue daily trade history pipeline.
     pub fn needs_trade_history(self) -> bool {
-        matches!(
-            self,
-            Self::FootprintHistory | Self::DailyDelta | Self::PreviousValueArea
-        )
+        matches!(self, Self::FootprintHistory | Self::DailyDelta)
     }
 }
 

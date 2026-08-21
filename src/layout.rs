@@ -35,10 +35,14 @@ pub struct SavedState {
 
 impl SavedState {
     pub fn window(&self) -> (iced::window::Position, iced::Size) {
-        let position = self.main_window.map(|w| w.position()).map_or(
-            iced::window::Position::Centered,
-            iced::window::Position::Specific,
-        );
+        let position = self
+            .main_window
+            .filter(WindowSpec::has_restorable_position)
+            .map(|w| w.position())
+            .map_or(
+                iced::window::Position::Centered,
+                iced::window::Position::Specific,
+            );
         let size = self
             .main_window
             .map_or_else(crate::window::default_size, |w| w.size());

@@ -430,7 +430,7 @@ async fn fetch_recent_trades(
 }
 
 async fn fetch_archive_trades(
-    hub: &mut HttpHub<BybitLimiter>,
+    client: &reqwest::Client,
     ticker_info: TickerInfo,
     date: chrono::NaiveDate,
     from_time: UnixMs,
@@ -467,8 +467,7 @@ async fn fetch_archive_trades(
     if !archive_path.exists() {
         let url = format!("https://public.bybit.com/trading/{symbol}/{filename}");
         log::info!("Downloading Bybit trade archive from {url}");
-        let response = hub
-            .client()
+        let response = client
             .get(&url)
             .header(
                 reqwest::header::USER_AGENT,
@@ -551,6 +550,11 @@ pub(super) async fn fetch_trades(
     to_time: Option<UnixMs>,
     data_path: Option<PathBuf>,
 ) -> Result<Vec<Trade>, AdapterError> {
+    /// Archive days to download concurrently. Results are processed strictly
+    /// in order, so paging semantics match a serial walk — the wall-clock win
+    /// comes from overlapping the ~seconds-long archive downloads.
+    const ARCHIVE_PREFETCH_DAYS: usize = 4;
+
     let from_ms = i64::try_from(from_time.as_u64())
         .map_err(|_| AdapterError::InvalidRequest("Timestamp exceeds i64 range".into()))?;
     let mut date = chrono::DateTime::from_timestamp_millis(from_ms)
@@ -572,24 +576,67 @@ pub(super) async fn fetch_trades(
             return fetch_recent_trades(hub, ticker_info, cursor, to_time).await;
         }
 
-        let trades =
-            fetch_archive_trades(hub, ticker_info, date, cursor, to_time, data_path.clone())
-                .await?;
-        if !trades.is_empty() {
-            return Ok(trades);
+        let mut window: Vec<(chrono::NaiveDate, UnixMs)> = Vec::new();
+        {
+            let mut probe_date = date;
+            let mut probe_cursor = cursor;
+            while probe_date < today
+                && probe_date <= end_date
+                && window.len() < ARCHIVE_PREFETCH_DAYS
+            {
+                window.push((probe_date, probe_cursor));
+                let Some(next_date) = probe_date.succ_opt() else {
+                    break;
+                };
+                let Some(next_midnight) = next_date.and_hms_opt(0, 0, 0) else {
+                    break;
+                };
+                let next_ms = next_midnight.and_utc().timestamp_millis();
+                probe_cursor = UnixMs::new(u64::try_from(next_ms).map_err(|_| {
+                    AdapterError::InvalidRequest(
+                        "Bybit archive timestamp is before Unix epoch".into(),
+                    )
+                })?);
+                probe_date = next_date;
+            }
         }
 
-        let Some(next_date) = date.succ_opt() else {
-            break;
-        };
-        date = next_date;
-        let Some(next_midnight) = date.and_hms_opt(0, 0, 0) else {
-            break;
-        };
-        let next_ms = next_midnight.and_utc().timestamp_millis();
-        cursor = UnixMs::new(u64::try_from(next_ms).map_err(|_| {
-            AdapterError::InvalidRequest("Bybit archive timestamp is before Unix epoch".into())
-        })?);
+        let client = hub.client().clone();
+        let downloads = window.iter().map(|(window_date, window_from)| {
+            let client = client.clone();
+            let data_path = data_path.clone();
+            async move {
+                fetch_archive_trades(
+                    &client,
+                    ticker_info,
+                    *window_date,
+                    *window_from,
+                    to_time,
+                    data_path,
+                )
+                .await
+            }
+        });
+        let results = futures::future::join_all(downloads).await;
+
+        for ((window_date, _), result) in window.into_iter().zip(results) {
+            let trades = result?;
+            if !trades.is_empty() {
+                return Ok(trades);
+            }
+
+            let Some(next_date) = window_date.succ_opt() else {
+                return Ok(Vec::new());
+            };
+            let Some(next_midnight) = next_date.and_hms_opt(0, 0, 0) else {
+                return Ok(Vec::new());
+            };
+            let next_ms = next_midnight.and_utc().timestamp_millis();
+            date = next_date;
+            cursor = UnixMs::new(u64::try_from(next_ms).map_err(|_| {
+                AdapterError::InvalidRequest("Bybit archive timestamp is before Unix epoch".into())
+            })?);
+        }
     }
 
     Ok(Vec::new())

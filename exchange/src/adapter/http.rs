@@ -10,6 +10,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Duration;
 
 type ResponseTx<T> = oneshot::Sender<Result<T, AdapterError>>;
 
@@ -52,20 +53,29 @@ pub(super) enum FetchCommand<M> {
 
 pub(super) struct HttpHub<L> {
     client: Client,
-    limiter: L,
+    /// Shared behind a mutex so several in-flight requests (for example
+    /// parallel trade pages) can pace against one rate budget. Locks are
+    /// only held across synchronous limiter updates, never across awaits.
+    limiter: std::sync::Mutex<L>,
 }
 
 impl<L: RateLimiter> HttpHub<L> {
     pub(super) fn with_client(client: Client, limiter: L) -> Self {
-        Self { client, limiter }
+        Self {
+            client,
+            limiter: std::sync::Mutex::new(limiter),
+        }
     }
 
     pub(super) fn client(&self) -> &Client {
         &self.client
     }
 
-    pub(super) fn limiter_mut(&mut self) -> &mut L {
-        &mut self.limiter
+    fn lock_limiter(limiter: &std::sync::Mutex<L>) -> std::sync::MutexGuard<'_, L> {
+        match limiter.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
     }
 
     /// Lowest-level HTTP layer.
@@ -73,43 +83,84 @@ impl<L: RateLimiter> HttpHub<L> {
     /// Applies limiter pre-wait, performs the request, updates limiter state from
     /// the response, and returns the raw response for callers that need custom
     /// decoding/parsing logic.
+    ///
+    /// Rate-limit rejections (429/418) are retried with server-provided
+    /// backoff instead of failing the whole fetch — bursts that slip past the
+    /// local limiter must not surface as UI errors.
     pub(super) async fn http_response_with_limiter(
-        &mut self,
+        &self,
         url: &str,
         weight: usize,
         method: Method,
         json_body: Option<&serde_json::Value>,
     ) -> Result<Response, AdapterError> {
+        const MAX_RATE_LIMIT_RETRIES: u32 = 3;
         let request_method = method.clone();
 
-        {
-            let limiter = self.limiter_mut();
-            if let Some(wait_time) = limiter.prepare_request(weight) {
+        let mut attempt: u32 = 0;
+        loop {
+            let wait_time = {
+                let mut limiter = Self::lock_limiter(&self.limiter);
+                limiter.prepare_request(weight)
+            };
+            if let Some(wait_time) = wait_time {
                 log::warn!("Rate limit hit for: {url}. Waiting for {:?}", wait_time);
                 tokio::time::sleep(wait_time).await;
             }
-        }
 
-        let response = Self::send_request_client(self.client(), method, url, json_body)
-            .await
-            .map_err(|error| AdapterError::request_failed(&request_method, url, error))?;
+            let response = Self::send_request_client(self.client(), method.clone(), url, json_body)
+                .await
+                .map_err(|error| AdapterError::request_failed(&request_method, url, error))?;
 
-        {
-            let limiter = self.limiter_mut();
-            if limiter.should_exit_on_response(&response) {
+            let rate_limited = {
+                let limiter = Self::lock_limiter(&self.limiter);
+                limiter.should_exit_on_response(&response)
+            };
+
+            if rate_limited && attempt < MAX_RATE_LIMIT_RETRIES {
+                attempt += 1;
                 let status = response.status();
-                let msg = format!(
-                    "HTTP error {} for: {}. Handle limiter exit status reached.",
-                    status, url
+                let retry_after = Self::retry_after_duration(&response, attempt);
+                log::warn!(
+                    "Rate limited ({status}) for: {url}. Retry {attempt}/{} in {retry_after:?}",
+                    MAX_RATE_LIMIT_RETRIES
                 );
-                log::error!("{}", msg);
-                return Err(AdapterError::http_status_failed(status, msg));
+                tokio::time::sleep(retry_after).await;
+                continue;
             }
 
-            limiter.update_from_response(&response, weight);
+            {
+                let mut limiter = Self::lock_limiter(&self.limiter);
+                if limiter.should_exit_on_response(&response) {
+                    let status = response.status();
+                    let msg = format!(
+                        "HTTP error {} for: {}. Handle limiter exit status reached.",
+                        status, url
+                    );
+                    log::error!("{}", msg);
+                    return Err(AdapterError::http_status_failed(status, msg));
+                }
+
+                limiter.update_from_response(&response, weight);
+            }
+
+            return Ok(response);
+        }
+    }
+
+    /// Backoff for a rate-limited response. Prefers the server's `Retry-After`
+    /// header (seconds form); falls back to exponential backoff.
+    fn retry_after_duration(response: &Response, attempt: u32) -> Duration {
+        if let Some(seconds) = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.trim().parse::<u64>().ok())
+        {
+            return Duration::from_secs(seconds.saturating_add(1));
         }
 
-        Ok(response)
+        Duration::from_secs(2u64.saturating_pow(attempt).min(60))
     }
 
     /// Text-response layer.
@@ -117,7 +168,7 @@ impl<L: RateLimiter> HttpHub<L> {
     /// Builds on `http_response_with_limiter`, decodes the response body into UTF-8
     /// text, and emits enriched HTTP/status diagnostics on failure.
     pub(super) async fn http_text_with_limiter(
-        &mut self,
+        &self,
         url: &str,
         weight: usize,
         method: Option<Method>,
@@ -137,7 +188,7 @@ impl<L: RateLimiter> HttpHub<L> {
     /// Builds on `http_text_with_limiter`, validates response shape, and
     /// deserializes JSON into the target type with parse diagnostics.
     pub(super) async fn http_json_with_limiter<V>(
-        &mut self,
+        &self,
         url: &str,
         weight: usize,
         method: Option<Method>,

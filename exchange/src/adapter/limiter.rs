@@ -30,18 +30,19 @@ impl FixedWindowBucket {
         }
     }
 
-    fn refill(&mut self) {
-        if let Ok(current_time) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-        {
-            let now = Instant::now();
-            let period_seconds = self.refill_rate.as_secs();
-            let seconds_in_current_period = current_time.as_secs() % period_seconds;
+    fn tokens_per_second(&self) -> f64 {
+        self.max_tokens as f64 / self.refill_rate.as_secs_f64().max(1e-6)
+    }
 
-            let elapsed = now.duration_since(self.last_refill);
-            if elapsed >= self.refill_rate || seconds_in_current_period < 1 {
-                self.available_tokens = self.max_tokens;
-                self.last_refill = now;
-            }
+    /// Continuously replenish tokens based on elapsed time instead of
+    /// resetting the whole window at once. This keeps pacing smooth and lets
+    /// wait estimates be proportional to the actual deficit.
+    fn refill(&mut self) {
+        let elapsed = Instant::now().duration_since(self.last_refill);
+        let gained = (elapsed.as_secs_f64() * self.tokens_per_second()) as usize;
+        if gained > 0 {
+            self.available_tokens = (self.available_tokens + gained).min(self.max_tokens);
+            self.last_refill = Instant::now();
         }
     }
 
@@ -53,10 +54,11 @@ impl FixedWindowBucket {
             return None;
         }
 
-        let wait_time = self
-            .refill_rate
-            .saturating_sub(Instant::now().duration_since(self.last_refill));
-        Some(wait_time)
+        // Estimate how long the deficit takes to replenish, plus a small
+        // safety margin, rather than sleeping until the next full reset.
+        let deficit = (tokens - self.available_tokens) as f64;
+        let wait_secs = (deficit / self.tokens_per_second()) * 1.05 + 0.05;
+        Some(Duration::from_secs_f64(wait_secs))
     }
 
     pub fn consume_tokens(&mut self, tokens: usize) {
@@ -118,22 +120,29 @@ impl DynamicBucket {
         &self,
         weight: usize,
     ) -> (Option<Duration>, Option<DynamicLimitReason>) {
-        let available = self.max_weight.saturating_sub(self.current_used_weight);
+        // The server reports cumulative used weight for the current window.
+        // Assume it decays linearly since the last header update, but only
+        // credit half of the theoretical decay: exchange windows are aligned
+        // rather than continuously sliding, so optimistic decay assumptions
+        // overshoot into real 429s when several fetches run concurrently.
+        let period_secs = self.refill_rate.as_secs_f64().max(1.0);
+        let elapsed_secs = self.last_updated.elapsed().as_secs_f64();
+        let decayed = elapsed_secs / period_secs * 0.5 * self.max_weight as f64;
+        let assumed_used = (self.current_used_weight as f64 - decayed).max(0.0);
+        let available = self.max_weight as f64 - assumed_used;
 
-        if available >= weight {
+        if available >= weight as f64 {
             return (None, None);
         }
 
-        let current_time = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default();
+        let deficit = weight as f64 - available;
+        let per_second = self.max_weight as f64 / period_secs;
+        let wait_secs = ((deficit / per_second) * 1.1 + 0.25).min(period_secs);
 
-        let period_seconds = self.refill_rate.as_secs();
-        let seconds_in_period = current_time.as_secs() % period_seconds;
-        let wait_time = Duration::from_secs(period_seconds - seconds_in_period)
-            .saturating_add(Duration::from_millis(500));
-
-        (Some(wait_time), Some(DynamicLimitReason::HeaderRate))
+        (
+            Some(Duration::from_secs_f64(wait_secs)),
+            Some(DynamicLimitReason::HeaderRate),
+        )
     }
 
     fn prepare_with_fallback(

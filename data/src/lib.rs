@@ -211,3 +211,44 @@ pub fn cleanup_old_market_data() -> usize {
     info!("File cleanup completed. Deleted {} files", total_deleted);
     total_deleted
 }
+
+/// Remove footprint day caches written by retired cache schema versions.
+/// The schema version is part of the cache path, so superseded version
+/// directories can never be read again and only waste disk space.
+pub fn cleanup_legacy_footprint_caches(current_schema_version: u16) -> usize {
+    let root = data_path(Some("market_data/footprint-days"));
+    let entries = match std::fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return 0,
+        Err(err) => {
+            warn!(
+                "Failed to read footprint cache directory {:?}: {}",
+                root, err
+            );
+            return 0;
+        }
+    };
+
+    let mut removed = 0;
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let is_legacy_version_dir = name
+            .strip_prefix('v')
+            .and_then(|version| version.parse::<u16>().ok())
+            .is_some_and(|version| version < current_schema_version);
+
+        if is_legacy_version_dir {
+            match std::fs::remove_dir_all(&path) {
+                Ok(()) => {
+                    removed += 1;
+                    info!("Removed legacy footprint cache directory: {}", name);
+                }
+                Err(err) => warn!("Failed to remove legacy cache dir {name}: {err}"),
+            }
+        }
+    }
+    removed
+}

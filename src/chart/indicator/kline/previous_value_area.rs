@@ -1,21 +1,18 @@
 use super::KlineIndicatorImpl;
-use super::footprint_history::{
-    DAY_MS, DayStats, FootprintHistoryIndicator, draw_text, group_levels,
-};
+use super::footprint_history::{DAY_MS, draw_text};
 use crate::chart::{Message, ViewState};
 
-use chrono::{Datelike, Duration, TimeZone, Utc};
+use chrono::{Datelike, TimeZone, Utc};
 use data::aggr::ticks::TickAggr;
 use data::chart::PlotData;
 use data::chart::kline::KlineDataPoint;
-use exchange::UnixMs;
+use data::chart::tpo::{self, Config as TpoConfig, Profile as TpoProfile};
 use exchange::unit::{Price, PriceStep};
+use exchange::{Kline, UnixMs};
 use iced::theme::palette::Extended;
 use iced::widget::canvas::{self, Path, Stroke};
 use iced::{Alignment, Color, Element, Point, Rectangle};
-use std::cmp::Ordering;
 
-const VALUE_AREA_FRACTION: f64 = 0.70;
 const MAX_LOOKBACK_DAYS: u16 = 732;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,6 +42,7 @@ impl PeriodKind {
 struct PeriodRange {
     kind: PeriodKind,
     previous_start: UnixMs,
+    /// Exclusive end of the previous period == start of the current one.
     previous_end: UnixMs,
     current_start: UnixMs,
 }
@@ -56,39 +54,36 @@ struct ValueArea {
     low: Price,
 }
 
-/// Previous completed UTC day/week/month/year value-area overlay.
+/// Previous completed day/week/month/year value-area overlay.
 ///
-/// The underlying executed-volume books, source selection, aggregation and
-/// disk cache are all provided by Footprint History.
+/// Profiles are built with the exact TPO machinery (`data::chart::tpo`) from
+/// letter-timeframe exchange OHLC bars, so the plotted VAH/VAL/POC match the
+/// TPO surface whenever the block size, ticks-per-row, session anchor and
+/// value-area percent knobs agree.
 pub struct PreviousValueAreaIndicator {
-    inner: FootprintHistoryIndicator,
-    profile_step: PriceStep,
+    /// Composite letter-timeframe bars mirrored from the chart's bar store so
+    /// period rollovers can rebuild without waiting for new pages.
+    bars: Vec<Kline>,
+    areas: Vec<(PeriodRange, ValueArea)>,
+    built_with: Option<(TpoConfig, PriceStep)>,
+    range_key: Vec<(u64, u64)>,
 }
 
 impl PreviousValueAreaIndicator {
     pub fn new() -> Self {
-        let mut inner = FootprintHistoryIndicator::new();
-        inner.set_lookback_days(required_lookback_days(UnixMs::now()));
         Self {
-            inner,
-            profile_step: PriceStep { units: 1 },
+            bars: Vec::new(),
+            areas: Vec::new(),
+            built_with: None,
+            range_key: Vec::new(),
         }
-    }
-
-    fn compact_completed_day(&mut self, source: exchange::TickerInfo, day_start: UnixMs) {
-        self.inner
-            .compact_day_for_value_area(source, day_start, self.profile_step);
     }
 }
 
 impl KlineIndicatorImpl for PreviousValueAreaIndicator {
-    fn clear_all_caches(&mut self) {
-        self.inner.clear_all_caches();
-    }
+    fn clear_all_caches(&mut self) {}
 
-    fn clear_crosshair_caches(&mut self) {
-        self.inner.clear_crosshair_caches();
-    }
+    fn clear_crosshair_caches(&mut self) {}
 
     fn element<'a>(
         &'a self,
@@ -99,69 +94,41 @@ impl KlineIndicatorImpl for PreviousValueAreaIndicator {
         iced::widget::row![].into()
     }
 
-    fn configure_footprint_history(&mut self, sources: &[exchange::TickerInfo], aggregate: bool) {
-        self.inner.configure_footprint_history(sources, aggregate);
-        self.inner
-            .set_lookback_days(required_lookback_days(UnixMs::now()));
-    }
-
-    fn set_trade_history_lookback(&mut self, _days: u16) {
-        self.inner
-            .set_lookback_days(required_lookback_days(UnixMs::now()));
-    }
-
-    fn set_trade_history_price_step(&mut self, step: PriceStep) {
-        self.profile_step = PriceStep {
-            units: step.units.max(1),
-        };
-    }
-
-    fn reset_trade_history_backfill(&mut self) {
-        self.inner.reset_trade_history_backfill();
-    }
-
-    fn prepare_footprint_history(&mut self, source: exchange::TickerInfo, cutoff: UnixMs) {
-        self.inner.prepare_footprint_history(source, cutoff);
-    }
-
-    fn load_cached_footprint_day(
+    fn sync_value_areas(
         &mut self,
-        source: exchange::TickerInfo,
-        day_start: UnixMs,
-    ) -> Option<UnixMs> {
-        let loaded = self.inner.load_cached_footprint_day(source, day_start);
-        if loaded.is_some() {
-            self.compact_completed_day(source, day_start);
+        bars: Option<&[Kline]>,
+        config: TpoConfig,
+        row_step: PriceStep,
+        now: UnixMs,
+    ) {
+        if let Some(bars) = bars {
+            self.bars = bars.to_vec();
         }
-        loaded
-    }
 
-    fn persist_cached_footprint_day(
-        &mut self,
-        source: exchange::TickerInfo,
-        day_start: UnixMs,
-        covered_through: UnixMs,
-    ) {
-        self.inner
-            .persist_cached_footprint_day(source, day_start, covered_through);
-        self.compact_completed_day(source, day_start);
-    }
+        let ranges = period_ranges(config, now);
+        let range_key = ranges
+            .iter()
+            .map(|period| {
+                (
+                    period.previous_start.as_u64(),
+                    period.current_start.as_u64(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let needs_rebuild =
+            self.built_with != Some((config, row_step)) || self.range_key != range_key;
+        self.built_with = Some((config, row_step));
+        self.range_key = range_key;
 
-    fn on_source_trades(
-        &mut self,
-        source: exchange::TickerInfo,
-        trades: &[exchange::Trade],
-        historical: bool,
-    ) {
-        self.inner.on_source_trades(source, trades, historical);
-    }
-
-    fn on_source_open_interest(
-        &mut self,
-        source: exchange::TickerInfo,
-        values: &[exchange::OpenInterest],
-    ) {
-        self.inner.on_source_open_interest(source, values);
+        if !needs_rebuild {
+            return;
+        }
+        self.areas = ranges
+            .iter()
+            .filter_map(|period| {
+                profile_value_area(&self.bars, period, config, row_step).map(|area| (*period, area))
+            })
+            .collect();
     }
 
     fn draw_overlay(
@@ -171,24 +138,11 @@ impl KlineIndicatorImpl for PreviousValueAreaIndicator {
         data_source: &PlotData<KlineDataPoint>,
         palette: &Extended,
         region: Rectangle,
-        group_step: PriceStep,
+        _group_step: PriceStep,
     ) {
-        if group_step.units <= 0 {
-            return;
-        }
-
         let scaling = chart.scaling.max(0.01);
         let line_end = region.x + region.width;
-        for period in period_ranges(UnixMs::now()) {
-            let (stats, complete_sources) = self
-                .inner
-                .display_complete_period(period.previous_start, period.previous_end);
-            if complete_sources == 0 {
-                continue;
-            }
-            let Some(area) = calculate_value_area(&stats, group_step) else {
-                continue;
-            };
+        for (period, area) in &self.areas {
             let Some(line_start) = period_start_x(chart, data_source, region, period.current_start)
             else {
                 continue;
@@ -202,51 +156,47 @@ impl KlineIndicatorImpl for PreviousValueAreaIndicator {
                 line_start,
                 line_end,
                 period.kind,
-                area,
+                *area,
                 color,
             );
         }
     }
 }
 
-pub(crate) fn trade_history_ranges(now: UnixMs) -> Vec<(UnixMs, UnixMs)> {
-    period_ranges(now)
-        .into_iter()
-        .map(|period| (period.previous_start, period.previous_end))
-        .collect()
+/// Earliest bar time the Previous Value Areas bar store must cover.
+pub(crate) fn value_area_history_earliest(config: TpoConfig, now: UnixMs) -> UnixMs {
+    UnixMs::new(
+        period_ranges(config, now)
+            .iter()
+            .map(|period| period.previous_start.as_u64())
+            .min()
+            .map(|earliest| earliest.saturating_sub(1))
+            .unwrap_or_else(|| {
+                now.as_u64()
+                    .saturating_sub(u64::from(MAX_LOOKBACK_DAYS) * DAY_MS)
+            }),
+    )
 }
 
-pub(crate) fn required_lookback_days(now: UnixMs) -> u16 {
-    let earliest = period_ranges(now)
-        .into_iter()
-        .map(|period| period.previous_start.as_u64())
-        .min()
-        .unwrap_or(now.as_u64());
-    let days = now
-        .as_u64()
-        .saturating_sub(earliest)
-        .div_euclid(DAY_MS)
-        .saturating_add(1);
-    u16::try_from(days)
-        .unwrap_or(MAX_LOOKBACK_DAYS)
-        .min(MAX_LOOKBACK_DAYS)
-}
+/// Completed previous periods relative to `now`.
+///
+/// Day and week boundaries follow the TPO session anchoring
+/// (`Config::profile_start`) so they line up exactly with TPO profiles.
+/// Months and years have no TPO counterpart and use UTC calendar ranges.
+fn period_ranges(config: TpoConfig, now: UnixMs) -> Vec<PeriodRange> {
+    let mut week_config = config.normalized();
+    week_config.profile_period = tpo::ProfilePeriod::Week;
+    let day_config = config.normalized();
 
-fn period_ranges(now: UnixMs) -> [PeriodRange; 4] {
+    let current_day = day_config.profile_start(now);
+    let previous_day = day_config.profile_start(current_day.saturating_sub(1));
+    let current_week = week_config.profile_start(now);
+    let previous_week = week_config.profile_start(current_week.saturating_sub(1));
+
     let now_dt = Utc
         .timestamp_millis_opt(now.as_u64().min(i64::MAX as u64) as i64)
         .single()
         .unwrap_or_else(Utc::now);
-    let today = now_dt
-        .date_naive()
-        .and_hms_opt(0, 0, 0)
-        .expect("midnight is a valid UTC time")
-        .and_utc();
-    let previous_day = today - Duration::days(1);
-
-    let current_week = today - Duration::days(i64::from(now_dt.weekday().num_days_from_monday()));
-    let previous_week = current_week - Duration::days(7);
-
     let current_month = Utc
         .with_ymd_and_hms(now_dt.year(), now_dt.month(), 1, 0, 0, 0)
         .single()
@@ -270,100 +220,58 @@ fn period_ranges(now: UnixMs) -> [PeriodRange; 4] {
         .single()
         .expect("previous UTC year start is valid");
 
-    [
-        make_period(PeriodKind::Day, previous_day, today),
+    vec![
+        make_period(PeriodKind::Day, previous_day, current_day),
         make_period(PeriodKind::Week, previous_week, current_week),
-        make_period(PeriodKind::Month, previous_month, current_month),
-        make_period(PeriodKind::Year, previous_year, current_year),
+        make_period(
+            PeriodKind::Month,
+            UnixMs::new(previous_month.timestamp_millis().max(0) as u64),
+            UnixMs::new(current_month.timestamp_millis().max(0) as u64),
+        ),
+        make_period(
+            PeriodKind::Year,
+            UnixMs::new(previous_year.timestamp_millis().max(0) as u64),
+            UnixMs::new(current_year.timestamp_millis().max(0) as u64),
+        ),
     ]
 }
 
-fn make_period(
-    kind: PeriodKind,
-    previous_start: chrono::DateTime<Utc>,
-    current_start: chrono::DateTime<Utc>,
-) -> PeriodRange {
+fn make_period(kind: PeriodKind, previous_start: UnixMs, current_start: UnixMs) -> PeriodRange {
     PeriodRange {
         kind,
-        previous_start: UnixMs::new(previous_start.timestamp_millis().max(0) as u64),
-        previous_end: UnixMs::new(current_start.timestamp_millis().max(0).saturating_sub(1) as u64),
-        current_start: UnixMs::new(current_start.timestamp_millis().max(0) as u64),
+        previous_start,
+        previous_end: current_start,
+        current_start,
     }
 }
 
-fn calculate_value_area(stats: &DayStats, step: PriceStep) -> Option<ValueArea> {
-    if step.units <= 0 {
+/// Build the period's TPO profile from letter-timeframe bars and read its
+/// value area — the same numbers a TPO pane shows for that session.
+fn profile_value_area(
+    bars: &[Kline],
+    period: &PeriodRange,
+    config: TpoConfig,
+    row_step: PriceStep,
+) -> Option<ValueArea> {
+    if row_step.units <= 0 {
         return None;
     }
-    let grouped = group_levels(stats, step);
-    if grouped.is_empty() {
-        return None;
-    }
+    let cfg = config.normalized();
+    let start_index = bars.partition_point(|bar| bar.time < period.previous_start);
+    let end_index = bars.partition_point(|bar| bar.time < period.previous_end);
+    let slice = &bars[start_index..end_index];
+    let first = slice.first()?;
 
-    let prices = grouped.keys().copied().collect::<Vec<_>>();
-    let volumes = grouped
-        .values()
-        .map(|level| level.volume().max(0.0))
-        .collect::<Vec<_>>();
-    let total = volumes.iter().sum::<f64>();
-    if !total.is_finite() || total <= 0.0 {
-        return None;
+    let mut profile = TpoProfile::empty_at(cfg, period.previous_start, first.open);
+    for bar in slice {
+        profile.apply_kline(cfg, row_step, bar);
     }
+    profile.recalculate(cfg, row_step);
 
-    let midpoint = (i128::from(*prices.first()?) + i128::from(*prices.last()?)) / 2;
-    let mut poc_index = 0;
-    for index in 1..prices.len() {
-        let order = volumes[index].total_cmp(&volumes[poc_index]);
-        let distance = |price: i64| (i128::from(price) - midpoint).abs();
-        if order == Ordering::Greater
-            || (order == Ordering::Equal
-                && (distance(prices[index]) < distance(prices[poc_index])
-                    || (distance(prices[index]) == distance(prices[poc_index])
-                        && prices[index] < prices[poc_index])))
-        {
-            poc_index = index;
-        }
-    }
-
-    let target = total * VALUE_AREA_FRACTION;
-    let mut included = volumes[poc_index];
-    let mut low_index = poc_index;
-    let mut high_index = poc_index;
-    while included < target && (low_index > 0 || high_index + 1 < prices.len()) {
-        let below = low_index.checked_sub(1);
-        let above = (high_index + 1 < prices.len()).then_some(high_index + 1);
-        match (below, above) {
-            (Some(below), Some(above)) => match volumes[above].total_cmp(&volumes[below]) {
-                Ordering::Greater => {
-                    high_index = above;
-                    included += volumes[above];
-                }
-                Ordering::Less => {
-                    low_index = below;
-                    included += volumes[below];
-                }
-                Ordering::Equal => {
-                    low_index = below;
-                    high_index = above;
-                    included += volumes[below] + volumes[above];
-                }
-            },
-            (Some(below), None) => {
-                low_index = below;
-                included += volumes[below];
-            }
-            (None, Some(above)) => {
-                high_index = above;
-                included += volumes[above];
-            }
-            (None, None) => break,
-        }
-    }
-
-    Some(ValueArea {
-        high: Price::from_units(prices[high_index]),
-        poc: Price::from_units(prices[poc_index]),
-        low: Price::from_units(prices[low_index]),
+    (profile.total_tpos > 0).then_some(ValueArea {
+        high: profile.value_area_high,
+        poc: profile.poc,
+        low: profile.value_area_low,
     })
 }
 
@@ -466,30 +374,22 @@ fn draw_period_levels(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use exchange::{TickerInfo, Trade, adapter::Exchange, unit::Qty};
+    use chrono::Timelike;
 
-    fn stats(levels: &[(f64, f64)]) -> DayStats {
-        let mut stats = DayStats::default();
-        for (price, volume) in levels {
-            stats
-                .levels
-                .entry(Price::from_f64(*price).units)
-                .or_default()
-                .add_notional(false, *volume);
+    fn step(units: f64) -> PriceStep {
+        PriceStep {
+            units: Price::from_f64(units).units,
         }
-        stats
     }
 
-    fn source(exchange: Exchange, symbol: &str) -> TickerInfo {
-        TickerInfo::new(exchange::Ticker::new(symbol, exchange), 0.1, 0.001, None)
-    }
-
-    fn trade(time: UnixMs, price: f64, qty: f64) -> Trade {
-        Trade {
-            time,
-            price: Price::from_f64(price),
-            qty: Qty::from_f64(qty),
-            is_sell: false,
+    fn bar(time: u64, open: f64, high: f64, low: f64, close: f64) -> Kline {
+        Kline {
+            time: UnixMs::new(time),
+            open: Price::from_f64(open),
+            high: Price::from_f64(high),
+            low: Price::from_f64(low),
+            close: Price::from_f64(close),
+            volume: exchange::Volume::TotalOnly(exchange::unit::Qty::from_f64(1.0)),
         }
     }
 
@@ -501,7 +401,7 @@ mod tests {
                 .unwrap()
                 .timestamp_millis() as u64,
         );
-        let ranges = period_ranges(now);
+        let ranges = period_ranges(TpoConfig::default(), now);
         let to_date = |time: UnixMs| {
             Utc.timestamp_millis_opt(time.as_u64() as i64)
                 .single()
@@ -543,78 +443,56 @@ mod tests {
     }
 
     #[test]
-    fn value_area_expands_from_poc_toward_more_volume() {
-        let stats = stats(&[
-            (100.0, 10.0),
-            (101.0, 20.0),
-            (102.0, 50.0),
-            (103.0, 15.0),
-            (104.0, 5.0),
-        ]);
-        let area = calculate_value_area(
-            &stats,
-            PriceStep {
-                units: Price::from_f64(1.0).units,
-            },
-        )
-        .unwrap();
+    fn value_area_matches_expected_tpo_rows() {
+        // Two 30m letters inside the previous UTC day. Row counts make
+        // rows 102 and 103 the longest; the midpoint tie-break picks POC 102,
+        // and the 70% expansion covers rows 101..=104.
+        let day = 10 * DAY_MS;
+        let bars = vec![
+            bar(day - DAY_MS, 101.0, 103.0, 100.0, 102.0),
+            bar(day - DAY_MS + 30 * 60_000, 103.0, 104.0, 102.0, 103.5),
+        ];
+        let now = UnixMs::new(day + 12 * 3_600_000);
+        let period = period_ranges(TpoConfig::default(), now).remove(0);
+        assert_eq!(period.kind, PeriodKind::Day);
+
+        let area = profile_value_area(&bars, &period, TpoConfig::default(), step(1.0)).unwrap();
         assert_eq!(area.poc, Price::from_f64(102.0));
         assert_eq!(area.low, Price::from_f64(101.0));
-        assert_eq!(area.high, Price::from_f64(102.0));
+        assert_eq!(area.high, Price::from_f64(104.0));
     }
 
     #[test]
-    fn lookback_covers_the_entire_previous_year() {
+    fn empty_period_yields_no_value_area() {
+        let period = PeriodRange {
+            kind: PeriodKind::Day,
+            previous_start: UnixMs::new(0),
+            previous_end: UnixMs::new(1),
+            current_start: UnixMs::new(1),
+        };
+        assert!(profile_value_area(&[], &period, TpoConfig::default(), step(1.0)).is_none());
+    }
+
+    #[test]
+    fn session_anchor_shifts_day_boundary_like_tpo() {
         let now = UnixMs::new(
-            Utc.with_ymd_and_hms(2026, 12, 31, 12, 0, 0)
+            Utc.with_ymd_and_hms(2026, 8, 20, 12, 0, 0)
                 .single()
                 .unwrap()
                 .timestamp_millis() as u64,
         );
-        assert_eq!(required_lookback_days(now), 730);
-    }
-
-    #[test]
-    fn aggregate_profile_merges_binance_bybit_and_hyperliquid() {
-        let binance = source(Exchange::BinanceLinear, "BTCUSDT");
-        let bybit = source(Exchange::BybitLinear, "BTCUSDT");
-        let hyperliquid = source(Exchange::HyperliquidLinear, "BTC");
-        let period = period_ranges(UnixMs::now())[1];
-        let time = period.previous_start.saturating_add(3_600_000);
-        let mut indicator = PreviousValueAreaIndicator::new();
-        indicator
-            .inner
-            .configure_footprint_history(&[binance, bybit, hyperliquid], true);
-        indicator
-            .inner
-            .on_source_trades(binance, &[trade(time, 100.0, 1.0)], true);
-        indicator
-            .inner
-            .on_source_trades(bybit, &[trade(time, 101.0, 5.0)], true);
-        indicator
-            .inner
-            .on_source_trades(hyperliquid, &[trade(time, 102.0, 10.0)], true);
-
-        let aggregate = indicator
-            .inner
-            .display_period(period.previous_start, period.previous_end);
-        let step = PriceStep {
-            units: Price::from_f64(1.0).units,
+        let config = TpoConfig {
+            session_start_minutes_utc: 5 * 60, // 05:00 UTC session start
+            ..TpoConfig::default()
         };
-        assert_eq!(
-            calculate_value_area(&aggregate, step).unwrap().poc,
-            Price::from_f64(102.0)
-        );
-
-        indicator
-            .inner
-            .configure_footprint_history(&[binance, bybit, hyperliquid], false);
-        let single_venue = indicator
-            .inner
-            .display_period(period.previous_start, period.previous_end);
-        assert_eq!(
-            calculate_value_area(&single_venue, step).unwrap().poc,
-            Price::from_f64(100.0)
-        );
+        let ranges = period_ranges(config, now);
+        let to_hour = |time: UnixMs| {
+            Utc.timestamp_millis_opt(time.as_u64() as i64)
+                .single()
+                .unwrap()
+                .hour()
+        };
+        assert_eq!(to_hour(ranges[0].previous_start), 5);
+        assert_eq!(to_hour(ranges[0].current_start), 5);
     }
 }

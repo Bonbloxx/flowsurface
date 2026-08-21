@@ -1158,6 +1158,7 @@ dependencies = [
  "arrow-array",
  "arrow-ipc",
  "arrow-schema",
+ "bincode 2.0.1",
  "bytemuck",
  "bytes",
  "chrono",

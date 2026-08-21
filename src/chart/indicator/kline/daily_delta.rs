@@ -12,7 +12,7 @@ use data::chart::kline::{KlineDataPoint, KlineTrades};
 use exchange::UnixMs;
 use exchange::unit::{Price, PriceStep};
 use iced::theme::palette::Extended;
-use iced::widget::canvas::{self, Path};
+use iced::widget::canvas::{self, Path, Stroke};
 use iced::{Alignment, Color, Element, Point, Rectangle, Size};
 
 /// Daily dollar-delta profile overlay. Reuses Footprint History's UTC-day
@@ -162,10 +162,11 @@ impl KlineIndicatorImpl for DailyDeltaIndicator {
             ) else {
                 continue;
             };
+            let poc_line = poc_line_range(chart, data_source, region, x, day_ts, is_current);
 
             draw_day_profile(
                 frame, chart, &day, group_step, x, profile_w, highest, lowest, scaling, buy, sell,
-                axis, label, is_current,
+                axis, label, is_current, poc_line,
             );
         }
     }
@@ -238,6 +239,28 @@ fn tick_day_x(chart: &ViewState, tick_aggr: &TickAggr, day_ts: u64) -> Option<f3
             (time >= day_ts && time < day_end).then_some((len - 1 - i) as u64)
         })?;
     Some(chart.interval_to_x(index))
+}
+
+fn poc_line_range(
+    chart: &ViewState,
+    data_source: &PlotData<KlineDataPoint>,
+    region: Rectangle,
+    profile_x: f32,
+    day_ts: u64,
+    is_current: bool,
+) -> Option<(f32, f32)> {
+    let next_day = completed_day_close_ts(day_ts);
+    let end = match data_source {
+        PlotData::TimeBased(_) => chart.interval_to_x(if is_current {
+            next_day
+        } else {
+            completed_day_close_ts(next_day)
+        }),
+        PlotData::TickBased(tick_aggr) => tick_day_x(chart, tick_aggr, next_day)?,
+    };
+    let start = profile_x.max(region.x);
+    let end = end.min(region.x + region.width);
+    (end > start).then_some((start, end))
 }
 
 fn apply_kline_day(
@@ -314,6 +337,7 @@ fn draw_day_profile(
     axis: Color,
     label: Color,
     is_current: bool,
+    poc_line: Option<(f32, f32)>,
 ) {
     let step = group_step;
     let step_u = step.units.max(1);
@@ -399,15 +423,21 @@ fn draw_day_profile(
         }
     }
 
-    if let Some(poc_units) = poc {
+    if let (Some(poc_units), Some((line_start, line_end))) = (poc, poc_line) {
         let poc_y = {
             let price = Price::from_units(poc_units);
             let next = Price::from_units(poc_units.saturating_add(step_u));
             (chart.price_to_y(price) + chart.price_to_y(next)) * 0.5
         };
-        frame.fill(
-            &Path::circle(Point::new(x + 6.0 / scaling, poc_y), 4.0 / scaling),
-            buy,
+        frame.stroke(
+            &Path::line(Point::new(line_start, poc_y), Point::new(line_end, poc_y)),
+            Stroke::with_color(
+                Stroke {
+                    width: 2.0 / scaling,
+                    ..Stroke::default()
+                },
+                buy,
+            ),
         );
     }
 

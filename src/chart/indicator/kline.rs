@@ -180,8 +180,18 @@ pub trait KlineIndicatorImpl {
     /// How many UTC days of trade history this indicator should retain.
     fn set_trade_history_lookback(&mut self, _days: u16) {}
 
-    /// Price bucket retained by long-lookback value-area histories.
-    fn set_trade_history_price_step(&mut self, _step: PriceStep) {}
+    /// Sync Previous Value Areas with the chart's letter-timeframe bar store.
+    ///
+    /// `bars` is `Some` when the store changed since the last sync; `None`
+    /// only re-evaluates config changes and period rollovers.
+    fn sync_value_areas(
+        &mut self,
+        _bars: Option<&[Kline]>,
+        _config: data::chart::tpo::Config,
+        _row_step: PriceStep,
+        _now: UnixMs,
+    ) {
+    }
 
     /// Drop cached UTC-day books so the next backfill is not merged on top.
     fn reset_trade_history_backfill(&mut self) {}

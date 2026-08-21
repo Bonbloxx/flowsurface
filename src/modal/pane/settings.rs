@@ -1138,6 +1138,8 @@ pub fn kline_cfg_view<'a>(
     }
 
     if let Some(ticks) = previous_value_area {
+        use data::chart::tpo::{BlockSize, SessionStart};
+        let tpo_cfg = cfg.previous_value_area_tpo_config();
         let tick_choices = pick_list(
             data::chart::kline::Config::DAILY_DELTA_TICK_PRESETS,
             Some(TickMultiplier(ticks)),
@@ -1152,11 +1154,61 @@ pub fn kline_cfg_view<'a>(
                 )
             },
         );
+        let block_choices = pick_list(
+            BlockSize::ALL,
+            Some(tpo_cfg.block_size),
+            move |block_size| {
+                Message::VisualConfigChanged(
+                    pane,
+                    VisualConfig::Kline(data::chart::kline::Config {
+                        previous_value_area_block_size: block_size,
+                        ..cfg
+                    }),
+                    false,
+                )
+            },
+        );
+        let session_choices = pick_list(
+            SessionStart::half_hour_presets(),
+            Some(SessionStart(
+                cfg.previous_value_area_session_start_minutes_utc,
+            )),
+            move |start| {
+                Message::VisualConfigChanged(
+                    pane,
+                    VisualConfig::Kline(data::chart::kline::Config {
+                        previous_value_area_session_start_minutes_utc: start.0,
+                        ..cfg
+                    }),
+                    false,
+                )
+            },
+        );
+        let percent_choices = pick_list(
+            data::chart::tpo::Config::VALUE_AREA_PRESETS,
+            Some(cfg.previous_value_area_value_area_percent),
+            move |percent| {
+                Message::VisualConfigChanged(
+                    pane,
+                    VisualConfig::Kline(data::chart::kline::Config {
+                        previous_value_area_value_area_percent: percent,
+                        ..cfg
+                    }),
+                    false,
+                )
+            },
+        );
         content = content.push(
             column![
                 text("Previous Value Areas").size(crate::style::text_size::SECTION),
-                text("Plots prior completed UTC day VAH/VAL plus week, month, and year VAH/POC/VAL from 70% executed-volume profiles."),
-                row![text("Ticks per level"), space::horizontal(), tick_choices]
+                text("Plots prior completed day, week, month, and year VAH/POC/VAL. Profiles reuse the TPO engine on exchange OHLC bars, so values match a TPO pane with the same settings."),
+                row![text("Ticks per row"), space::horizontal(), tick_choices]
+                    .align_y(Alignment::Center),
+                row![text("Letter period"), space::horizontal(), block_choices]
+                    .align_y(Alignment::Center),
+                row![text("Session start"), space::horizontal(), session_choices]
+                    .align_y(Alignment::Center),
+                row![text("Value area %"), space::horizontal(), percent_choices]
                     .align_y(Alignment::Center),
             ]
             .spacing(8),

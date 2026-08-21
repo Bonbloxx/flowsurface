@@ -930,15 +930,24 @@ impl State {
                 if let Some(id) = req_id {
                     let accepts_time = chart.basis() == Basis::Time(timeframe);
                     let accepts_tick_seed = chart.accepts_tick_kline_seed(timeframe);
-                    if !accepts_time && !accepts_tick_seed {
+                    // Letter-timeframe bars feeding the Previous Value Areas
+                    // overlay are stored separately from the chart's series.
+                    // When the letter timeframe equals the chart timeframe the
+                    // same page feeds both consumers.
+                    let accepts_pva_seed =
+                        !accepts_tick_seed && chart.accepts_pva_seed_klines(timeframe);
+                    if accepts_pva_seed {
+                        chart.insert_pva_seed_klines(id, ticker_info, klines);
+                    }
+                    if accepts_time || accepts_tick_seed {
+                        chart.insert_hist_klines(id, ticker_info, klines);
+                    } else if !accepts_pva_seed {
                         log::warn!(
                             "Ignoring stale kline fetch for timeframe {:?}; chart basis = {:?}",
                             timeframe,
                             chart.basis()
                         );
-                        return;
                     }
-                    chart.insert_hist_klines(id, ticker_info, klines);
                 } else {
                     let (raw_trades, tick_size) = (chart.raw_trades(), chart.tick_size());
                     let layout = chart.chart_layout();
@@ -4030,20 +4039,21 @@ mod tests {
     }
 
     #[test]
-    fn previous_value_area_aggregates_all_selected_trade_venues() {
+    fn previous_value_area_enables_without_trade_venue_streams() {
         let binance = ticker_info(Exchange::BinanceLinear, "BTCUSDT", 0.1);
-        let bybit = ticker_info(Exchange::BybitLinear, "BTCUSDT", 0.1);
-        let hyperliquid = ticker_info(Exchange::HyperliquidLinear, "BTC", 0.1);
         let mut state = State::default();
         state.set_content_and_streams(vec![binance], ContentKind::CandlestickChart);
 
-        assert!(matches!(
-            state.update(Event::ToggleIndicator(
-                UiIndicator::Kline(KlineIndicator::PreviousValueArea),
-                vec![binance, bybit, hyperliquid],
-            )),
-            Some(Effect::RefreshStreams)
-        ));
+        // Previous Value Areas builds TPO profiles from OHLC bars, so enabling
+        // it must not subscribe to any additional trade streams.
+        assert!(
+            state
+                .update(Event::ToggleIndicator(
+                    UiIndicator::Kline(KlineIndicator::PreviousValueArea),
+                    vec![binance],
+                ))
+                .is_none()
+        );
         assert_eq!(
             state
                 .streams
@@ -4051,20 +4061,18 @@ mod tests {
                 .expect("ready streams")
                 .filter(|stream| matches!(stream, StreamKind::Trades { .. }))
                 .count(),
-            3
+            0
         );
 
         let Content::Kline {
             indicators,
-            chart: Some(chart),
+            chart: Some(_),
             ..
         } = &state.content
         else {
             panic!("candlestick chart initialized");
         };
         assert!(indicators.contains(&KlineIndicator::PreviousValueArea));
-        assert!(chart.footprint_history_aggregate());
-        assert_eq!(chart.footprint_history_sources().len(), 3);
     }
 
     #[test]
