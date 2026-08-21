@@ -123,10 +123,21 @@ impl OpenInterestIndicator {
     }
 
     fn rebuild_candles(&mut self) {
-        let Some(timeframe) = self.timeframe else {
+        if self.timeframe.is_none() {
             return;
-        };
-        let max_age = timeframe.to_milliseconds().saturating_mul(2);
+        }
+
+        // Venues without a historical OI endpoint (e.g. Hyperliquid) only
+        // return a snapshot of the current value. Summing such snapshots into
+        // the aggregate makes total OI jump by the whole venue notional when
+        // the snapshot arrives and collapse again once it ages out of the
+        // freshness window, rendering as huge fake OI candles. A source must
+        // therefore accumulate real history before it may contribute, and
+        // once qualified its last known value is carried forward instead of
+        // being dropped when updates lag, so coverage changes never masquerade
+        // as OI flows.
+        const MIN_QUALIFYING_SAMPLES: usize = 5;
+
         let times = self
             .source_data
             .values()
@@ -139,9 +150,12 @@ impl OpenInterestIndicator {
             let values = self
                 .sources
                 .iter()
-                .filter_map(|source| self.source_data.get(source)?.range(..=time).next_back())
-                .filter(|(sample_time, _)| {
-                    time.as_u64().saturating_sub(sample_time.as_u64()) <= max_age
+                .filter_map(|source| {
+                    let series = self.source_data.get(source)?;
+                    if series.len() < MIN_QUALIFYING_SAMPLES {
+                        return None;
+                    }
+                    series.range(..=time).next_back()
                 })
                 .map(|(_, value)| *value)
                 .collect::<Vec<_>>();
@@ -326,6 +340,18 @@ mod tests {
                     time: UnixMs::new(600_000),
                     value: 7_100_000_000.0,
                 },
+                OpenInterest {
+                    time: UnixMs::new(900_000),
+                    value: 7_050_000_000.0,
+                },
+                OpenInterest {
+                    time: UnixMs::new(1_200_000),
+                    value: 7_150_000_000.0,
+                },
+                OpenInterest {
+                    time: UnixMs::new(1_500_000),
+                    value: 7_200_000_000.0,
+                },
             ],
         );
         indicator.on_source_open_interest(
@@ -339,14 +365,44 @@ mod tests {
                     time: UnixMs::new(600_000),
                     value: 3_900_000_000.0,
                 },
+                OpenInterest {
+                    time: UnixMs::new(900_000),
+                    value: 3_950_000_000.0,
+                },
+                OpenInterest {
+                    time: UnixMs::new(1_200_000),
+                    value: 3_850_000_000.0,
+                },
+                OpenInterest {
+                    time: UnixMs::new(1_500_000),
+                    value: 3_800_000_000.0,
+                },
             ],
         );
         indicator.on_source_open_interest(
             hyperliquid,
-            &[OpenInterest {
-                time: UnixMs::new(600_123),
-                value: 2_500_000_000.0,
-            }],
+            &[
+                OpenInterest {
+                    time: UnixMs::new(600_123),
+                    value: 2_500_000_000.0,
+                },
+                OpenInterest {
+                    time: UnixMs::new(900_000),
+                    value: 2_600_000_000.0,
+                },
+                OpenInterest {
+                    time: UnixMs::new(1_200_123),
+                    value: 2_550_000_000.0,
+                },
+                OpenInterest {
+                    time: UnixMs::new(1_500_000),
+                    value: 2_650_000_000.0,
+                },
+                OpenInterest {
+                    time: UnixMs::new(1_800_123),
+                    value: 2_700_000_000.0,
+                },
+            ],
         );
 
         let first = indicator.data[&UnixMs::new(300_000)];
@@ -358,6 +414,103 @@ mod tests {
         assert_eq!(current.high, 13_500_000_000.0);
         assert_eq!(current.low, 11_000_000_000.0);
         assert_eq!(current.source_count, 3);
+    }
+
+    #[test]
+    fn snapshot_only_source_is_excluded_until_it_has_history() {
+        let binance = source(Exchange::BinanceLinear, "BTCUSDT");
+        let hyperliquid = source(Exchange::HyperliquidLinear, "BTC");
+        let mut indicator = OpenInterestIndicator::new();
+        indicator.timeframe = Some(Timeframe::M5);
+        indicator.configure_open_interest(&[binance, hyperliquid]);
+
+        indicator.on_source_open_interest(
+            binance,
+            &[
+                OpenInterest {
+                    time: UnixMs::new(300_000),
+                    value: 7_000_000_000.0,
+                },
+                OpenInterest {
+                    time: UnixMs::new(600_000),
+                    value: 7_100_000_000.0,
+                },
+                OpenInterest {
+                    time: UnixMs::new(900_000),
+                    value: 7_050_000_000.0,
+                },
+                OpenInterest {
+                    time: UnixMs::new(1_200_000),
+                    value: 7_150_000_000.0,
+                },
+                OpenInterest {
+                    time: UnixMs::new(1_500_000),
+                    value: 7_200_000_000.0,
+                },
+            ],
+        );
+        // A single live snapshot must not enter the aggregate: it would add
+        // its whole notional to the newest candles and then age out again.
+        indicator.on_source_open_interest(
+            hyperliquid,
+            &[OpenInterest {
+                time: UnixMs::new(600_123),
+                value: 2_500_000_000.0,
+            }],
+        );
+
+        assert_eq!(indicator.data.len(), 5);
+        for candle in indicator.data.values() {
+            assert_eq!(candle.source_count, 1);
+            assert_eq!(candle.expected_source_count, 2);
+            assert!(candle.close < 8_000_000_000.0);
+        }
+    }
+
+    #[test]
+    fn qualified_source_is_carried_forward_when_updates_lag() {
+        let binance = source(Exchange::BinanceLinear, "BTCUSDT");
+        let bybit = source(Exchange::BybitLinear, "BTCUSDT");
+        let mut indicator = OpenInterestIndicator::new();
+        indicator.timeframe = Some(Timeframe::M5);
+        indicator.configure_open_interest(&[binance, bybit]);
+
+        let oi = |time: u64, value: f64| OpenInterest {
+            time: UnixMs::new(time),
+            value,
+        };
+        // Bybit stops updating after 1_500_000 but has enough history to
+        // qualify; its last known value must be carried forward instead of
+        // dropping out of the sum.
+        indicator.on_source_open_interest(
+            bybit,
+            &[
+                oi(300_000, 4.4e9),
+                oi(600_000, 4.3e9),
+                oi(900_000, 4.2e9),
+                oi(1_200_000, 4.1e9),
+                oi(1_500_000, 4.0e9),
+            ],
+        );
+        indicator.on_source_open_interest(
+            binance,
+            &[
+                oi(300_000, 6.8e9),
+                oi(600_000, 6.9e9),
+                oi(900_000, 7.0e9),
+                oi(1_200_000, 7.0e9),
+                oi(1_500_000, 7.1e9),
+                oi(1_800_000, 7.15e9),
+                oi(2_100_000, 7.2e9),
+                oi(2_400_000, 7.25e9),
+            ],
+        );
+
+        assert_eq!(
+            indicator.data[&UnixMs::new(2_400_000)].close,
+            11_250_000_000.0
+        );
+        assert_eq!(indicator.data[&UnixMs::new(2_400_000)].source_count, 2);
     }
 
     #[test]
