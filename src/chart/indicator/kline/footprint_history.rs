@@ -19,6 +19,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 pub(crate) const DAY_MS: u64 = 24 * 60 * 60 * 1_000;
 const FIVE_MIN_MS: u64 = 5 * 60 * 1_000;
@@ -35,7 +36,10 @@ pub(crate) const DAYS: usize = 3;
 /// v5: Binance intraday aggTrades no longer persist truncated busy windows
 /// (hour-capped slices + fromId continuation). v4 days fetched during a
 /// rally can be missing those timespots and must be re-fetched.
-pub(crate) const CACHE_SCHEMA_VERSION: u16 = 5;
+/// v6: Cumulative Delta used to persist the shared day file without large
+/// prints, then win the writer race and wipe whales that Daily Delta / live
+/// tape had already stored. Those files must be dropped and re-fetched.
+pub(crate) const CACHE_SCHEMA_VERSION: u16 = 6;
 const MAX_LOOKBACK_DAYS: usize = 732;
 
 /// Notional floor (quote currency) at which an executed trade is retained for
@@ -199,8 +203,10 @@ impl DayBookRetain {
         five_min_delta: false,
         large_trades: true,
     };
-    /// CVD subplot: keep five-minute buckets (and levels so the shared disk
-    /// cache stays complete for Footprint History), skip individual prints.
+    /// CVD subplot: keep five-minute buckets and levels so the shared disk
+    /// cache stays complete for Footprint History. Large prints are still
+    /// captured on insert so a CVD persist cannot wipe the Large Trades
+    /// overlay; they are slimmed from memory after a complete day is written.
     pub const DELTAS_WITHOUT_PRINTS: Self = Self {
         levels: true,
         five_min_delta: true,
@@ -261,7 +267,10 @@ impl DayStats {
             });
         }
 
-        if retain.large_trades && notional >= large_trades_capture_floor() {
+        // Always capture large prints so a CVD-style persist still writes
+        // them to the shared day file. Consumers that do not draw the overlay
+        // slim the vec from memory after a complete day is on disk.
+        if notional >= large_trades_capture_floor() {
             self.push_large_trade(StoredLargeTrade {
                 time: trade.time,
                 price_units: trade.price.units,
@@ -269,6 +278,41 @@ impl DayStats {
                 is_sell: trade.is_sell,
             });
         }
+    }
+
+    fn merge_large_trades_from(&mut self, other: &Self) {
+        if other.large_trades.is_empty() {
+            return;
+        }
+        if self.large_trades.is_empty() {
+            self.large_trades.clone_from(&other.large_trades);
+            return;
+        }
+        let existing: FxHashSet<(u64, i64, bool, u64)> = self
+            .large_trades
+            .iter()
+            .map(|trade| {
+                (
+                    trade.time.as_u64(),
+                    trade.price_units,
+                    trade.is_sell,
+                    trade.notional.to_bits(),
+                )
+            })
+            .collect();
+        for trade in &other.large_trades {
+            let key = (
+                trade.time.as_u64(),
+                trade.price_units,
+                trade.is_sell,
+                trade.notional.to_bits(),
+            );
+            if existing.contains(&key) {
+                continue;
+            }
+            self.push_large_trade(*trade);
+        }
+        self.compact_large_trades();
     }
 
     fn push_large_trade(&mut self, trade: StoredLargeTrade) {
@@ -564,13 +608,28 @@ impl FootprintHistoryIndicator {
         covered_through: UnixMs,
         stats: &DayStats,
     ) -> std::io::Result<()> {
+        static WRITE_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = WRITE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
         if stats.notional > 0.0 && stats.levels.is_empty() {
             return Ok(());
         }
-        if Self::read_cached_day(path, source, day)
-            .is_some_and(|(_, cached_through)| cached_through >= covered_through)
-        {
-            return Ok(());
+        let mut stats = stats.clone();
+        if let Some((existing, existing_through)) = Self::read_cached_day(path, source, day) {
+            if existing_through > covered_through {
+                return Ok(());
+            }
+            if existing_through == covered_through
+                && existing.large_trades.len() >= stats.large_trades.len()
+                && existing.levels.len() >= stats.levels.len()
+            {
+                return Ok(());
+            }
+            // Extending coverage, or replacing a print-less CVD snapshot:
+            // keep whales the writer itself never held in memory.
+            stats.merge_large_trades_from(&existing);
         }
         let Some(parent) = path.parent() else {
             return Err(std::io::Error::new(
@@ -585,7 +644,7 @@ impl FootprintHistoryIndicator {
             day_start: day,
             covered_through: covered_through.as_u64(),
             size_unit: volume_size_unit(),
-            stats: stats.clone(),
+            stats,
         };
         let bytes = bincode::serde::encode_to_vec(&payload, bincode::config::standard())
             .map_err(std::io::Error::other)?;
@@ -634,7 +693,7 @@ impl FootprintHistoryIndicator {
         if !self.retain.five_min_delta {
             stats.five_min_delta.clear();
         }
-        if !self.retain.large_trades {
+        if !self.retain.large_trades && Self::day_is_complete(UnixMs::new(day), covered_through) {
             stats.large_trades.clear();
         }
         self.histories
@@ -668,7 +727,8 @@ impl FootprintHistoryIndicator {
             return;
         };
         stats.compact_large_trades();
-        if covered_through.as_u64() >= day.saturating_add(DAY_MS).saturating_sub(1) {
+        let complete = Self::day_is_complete(UnixMs::new(day), covered_through);
+        if complete {
             self.completed_days.insert((source.ticker, day));
         }
         if !self.retain.levels {
@@ -681,14 +741,17 @@ impl FootprintHistoryIndicator {
         // Encoding a busy day still costs tens of milliseconds and the write
         // itself blocks on disk — keep both off the UI thread. The clone is
         // the only main-thread cost and is far cheaper than encoding.
-        let stats = stats.clone();
+        let to_write = stats.clone();
+        if !self.retain.large_trades && complete {
+            stats.large_trades.clear();
+        }
         self.cache_checkpoints
             .insert((source.ticker, day), Some(covered_through));
         std::thread::Builder::new()
             .name("footprint-cache-writer".to_string())
             .spawn(move || {
                 if let Err(err) =
-                    Self::write_cached_day(&path, source, day, covered_through, &stats)
+                    Self::write_cached_day(&path, source, day, covered_through, &to_write)
                 {
                     log::warn!("Failed to write footprint day cache {path:?}: {err}");
                 }
@@ -2476,5 +2539,100 @@ mod tests {
         assert_eq!(merged, via_display);
         let bucket = today / FIVE_MIN_MS * FIVE_MIN_MS;
         assert!((merged[&bucket] - 500.0).abs() < f64::EPSILON);
+    }
+
+    fn whale(day: u64) -> Trade {
+        trade(day + 5 * 60 * 60 * 1_000 + 10_000, 77_700.0, 197.0, true)
+    }
+
+    #[test]
+    fn cvd_insert_still_captures_prints_for_the_shared_cache() {
+        let mut stats = DayStats::default();
+        stats.insert_trade_with(
+            trade(1_000, 80_000.0, 20.0, false),
+            DayBookRetain::DELTAS_WITHOUT_PRINTS,
+        );
+        assert_eq!(stats.levels.len(), 1);
+        assert_eq!(stats.large_trades.len(), 1);
+        assert!((stats.large_trades[0].notional - 1_600_000.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn cvd_style_persist_does_not_wipe_existing_large_trades() {
+        let source = TickerInfo::new(
+            Ticker::new("BTCUSDT", Exchange::BinanceLinear),
+            0.1,
+            0.001,
+            None,
+        );
+        let day = DAY_MS;
+        let mut with_prints = DayStats::default();
+        with_prints.insert_trade(whale(day));
+        let mut without_prints = with_prints.clone();
+        without_prints.large_trades.clear();
+
+        let root = std::env::temp_dir().join(format!(
+            "flowsurface-footprint-cache-cvd-wipe-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let path = root.join("day.fpbin");
+        FootprintHistoryIndicator::write_cached_day(
+            &path,
+            source,
+            day,
+            UnixMs::new(day + 12_345),
+            &with_prints,
+        )
+        .expect("daily-delta write");
+        FootprintHistoryIndicator::write_cached_day(
+            &path,
+            source,
+            day,
+            UnixMs::new(day + 43_200_000),
+            &without_prints,
+        )
+        .expect("cvd extension write");
+
+        let (loaded, covered) =
+            FootprintHistoryIndicator::read_cached_day(&path, source, day).expect("read");
+        assert_eq!(covered, UnixMs::new(day + 43_200_000));
+        assert_eq!(loaded.large_trades.len(), 1);
+        assert!(
+            (loaded.large_trades[0].notional - 15_306_900.0).abs() < 1.0,
+            "got {}",
+            loaded.large_trades[0].notional
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn same_coverage_printless_snapshot_does_not_replace_whales() {
+        let source = TickerInfo::new(
+            Ticker::new("BTCUSDT", Exchange::BinanceLinear),
+            0.1,
+            0.001,
+            None,
+        );
+        let day = DAY_MS;
+        let mut with_prints = DayStats::default();
+        with_prints.insert_trade(whale(day));
+        let mut without_prints = with_prints.clone();
+        without_prints.large_trades.clear();
+        let covered = UnixMs::new(day + 12_345);
+
+        let root = std::env::temp_dir().join(format!(
+            "flowsurface-footprint-cache-cvd-same-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let path = root.join("day.fpbin");
+        FootprintHistoryIndicator::write_cached_day(&path, source, day, covered, &with_prints)
+            .expect("daily-delta write");
+        FootprintHistoryIndicator::write_cached_day(&path, source, day, covered, &without_prints)
+            .expect("cvd same-coverage write");
+
+        let (loaded, _) =
+            FootprintHistoryIndicator::read_cached_day(&path, source, day).expect("read");
+        assert_eq!(loaded.large_trades.len(), 1);
+        let _ = std::fs::remove_dir_all(root);
     }
 }
