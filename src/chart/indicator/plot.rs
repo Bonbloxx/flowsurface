@@ -2,8 +2,9 @@ use crate::chart::{Basis, Interaction, Message, ViewState};
 use crate::style::{self, dashed_line};
 use data::util::{guesstimate_ticks, round_to_tick};
 use exchange::UnixMs;
+use iced::theme::palette::Extended;
 use iced::widget::canvas::{self, Cache, Geometry, Path};
-use iced::{Alignment, Point, Rectangle, Renderer, Size, Theme, Vector, mouse};
+use iced::{Alignment, Color, Point, Rectangle, Renderer, Size, Theme, Vector, mouse};
 
 use std::collections::BTreeMap;
 use std::ops::RangeInclusive;
@@ -428,10 +429,18 @@ where
                 return;
             }
 
-            if let Some(cursor_position) = cursor.position_in(ctx.bounds) {
+            // Time-aligned stats follow the shared x-axis: hovering the main
+            // chart *or* this indicator row should show the datapoint tooltip.
+            let over_self = cursor.position_in(bounds);
+            let cursor_x = cursor
+                .position_in(ctx.bounds)
+                .or(over_self)
+                .map(|position| position.x);
+
+            if let Some(cursor_x) = cursor_x {
                 let earliest_f = ctx.x_to_interval(region.x) as f64;
                 let latest_f = ctx.x_to_interval(region.x + region.width) as f64;
-                let crosshair_ratio = f64::from(cursor_position.x / bounds.width);
+                let crosshair_ratio = f64::from(cursor_x / bounds.width);
                 let (rounded_x, snap_ratio) = match ctx.basis {
                     Basis::Time(tf) => {
                         let step = tf.to_milliseconds() as f64;
@@ -447,7 +456,7 @@ where
                         (rx, sr)
                     }
                     Basis::Tick(_) => {
-                        let world_x = region.x + (cursor_position.x / bounds.width) * region.width;
+                        let world_x = region.x + (cursor_x / bounds.width) * region.width;
                         let snapped_world_x = (world_x / ctx.cell_width).round() * ctx.cell_width;
 
                         let sr = (snapped_world_x - region.x) / region.width;
@@ -498,13 +507,15 @@ where
 
                     if self.plot.is_point_valid(y) {
                         if let Some(tooltip) = self.plot.tooltip(y, next, theme) {
-                            tooltip.draw(frame, theme, bounds, cursor_position.x);
+                            tooltip.draw(frame, theme, bounds, cursor_x);
                         }
                     } else if let Some(msg) = self.plot.invalid_point_message() {
                         PlotTooltip::warning(msg).draw_static(frame, theme, bounds);
                     }
                 }
-            } else if let Some(cursor_position) = cursor.position_in(bounds) {
+            }
+
+            if let Some(cursor_position) = over_self {
                 // horizontal snap uses label extents
                 let highest = self.max_for_labels;
                 let lowest = self.min_for_labels;
@@ -526,7 +537,8 @@ where
                     ),
                     dashed,
                 );
-            } else if self.data_labels_always_visible
+            } else if cursor_x.is_none()
+                && self.data_labels_always_visible
                 && let Some((x, y)) = match ctx.basis {
                     Basis::Time(_) => self.series.last_in(earliest..=latest),
                     Basis::Tick(_) => self.series.first_in(earliest..=latest),
@@ -672,27 +684,7 @@ impl PlotTooltip {
             palette.background.weakest.color.scale_alpha(0.9),
         );
 
-        // All segments drawn left-to-right with Start alignment from the
-        // text area's left edge (box origin + padding).
-        let mut cursor = rect_x + TOOLTIP_PADDING;
-
-        for (text, is_danger) in self.kind.segments() {
-            let color = if is_danger {
-                palette.danger.base.color
-            } else {
-                palette.background.base.text
-            };
-            frame.fill_text(canvas::Text {
-                content: text.to_string(),
-                position: Point::new(cursor, 2.0),
-                size: iced::Pixels(crate::style::text_size::TINY),
-                color,
-                font: style::AZERET_MONO,
-                align_x: Alignment::Start.into(),
-                ..canvas::Text::default()
-            });
-            cursor += text.chars().count() as f32 * Self::TOOLTIP_CHAR_W;
-        }
+        self.paint_lines(frame, palette, rect_x);
     }
 
     pub fn draw_static(&self, frame: &mut canvas::Frame, theme: &Theme, _bounds: Rectangle) {
@@ -705,24 +697,44 @@ impl PlotTooltip {
             palette.background.weakest.color.scale_alpha(0.9),
         );
 
-        let mut cursor = TOOLTIP_MARGIN + TOOLTIP_PADDING;
+        self.paint_lines(frame, palette, TOOLTIP_MARGIN);
+    }
 
-        for (text, is_danger) in self.kind.segments() {
-            let color = if is_danger {
-                palette.danger.base.color
-            } else {
-                palette.background.base.text
-            };
-            frame.fill_text(canvas::Text {
-                content: text.to_string(),
-                position: Point::new(cursor, 2.0),
-                size: iced::Pixels(crate::style::text_size::TINY),
-                color,
-                font: style::AZERET_MONO,
-                align_x: Alignment::Start.into(),
-                ..canvas::Text::default()
-            });
-            cursor += text.chars().count() as f32 * Self::TOOLTIP_CHAR_W;
+    fn paint_lines(&self, frame: &mut canvas::Frame, palette: &Extended, rect_x: f32) {
+        let text_color = palette.background.base.text;
+        let danger_color = palette.danger.base.color;
+        let text_x = rect_x + TOOLTIP_PADDING;
+
+        match &self.kind {
+            TooltipKind::Info(text) => {
+                for (i, line) in text.split('\n').enumerate() {
+                    Self::fill_line(frame, line, text_x, i, text_color);
+                }
+            }
+            TooltipKind::Warning(text) => {
+                let mut lines = text.split('\n');
+                if let Some(first) = lines.next() {
+                    let prefix = "<!> ";
+                    Self::fill_line(frame, prefix, text_x, 0, danger_color);
+                    let first_x = text_x + prefix.chars().count() as f32 * Self::TOOLTIP_CHAR_W;
+                    Self::fill_line(frame, first, first_x, 0, text_color);
+                }
+                for (i, line) in lines.enumerate() {
+                    Self::fill_line(frame, line, text_x, i + 1, text_color);
+                }
+            }
         }
+    }
+
+    fn fill_line(frame: &mut canvas::Frame, text: &str, x: f32, line: usize, color: Color) {
+        frame.fill_text(canvas::Text {
+            content: text.to_string(),
+            position: Point::new(x, 2.0 + line as f32 * Self::TOOLTIP_LINE_H),
+            size: iced::Pixels(crate::style::text_size::TINY),
+            color,
+            font: style::AZERET_MONO,
+            align_x: Alignment::Start.into(),
+            ..canvas::Text::default()
+        });
     }
 }

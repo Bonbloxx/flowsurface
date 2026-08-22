@@ -2809,6 +2809,9 @@ impl State {
 
     pub fn update_interval(&self) -> Option<u64> {
         match &self.content {
+            Content::Kline {
+                chart: Some(chart), ..
+            } if chart.needs_seed_backfill() => Some(100),
             Content::Kline { .. } | Content::FootprintHistory(_) | Content::Comparison(_) => {
                 Some(1000)
             }

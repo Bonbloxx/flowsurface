@@ -48,10 +48,18 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use std::time::{Duration, Instant};
 
 const RENKO_SEED_TIMEFRAME: exchange::Timeframe = exchange::Timeframe::M1;
-/// A month of close-based seed bars. At 1000 bars per REST page this costs
-/// roughly one page per maintenance tick (~45 requests) of progressive
-/// backfill, which keeps each rebuild cheap and the pane responsive.
+/// A month of close-based seed bars. Each REST page is one venue-sized
+/// window of 1m closes, requested one page per seed tick so a liquid
+/// symbol cannot stall the UI with a giant rebuild.
 const RENKO_HISTORY_MS: u64 = 31 * 24 * 60 * 60 * 1_000;
+
+fn renko_seed_page_bars(source: TickerInfo) -> u64 {
+    match source.exchange().venue() {
+        Venue::Hyperliquid => 5_000,
+        Venue::Okex => 300,
+        _ => 1_000,
+    }
+}
 
 fn shared_history_price_step(sources: &[TickerInfo], fallback: PriceStep) -> PriceStep {
     sources
@@ -914,7 +922,112 @@ impl KlineChart {
         &self.kind
     }
 
+    /// True while Renko/TPO still has historical seed pages to request.
+    pub fn needs_seed_backfill(&self) -> bool {
+        matches!(
+            &self.kind,
+            KlineChartKind::Renko { .. } | KlineChartKind::Tpo { .. }
+        ) && !self.trade_history_loaded
+    }
+
+    fn fetch_seed_klines(&mut self) -> Option<Action> {
+        let (is_renko, is_tpo) = match &self.data_source {
+            PlotData::TickBased(tick_aggr) => (tick_aggr.is_renko(), tick_aggr.is_tpo()),
+            PlotData::TimeBased(_) => return None,
+        };
+
+        if is_renko && !self.trade_history_loaded {
+            let source = self.feed.primary();
+            let latest = UnixMs::now();
+            let need_earliest = latest.saturating_sub(RENKO_HISTORY_MS);
+
+            if self.tpo_klines.source_is_complete(source, need_earliest) {
+                self.trade_history_loaded = true;
+            } else {
+                // Strictly older than stored history, matching TPO. Ending a
+                // page on the earliest stored bar reused the first REST range,
+                // which then sat Pending forever after insert discarded the
+                // Action and left the chart with ~16h of 1m closes.
+                let page_end = self
+                    .tpo_klines
+                    .earliest(source)
+                    .map(|time| time.saturating_sub(1))
+                    .unwrap_or(latest);
+                if page_end > need_earliest {
+                    let page_ms = RENKO_SEED_TIMEFRAME
+                        .to_milliseconds()
+                        .saturating_mul(renko_seed_page_bars(source));
+                    let page_start = page_end.saturating_sub(page_ms).max(need_earliest);
+                    let range = FetchRange::Kline(page_start, page_end);
+                    let stream = StreamKind::Kline {
+                        ticker_info: source,
+                        timeframe: RENKO_SEED_TIMEFRAME,
+                    };
+                    if let Some(action) =
+                        request_fetch_with_stream(&mut self.request_handler, range, Some(stream))
+                    {
+                        return Some(action);
+                    }
+                }
+            }
+        }
+
+        // TPO history: exchange OHLC bars (Sierra/Quantower), not raw trades.
+        // At least 150 profiles are bar-seeded so older sessions stay available.
+        if is_tpo
+            && !self.trade_history_loaded
+            && let KlineChartKind::Tpo { config } = &self.kind
+        {
+            let letter_tf = config.letter_timeframe();
+            let latest = UnixMs::now();
+            let need_earliest = latest.saturating_sub(config.history_range_ms());
+            let page_ms = letter_tf.to_milliseconds().saturating_mul(1_000);
+
+            for source in self.feed.sources().iter().copied() {
+                if self.tpo_klines.source_is_complete(source, need_earliest) {
+                    continue;
+                }
+
+                // Request bars strictly older than this source's
+                // existing history. Request identity includes the
+                // stream, so equal ranges can run for every venue.
+                let page_end = self
+                    .tpo_klines
+                    .earliest(source)
+                    .map(|time| time.saturating_sub(1))
+                    .unwrap_or(latest);
+                if page_end <= need_earliest {
+                    continue;
+                }
+
+                let page_start = page_end.saturating_sub(page_ms).max(need_earliest);
+                let range = FetchRange::Kline(page_start, page_end);
+                let stream = StreamKind::Kline {
+                    ticker_info: source,
+                    timeframe: letter_tf,
+                };
+                if let Some(action) =
+                    request_fetch_with_stream(&mut self.request_handler, range, Some(stream))
+                {
+                    return Some(action);
+                }
+            }
+
+            if self.tpo_klines.all_sources_complete(need_earliest) {
+                self.trade_history_loaded = true;
+            }
+        }
+
+        None
+    }
+
     fn fetch_missing_data(&mut self) -> Option<Action> {
+        // Seed the chart's own bar history before trade-history indicators.
+        // CVD backfill used to take every tick and leave Renko with one 1m page.
+        if let Some(action) = self.fetch_seed_klines() {
+            return Some(action);
+        }
+
         let can_fetch_footprint_history = match &self.data_source {
             PlotData::TimeBased(timeseries) => !timeseries.datapoints.is_empty(),
             PlotData::TickBased(_) => true,
@@ -928,211 +1041,129 @@ impl KlineChart {
             return Some(action);
         }
 
-        match &self.data_source {
-            PlotData::TimeBased(timeseries) => {
-                let timeframe_ms = timeseries.interval.to_milliseconds();
+        if let PlotData::TimeBased(timeseries) = &self.data_source {
+            let timeframe_ms = timeseries.interval.to_milliseconds();
 
-                if timeseries.datapoints.is_empty() {
-                    let latest = chrono::Utc::now().timestamp_millis() as u64;
-                    let earliest = latest.saturating_sub(450 * timeframe_ms);
+            if timeseries.datapoints.is_empty() {
+                let latest = chrono::Utc::now().timestamp_millis() as u64;
+                let earliest = latest.saturating_sub(450 * timeframe_ms);
 
-                    let range = FetchRange::Kline(UnixMs::new(earliest), UnixMs::new(latest));
-                    if let Some(action) = request_fetch(&mut self.request_handler, range) {
-                        return Some(action);
-                    }
-                }
-
-                let (visible_earliest, visible_latest) = self.visible_timerange()?;
-                let (kline_earliest, kline_latest) = timeseries.timerange();
-                let visible_earliest_ms = UnixMs::new(visible_earliest);
-                let visible_latest_ms = UnixMs::new(visible_latest);
-                let visible_span = visible_latest.saturating_sub(visible_earliest);
-                let prefetch_earliest = visible_earliest.saturating_sub(visible_span);
-
-                // priority 1, initial klines for visible range
-                if visible_earliest_ms < kline_earliest {
-                    let range = FetchRange::Kline(UnixMs::new(prefetch_earliest), kline_earliest);
-
-                    if let Some(action) = request_fetch(&mut self.request_handler, range) {
-                        return Some(action);
-                    }
-                }
-
-                // priority 2, trades
-                if let KlineChartKind::Footprint { .. } = self.kind
-                    && !self.fetching_trades.0
-                    && is_trade_fetch_enabled()
-                    && let Some((fetch_from, fetch_to)) =
-                        timeseries.suggest_trade_fetch_range(visible_earliest_ms, visible_latest_ms)
-                {
-                    let range = FetchRange::FootprintTrades(fetch_from, fetch_to);
-                    let mut specs = Vec::new();
-                    for source in self.feed.sources().iter().copied() {
-                        let stream = StreamKind::Trades {
-                            ticker_info: source,
-                        };
-                        if let Ok(Some(req_id)) =
-                            self.request_handler.add_request(range, Some(stream))
-                        {
-                            specs.push(FetchSpec {
-                                req_id,
-                                fetch: range,
-                                stream: Some(stream),
-                            });
-                        }
-                    }
-                    if !specs.is_empty() {
-                        self.fetching_trades = (true, None);
-                        return Some(Action::RequestFetch(specs));
-                    }
-                }
-
-                // priority 3, indicators
-                // (e.g. open interest needs external fetch as it's not derived from klines)
-                let ctx = indicator::kline::FetchCtx {
-                    main_chart: &self.chart,
-                    timeframe: timeseries.interval,
-                    visible_earliest: visible_earliest_ms,
-                    kline_latest,
-                    prefetch_earliest: UnixMs::new(prefetch_earliest),
-                };
-                if let Some(indi) = self.indicators[KlineIndicator::OpenInterest].as_mut()
-                    && let Some(range) = indi.fetch_range(&ctx)
-                {
-                    let mut specs = Vec::new();
-                    for source in indi.open_interest_sources().iter().copied() {
-                        let stream = StreamKind::Kline {
-                            ticker_info: source,
-                            timeframe: timeseries.interval,
-                        };
-                        if let Ok(Some(req_id)) =
-                            self.request_handler.add_request(range, Some(stream))
-                        {
-                            specs.push(FetchSpec {
-                                req_id,
-                                fetch: range,
-                                stream: Some(stream),
-                            });
-                        }
-                    }
-                    if !specs.is_empty() {
-                        return Some(Action::RequestFetch(specs));
-                    }
-                }
-
-                for indi in self
-                    .indicators
-                    .values_mut()
-                    .filter_map(Option::as_mut)
-                    .filter(|indi| indi.open_interest_sources().is_empty())
-                {
-                    if let Some(range) = indi.fetch_range(&ctx)
-                        && let Some(action) = request_fetch(&mut self.request_handler, range)
-                    {
-                        return Some(action);
-                    }
-                }
-
-                // priority 4, missing klines & integrity check
-                let check_earliest = UnixMs::new(prefetch_earliest).max(kline_earliest);
-                let check_latest = visible_latest_ms.saturating_add(timeframe_ms);
-
-                if let Some(missing_keys) =
-                    timeseries.check_kline_integrity(check_earliest, check_latest)
-                {
-                    let latest = missing_keys
-                        .iter()
-                        .max()
-                        .unwrap_or(&visible_latest_ms)
-                        .saturating_add(timeframe_ms);
-                    let earliest = missing_keys
-                        .iter()
-                        .min()
-                        .unwrap_or(&visible_earliest_ms)
-                        .saturating_sub(timeframe_ms);
-
-                    let range = FetchRange::Kline(earliest, latest);
-                    if let Some(action) = request_fetch(&mut self.request_handler, range) {
-                        return Some(action);
-                    }
+                let range = FetchRange::Kline(UnixMs::new(earliest), UnixMs::new(latest));
+                if let Some(action) = request_fetch(&mut self.request_handler, range) {
+                    return Some(action);
                 }
             }
-            PlotData::TickBased(tick_aggr) => {
-                // Renko history is seeded from completed one-minute closes.
-                // Raw-trade backfills are unusably dense on liquid symbols and
-                // used to hit the cap after only a few minutes of price action.
-                if tick_aggr.is_renko() && !self.trade_history_loaded {
-                    let source = self.feed.primary();
-                    let latest = UnixMs::now();
-                    let need_earliest = latest.saturating_sub(RENKO_HISTORY_MS);
 
-                    if self.tpo_klines.source_is_complete(source, need_earliest) {
-                        self.trade_history_loaded = true;
-                    } else {
-                        let page_end = self.tpo_klines.earliest(source).unwrap_or(latest);
-                        let page_ms = RENKO_SEED_TIMEFRAME.to_milliseconds().saturating_mul(1_000);
-                        let page_start = page_end.saturating_sub(page_ms).max(need_earliest);
-                        let range = FetchRange::Kline(page_start, page_end);
-                        let stream = StreamKind::Kline {
-                            ticker_info: source,
-                            timeframe: RENKO_SEED_TIMEFRAME,
-                        };
-                        if let Some(action) = request_fetch_with_stream(
-                            &mut self.request_handler,
-                            range,
-                            Some(stream),
-                        ) {
-                            return Some(action);
-                        }
+            let (visible_earliest, visible_latest) = self.visible_timerange()?;
+            let (kline_earliest, kline_latest) = timeseries.timerange();
+            let visible_earliest_ms = UnixMs::new(visible_earliest);
+            let visible_latest_ms = UnixMs::new(visible_latest);
+            let visible_span = visible_latest.saturating_sub(visible_earliest);
+            let prefetch_earliest = visible_earliest.saturating_sub(visible_span);
+
+            // priority 1, initial klines for visible range
+            if visible_earliest_ms < kline_earliest {
+                let range = FetchRange::Kline(UnixMs::new(prefetch_earliest), kline_earliest);
+
+                if let Some(action) = request_fetch(&mut self.request_handler, range) {
+                    return Some(action);
+                }
+            }
+
+            // priority 2, trades
+            if let KlineChartKind::Footprint { .. } = self.kind
+                && !self.fetching_trades.0
+                && is_trade_fetch_enabled()
+                && let Some((fetch_from, fetch_to)) =
+                    timeseries.suggest_trade_fetch_range(visible_earliest_ms, visible_latest_ms)
+            {
+                let range = FetchRange::FootprintTrades(fetch_from, fetch_to);
+                let mut specs = Vec::new();
+                for source in self.feed.sources().iter().copied() {
+                    let stream = StreamKind::Trades {
+                        ticker_info: source,
+                    };
+                    if let Ok(Some(req_id)) = self.request_handler.add_request(range, Some(stream))
+                    {
+                        specs.push(FetchSpec {
+                            req_id,
+                            fetch: range,
+                            stream: Some(stream),
+                        });
                     }
                 }
+                if !specs.is_empty() {
+                    self.fetching_trades = (true, None);
+                    return Some(Action::RequestFetch(specs));
+                }
+            }
 
-                // TPO history: exchange OHLC bars (Sierra/Quantower), not raw trades.
-                // At least 150 profiles are bar-seeded so older sessions stay available.
-                if tick_aggr.is_tpo()
-                    && !self.trade_history_loaded
-                    && let KlineChartKind::Tpo { config } = &self.kind
+            // priority 3, indicators
+            // (e.g. open interest needs external fetch as it's not derived from klines)
+            let ctx = indicator::kline::FetchCtx {
+                main_chart: &self.chart,
+                timeframe: timeseries.interval,
+                visible_earliest: visible_earliest_ms,
+                kline_latest,
+                prefetch_earliest: UnixMs::new(prefetch_earliest),
+            };
+            if let Some(indi) = self.indicators[KlineIndicator::OpenInterest].as_mut()
+                && let Some(range) = indi.fetch_range(&ctx)
+            {
+                let mut specs = Vec::new();
+                for source in indi.open_interest_sources().iter().copied() {
+                    let stream = StreamKind::Kline {
+                        ticker_info: source,
+                        timeframe: timeseries.interval,
+                    };
+                    if let Ok(Some(req_id)) = self.request_handler.add_request(range, Some(stream))
+                    {
+                        specs.push(FetchSpec {
+                            req_id,
+                            fetch: range,
+                            stream: Some(stream),
+                        });
+                    }
+                }
+                if !specs.is_empty() {
+                    return Some(Action::RequestFetch(specs));
+                }
+            }
+
+            for indi in self
+                .indicators
+                .values_mut()
+                .filter_map(Option::as_mut)
+                .filter(|indi| indi.open_interest_sources().is_empty())
+            {
+                if let Some(range) = indi.fetch_range(&ctx)
+                    && let Some(action) = request_fetch(&mut self.request_handler, range)
                 {
-                    let letter_tf = config.letter_timeframe();
-                    let latest = UnixMs::now();
-                    let need_earliest = latest.saturating_sub(config.history_range_ms());
-                    let page_ms = letter_tf.to_milliseconds().saturating_mul(1_000);
+                    return Some(action);
+                }
+            }
 
-                    for source in self.feed.sources().iter().copied() {
-                        if self.tpo_klines.source_is_complete(source, need_earliest) {
-                            continue;
-                        }
+            // priority 4, missing klines & integrity check
+            let check_earliest = UnixMs::new(prefetch_earliest).max(kline_earliest);
+            let check_latest = visible_latest_ms.saturating_add(timeframe_ms);
 
-                        // Request bars strictly older than this source's
-                        // existing history. Request identity includes the
-                        // stream, so equal ranges can run for every venue.
-                        let page_end = self
-                            .tpo_klines
-                            .earliest(source)
-                            .map(|time| time.saturating_sub(1))
-                            .unwrap_or(latest);
-                        if page_end <= need_earliest {
-                            continue;
-                        }
+            if let Some(missing_keys) =
+                timeseries.check_kline_integrity(check_earliest, check_latest)
+            {
+                let latest = missing_keys
+                    .iter()
+                    .max()
+                    .unwrap_or(&visible_latest_ms)
+                    .saturating_add(timeframe_ms);
+                let earliest = missing_keys
+                    .iter()
+                    .min()
+                    .unwrap_or(&visible_earliest_ms)
+                    .saturating_sub(timeframe_ms);
 
-                        let page_start = page_end.saturating_sub(page_ms).max(need_earliest);
-                        let range = FetchRange::Kline(page_start, page_end);
-                        let stream = StreamKind::Kline {
-                            ticker_info: source,
-                            timeframe: letter_tf,
-                        };
-                        if let Some(action) = request_fetch_with_stream(
-                            &mut self.request_handler,
-                            range,
-                            Some(stream),
-                        ) {
-                            return Some(action);
-                        }
-                    }
-
-                    if self.tpo_klines.all_sources_complete(need_earliest) {
-                        self.trade_history_loaded = true;
-                    }
+                let range = FetchRange::Kline(earliest, latest);
+                if let Some(action) = request_fetch(&mut self.request_handler, range) {
+                    return Some(action);
                 }
             }
         }
@@ -1521,7 +1552,7 @@ impl KlineChart {
             .filter_map(Option::as_mut)
             .for_each(|indicator| indicator.on_basis_change(&self.data_source));
         self.reset_request_handler();
-        self.invalidate(Some(Instant::now()));
+        self.invalidate(None);
     }
 
     pub fn set_tpo_config(&mut self, new_config: TpoConfig) {
@@ -1559,7 +1590,7 @@ impl KlineChart {
             self.trade_history_loaded = false;
             self.reset_request_handler();
         }
-        self.invalidate(Some(Instant::now()));
+        self.invalidate(None);
     }
 
     pub fn basis(&self) -> Basis {
@@ -1969,7 +2000,10 @@ impl KlineChart {
                     self.request_handler.mark_no_data(req_id);
                     self.tpo_klines.mark_exhausted(source);
                     self.trade_history_loaded = true;
-                    self.invalidate(Some(Instant::now()));
+                    // Redraw only. Planning the next page here would register it
+                    // as Pending with no dispatcher, which suppressed every later
+                    // retry of that range (Overlaps) and froze seed history.
+                    self.invalidate(None);
                     return;
                 }
 
@@ -1997,7 +2031,7 @@ impl KlineChart {
                     .values_mut()
                     .filter_map(Option::as_mut)
                     .for_each(|indicator| indicator.on_basis_change(&self.data_source));
-                self.invalidate(Some(Instant::now()));
+                self.invalidate(None);
             }
             PlotData::TickBased(_) if matches!(self.kind, KlineChartKind::Tpo { .. }) => {
                 if klines_raw.is_empty() {
@@ -2009,7 +2043,7 @@ impl KlineChart {
                         self.trade_history_loaded =
                             self.tpo_klines.all_sources_complete(need_earliest);
                     }
-                    self.invalidate(Some(Instant::now()));
+                    self.invalidate(None);
                     return;
                 }
 
@@ -2042,7 +2076,7 @@ impl KlineChart {
                     self.trade_history_loaded = self.tpo_klines.all_sources_complete(need_earliest);
                 }
 
-                self.invalidate(Some(Instant::now()));
+                self.invalidate(None);
             }
             PlotData::TickBased(_) => {
                 self.request_handler.mark_completed(req_id);
@@ -4643,6 +4677,110 @@ mod tests {
                 .iter()
                 .all(|day| day.as_u64() >= oldest_allowed),
             "requested {requested_days:?} extends past the {oldest_allowed} fetch horizon"
+        );
+        crate::connector::fetcher::set_trade_fetch_mode(TradeFetchMode::Off);
+    }
+
+    fn seed_kline(time: UnixMs, close: f64) -> Kline {
+        let price = Price::from_f64(close);
+        Kline {
+            time,
+            open: price,
+            high: price,
+            low: price,
+            close: price,
+            volume: Volume::TotalOnly(Qty::ZERO),
+        }
+    }
+
+    fn renko_chart(source: TickerInfo, indicators: &[KlineIndicator]) -> KlineChart {
+        KlineChart::new(
+            ViewConfig::default(),
+            Basis::Tick(data::aggr::TickCount(1)),
+            PriceStep::from(source.min_ticksize),
+            &[],
+            Vec::new(),
+            indicators,
+            source,
+            &KlineChartKind::Renko {
+                config: RenkoConfig::default(),
+            },
+            None,
+        )
+    }
+
+    #[test]
+    fn renko_seed_pages_backward_after_the_first_minute_page() {
+        let source = TickerInfo::new(
+            Ticker::new("BTCUSDT", Exchange::BinanceLinear),
+            0.1,
+            0.001,
+            None,
+        );
+        let mut chart = renko_chart(source, &[]);
+
+        let Action::RequestFetch(first) = chart
+            .fetch_missing_data()
+            .expect("first 1m seed page should be requested")
+        else {
+            panic!("renko seed should request 1m klines");
+        };
+        let FetchRange::Kline(first_start, first_end) = first[0].fetch else {
+            panic!("renko seed should request klines, got {:?}", first[0].fetch);
+        };
+        assert!(
+            first_end.as_u64() - first_start.as_u64() >= 1_000 * 60_000,
+            "first page should cover a venue-sized 1m window, got {first_start:?}..{first_end:?}"
+        );
+
+        let minute_ms = RENKO_SEED_TIMEFRAME.to_milliseconds();
+        let page_bars = ((first_end.as_u64() - first_start.as_u64()) / minute_ms) as usize;
+        let klines: Vec<Kline> = (0..page_bars)
+            .map(|i| seed_kline(first_start.saturating_add(i as u64 * minute_ms), 68_000.0))
+            .collect();
+        chart.insert_hist_klines(first[0].req_id, source, &klines);
+
+        let Action::RequestFetch(second) = chart
+            .fetch_missing_data()
+            .expect("next 1m seed page must be dispatchable after insert")
+        else {
+            panic!("renko seed should keep requesting 1m klines");
+        };
+        let FetchRange::Kline(second_start, second_end) = second[0].fetch else {
+            panic!(
+                "renko seed should request klines, got {:?}",
+                second[0].fetch
+            );
+        };
+        assert!(
+            second_end < first_start,
+            "second page {second_start:?}..{second_end:?} should be older than first {first_start:?}..{first_end:?}"
+        );
+        assert!(chart.needs_seed_backfill());
+    }
+
+    #[test]
+    fn renko_seed_pages_are_not_starved_by_cumulative_delta_backfill() {
+        crate::connector::fetcher::set_trade_fetch_mode(TradeFetchMode::Server);
+        let source = TickerInfo::new(
+            Ticker::new("BTCUSDT", Exchange::BinanceLinear),
+            0.1,
+            0.001,
+            None,
+        );
+        let mut chart = renko_chart(source, &[KlineIndicator::CumulativeDelta]);
+        chart.configure_footprint_history(vec![source], true);
+
+        let Action::RequestFetch(specs) = chart
+            .fetch_missing_data()
+            .expect("renko seed should still be requested with CVD enabled")
+        else {
+            panic!("renko seed should request 1m klines");
+        };
+        assert!(
+            matches!(specs[0].fetch, FetchRange::Kline(..)),
+            "chart seed must win over CVD trade backfill, got {:?}",
+            specs[0].fetch
         );
         crate::connector::fetcher::set_trade_fetch_mode(TradeFetchMode::Off);
     }
