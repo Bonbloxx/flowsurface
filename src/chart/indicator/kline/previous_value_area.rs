@@ -101,9 +101,15 @@ impl KlineIndicatorImpl for PreviousValueAreaIndicator {
         row_step: PriceStep,
         now: UnixMs,
     ) {
-        if let Some(bars) = bars {
+        // `Some` means the letter-timeframe store changed. Rebuild even when
+        // config and period bounds are unchanged — a first empty tick after
+        // restore would otherwise cache `built_with` and ignore later pages.
+        let bars_changed = if let Some(bars) = bars {
             self.bars = bars.to_vec();
-        }
+            true
+        } else {
+            false
+        };
 
         let ranges = period_ranges(config, now);
         let range_key = ranges
@@ -115,8 +121,9 @@ impl KlineIndicatorImpl for PreviousValueAreaIndicator {
                 )
             })
             .collect::<Vec<_>>();
-        let needs_rebuild =
-            self.built_with != Some((config, row_step)) || self.range_key != range_key;
+        let needs_rebuild = bars_changed
+            || self.built_with != Some((config, row_step))
+            || self.range_key != range_key;
         self.built_with = Some((config, row_step));
         self.range_key = range_key;
 
@@ -460,6 +467,41 @@ mod tests {
         assert_eq!(area.poc, Price::from_f64(102.0));
         assert_eq!(area.low, Price::from_f64(101.0));
         assert_eq!(area.high, Price::from_f64(104.0));
+    }
+
+    #[test]
+    fn value_areas_rebuild_when_bars_arrive_after_empty_sync() {
+        // App restart: the first periodic tick syncs with an empty store, then
+        // letter-timeframe pages arrive. Areas must populate without toggling
+        // the indicator (which reconstructs it and clears `built_with`).
+        let mut indicator = PreviousValueAreaIndicator::new();
+        let config = TpoConfig::default();
+        let row_step = step(1.0);
+        let day = 10 * DAY_MS;
+        let now = UnixMs::new(day + 12 * 3_600_000);
+
+        indicator.sync_value_areas(Some(&[]), config, row_step, now);
+        assert!(indicator.areas.is_empty());
+
+        let bars = vec![
+            bar(day - DAY_MS, 101.0, 103.0, 100.0, 102.0),
+            bar(day - DAY_MS + 30 * 60_000, 103.0, 104.0, 102.0, 103.5),
+        ];
+        indicator.sync_value_areas(Some(&bars), config, row_step, now);
+        let day_area = indicator
+            .areas
+            .iter()
+            .find(|(period, _)| period.kind == PeriodKind::Day)
+            .map(|(_, area)| *area);
+        assert_eq!(day_area.map(|area| area.poc), Some(Price::from_f64(102.0)));
+
+        indicator.sync_value_areas(None, config, row_step, now);
+        assert!(
+            indicator
+                .areas
+                .iter()
+                .any(|(period, _)| period.kind == PeriodKind::Day)
+        );
     }
 
     #[test]

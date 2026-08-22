@@ -1286,6 +1286,10 @@ pub fn kline_cfg_view<'a>(
 
     if let Some(min_usd) = large_trades {
         use data::chart::kline::Config as KlineConfig;
+        let min_usd = min_usd.clamp(
+            KlineConfig::LARGE_TRADES_MIN_USD_MIN,
+            KlineConfig::LARGE_TRADES_MIN_USD_MAX,
+        );
         let threshold_slider = labeled_slider(
             "Minimum trade size",
             KlineConfig::LARGE_TRADES_MIN_USD_MIN..=KlineConfig::LARGE_TRADES_MIN_USD_MAX,
@@ -1306,7 +1310,7 @@ pub fn kline_cfg_view<'a>(
         content = content.push(
             column![
                 text("Large Trades").size(crate::style::text_size::SECTION),
-                text("Circles mark executed trades above the threshold, merged across the selected trade venues. Buy markers use bid color, sells use ask color; size scales with notional."),
+                text("Circles mark executed trades above the threshold. Same-side prints within 100ms — including across selected venues — are drawn as one bubble at VWAP. Buy markers use bid color, sells use ask color; size scales with notional. Hover a circle to see its value."),
                 threshold_slider,
             ]
             .spacing(8),

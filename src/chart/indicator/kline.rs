@@ -211,6 +211,18 @@ pub trait KlineIndicatorImpl {
         _group_step: PriceStep,
     ) {
     }
+
+    /// Overlay hover chrome drawn on the crosshair layer in chart space.
+    fn draw_hover(
+        &self,
+        _frame: &mut canvas::Frame,
+        _chart: &ViewState,
+        _data_source: &PlotData<KlineDataPoint>,
+        _palette: &Extended,
+        _region: Rectangle,
+        _cursor: iced::Point,
+    ) {
+    }
 }
 
 pub struct FetchCtx<'a> {

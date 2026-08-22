@@ -45,7 +45,7 @@ use iced::{Alignment, Color, Element, Point, Rectangle, Renderer, Size, Theme, V
 
 use enum_map::EnumMap;
 use rustc_hash::{FxHashMap, FxHashSet};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const RENKO_SEED_TIMEFRAME: exchange::Timeframe = exchange::Timeframe::M1;
 /// A month of close-based seed bars. At 1000 bars per REST page this costs
@@ -101,6 +101,7 @@ struct FootprintHistoryRuntime {
     fetch_handles: Vec<Handle>,
     liquidity_sources: Vec<TickerInfo>,
     liquidity: Option<Box<LiquidityHeatmapRuntime>>,
+    last_overlay_redraw: Option<Instant>,
 }
 
 struct LiquidityHeatmapRuntime {
@@ -126,6 +127,7 @@ impl FootprintHistoryRuntime {
             fetch_handles: Vec::new(),
             liquidity_sources: vec![source],
             liquidity: None,
+            last_overlay_redraw: None,
         }
     }
 }
@@ -1249,6 +1251,9 @@ impl KlineChart {
             self.request_handler.mark_completed(req_id);
             self.pva_klines.insert(source, klines_raw);
             self.pva_dirty = true;
+            // Rebuild before the next canvas draw so restored overlays do not
+            // stay blank until the 1s pane tick.
+            self.sync_previous_value_areas();
         }
         self.invalidate(None);
     }
@@ -1422,6 +1427,11 @@ impl KlineChart {
             .liquidity_heatmap_order_size_filter
             .to_bits()
             != visual_config.liquidity_heatmap_order_size_filter.to_bits();
+        let mut visual_config = visual_config;
+        visual_config.large_trades_min_usd = visual_config.large_trades_min_usd.clamp(
+            Config::LARGE_TRADES_MIN_USD_MIN,
+            Config::LARGE_TRADES_MIN_USD_MAX,
+        );
         let large_trades_threshold_changed = self.visual_config.large_trades_min_usd.to_bits()
             != visual_config.large_trades_min_usd.to_bits();
         self.visual_config = visual_config;
@@ -1753,6 +1763,24 @@ impl KlineChart {
         }
     }
 
+    fn refresh_history_overlay(&mut self, force: bool) {
+        const OVERLAY_REFRESH: Duration = Duration::from_millis(400);
+        let now = Instant::now();
+        let due = self
+            .footprint_history
+            .last_overlay_redraw
+            .is_none_or(|previous| now.duration_since(previous) >= OVERLAY_REFRESH);
+        if !force && !due {
+            return;
+        }
+        self.footprint_history.last_overlay_redraw = Some(now);
+        if force {
+            self.invalidate(None);
+        } else {
+            self.chart.cache.clear_all();
+        }
+    }
+
     pub fn insert_raw_trades(
         &mut self,
         source: TickerInfo,
@@ -1764,10 +1792,10 @@ impl KlineChart {
             self.for_each_trade_history(|indicator| {
                 indicator.on_source_trades(source, &raw_trades, true);
             });
-            // Redraw as pages arrive so Large Trades / Daily Delta do not stay
-            // blank until the last trade of a multi-million-print UTC day.
-            // `invalidate(None)` only clears caches; it does not plan fetches.
-            self.invalidate(None);
+            // Full `invalidate` also re-runs autoscale and is far too expensive
+            // to do on every 10k-trade page. Refresh the canvas a few times a
+            // second so overlays populate without freezing the UI.
+            self.refresh_history_overlay(is_batches_done);
             if is_batches_done && let Some(req_id) = req_id {
                 self.request_handler.mark_completed(req_id);
             }
@@ -2612,6 +2640,27 @@ impl canvas::Program<Message> for KlineChart {
                     chart.basis,
                     None,
                     visible_range,
+                );
+            }
+
+            if let Some(cursor_position) = cursor.position_in(bounds)
+                && let Some(indicator) = self.indicators[KlineIndicator::LargeTrades].as_ref()
+            {
+                let center = Vector::new(bounds.width / 2.0, bounds.height / 2.0);
+                frame.translate(center);
+                frame.scale(chart.scaling);
+                frame.translate(chart.translation);
+                let cursor_chart = Point::new(
+                    (cursor_position.x - bounds.width / 2.0) / chart.scaling - chart.translation.x,
+                    (cursor_position.y - bounds.height / 2.0) / chart.scaling - chart.translation.y,
+                );
+                indicator.draw_hover(
+                    frame,
+                    chart,
+                    &self.data_source,
+                    palette,
+                    visible_region,
+                    cursor_chart,
                 );
             }
         });

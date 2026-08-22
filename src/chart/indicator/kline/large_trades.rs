@@ -21,9 +21,83 @@ pub(crate) const LARGE_TRADES_LOOKBACK_DAYS: u16 = 15;
 /// Extra milliseconds padded onto the visible time range so markers do not
 /// pop in at the pane edges.
 const EDGE_PAD_MS: u64 = 60_000;
-/// Above this many visible markers, per-marker labels are suppressed; circle
-/// fills alone keep redraws cheap on very low thresholds.
-const MAX_LABELED_MARKERS: usize = 300;
+/// Hard cap on circles drawn in one frame. Keep the largest prints in view.
+const MAX_DRAWN_MARKERS: usize = 400;
+/// Same-side prints whose timestamps fall in this window are drawn as one
+/// bubble (notional summed, VWAP price). Matches Binance aggTrades' 100ms
+/// compression, and also folds simultaneous multi-venue prints together.
+const CLUSTER_WINDOW_MS: u64 = 100;
+
+fn cluster_same_side_prints(mut prints: Vec<StoredLargeTrade>) -> Vec<StoredLargeTrade> {
+    if prints.len() <= 1 {
+        return prints;
+    }
+    prints.sort_by_key(|trade| (trade.is_sell, trade.time.as_u64()));
+    let mut clustered = Vec::with_capacity(prints.len());
+    let mut start = 0;
+    while start < prints.len() {
+        let side = prints[start].is_sell;
+        let window_start = prints[start].time.as_u64();
+        let mut end = start + 1;
+        while end < prints.len()
+            && prints[end].is_sell == side
+            && prints[end].time.as_u64().saturating_sub(window_start) <= CLUSTER_WINDOW_MS
+        {
+            end += 1;
+        }
+        clustered.push(merge_print_cluster(&prints[start..end]));
+        start = end;
+    }
+    clustered
+}
+
+fn merge_print_cluster(prints: &[StoredLargeTrade]) -> StoredLargeTrade {
+    if prints.len() == 1 {
+        return prints[0];
+    }
+    let mut notional = 0.0_f64;
+    let mut qty = 0.0_f64;
+    let mut time_weighted = 0.0_f64;
+    for print in prints {
+        let price = Price::from_units(print.price_units).to_f64();
+        let size = if price > 0.0 {
+            print.notional / price
+        } else {
+            0.0
+        };
+        notional += print.notional;
+        qty += size;
+        time_weighted += print.time.as_u64() as f64 * print.notional;
+    }
+    let vwap = if qty > 0.0 {
+        notional / qty
+    } else {
+        Price::from_units(prints[0].price_units).to_f64()
+    };
+    let time = if notional > 0.0 {
+        (time_weighted / notional).round() as u64
+    } else {
+        prints[0].time.as_u64()
+    };
+    StoredLargeTrade {
+        time: UnixMs::new(time),
+        price_units: Price::from_f64(vwap).units,
+        notional,
+        is_sell: prints[0].is_sell,
+    }
+}
+
+fn marker_radius(notional: f64, min_notional: f64, max_notional: f64, scaling: f32) -> f32 {
+    let min_n = min_notional.max(1.0);
+    let max_n = max_notional.max(min_n * 2.0);
+    let span = (max_n / min_n).ln().max(f64::EPSILON);
+    let t = ((notional / min_n).max(1.0).ln() / span).clamp(0.0, 1.0) as f32;
+    // Steeper than linear at the top so 10M vs 40M reads as a size jump.
+    let fraction = t.powf(1.35);
+    let radius_min = (4.0 / scaling).max(2.0);
+    let radius_max = (32.0 / scaling).max(radius_min + 10.0);
+    radius_min + (radius_max - radius_min) * fraction
+}
 
 fn capture_floor_usd() -> f32 {
     KlineChartConfig::LARGE_TRADES_MIN_USD_MIN
@@ -141,68 +215,83 @@ impl LargeTradesIndicator {
         region: Rectangle,
     ) -> Vec<(f32, StoredLargeTrade)> {
         let threshold = self.min_usd.max(capture_floor_usd());
+        // `region` is the transformed visible region the overlay was drawn
+        // with; deriving it from raw widget bounds here would produce a
+        // wrong price band and silently cull almost every marker.
+        let (highest, lowest) = chart.price_range(&region);
 
-        // The day books are keyed by UTC day; walk only the days the window
-        // touches and copy just the entries above the threshold.
-        let mut candidates: Vec<StoredLargeTrade> = Vec::new();
+        let mut prints: Vec<StoredLargeTrade> = Vec::new();
         let first_day = day_start(UnixMs::new(window.from));
         let last_day = day_start(UnixMs::new(window.to));
         let mut day = first_day;
         loop {
-            for trade in self.inner.display_large_trades(day, threshold) {
+            self.inner.for_each_large_trade(day, threshold, |trade| {
                 let time = trade.time.as_u64();
-                if time >= window.from && time <= window.to {
-                    candidates.push(trade);
+                if time < window.from || time > window.to {
+                    return;
                 }
-            }
+                let price = Price::from_units(trade.price_units);
+                if price > highest || price < lowest {
+                    return;
+                }
+                prints.push(trade);
+            });
             if day >= last_day {
                 break;
             }
             day = day.saturating_add(DAY_MS);
         }
 
-        let mut markers: Vec<(f32, StoredLargeTrade)> = Vec::with_capacity(candidates.len());
-        match &window.mapper {
-            XMapper::Timestamp => {
-                for trade in candidates {
-                    markers.push((chart.interval_to_x(trade.time.as_u64()), trade));
-                }
+        let clustered = cluster_same_side_prints(prints);
+        let mut markers: Vec<(f32, StoredLargeTrade)> = Vec::with_capacity(clustered.len());
+        for trade in clustered {
+            let Some(x) = self.marker_x(chart, data_source, window, trade.time.as_u64()) else {
+                continue;
+            };
+            if !x.is_finite() {
+                continue;
             }
+            markers.push((x, trade));
+        }
+
+        if markers.len() > MAX_DRAWN_MARKERS {
+            markers.select_nth_unstable_by(MAX_DRAWN_MARKERS, |left, right| {
+                right.1.notional.total_cmp(&left.1.notional)
+            });
+            markers.truncate(MAX_DRAWN_MARKERS);
+        }
+        markers
+    }
+
+    fn marker_x(
+        &self,
+        chart: &ViewState,
+        data_source: &PlotData<KlineDataPoint>,
+        window: &VisibleWindow,
+        time: u64,
+    ) -> Option<f32> {
+        match &window.mapper {
+            XMapper::Timestamp => Some(chart.interval_to_x(time)),
             XMapper::Brick {
                 first_idx,
                 last_idx,
             } => {
                 let PlotData::TickBased(tick_aggr) = data_source else {
-                    return markers;
+                    return None;
                 };
                 let len = tick_aggr.datapoints.len();
-                let (first, last) = (*first_idx, *last_idx);
-                for trade in candidates {
-                    let closed_bricks = tick_aggr
-                        .datapoints
-                        .partition_point(|dp| dp.kline.time.as_u64() <= trade.time.as_u64());
-                    if closed_bricks == 0 || closed_bricks > len {
-                        continue;
-                    }
-                    let index = (len - closed_bricks) as u64;
-                    if !(first..=last).contains(&index) {
-                        continue;
-                    }
-                    markers.push((chart.interval_to_x(index), trade));
+                let closed_bricks = tick_aggr
+                    .datapoints
+                    .partition_point(|dp| dp.kline.time.as_u64() <= time);
+                if closed_bricks == 0 || closed_bricks > len {
+                    return None;
                 }
+                let index = (len - closed_bricks) as u64;
+                (*first_idx..=*last_idx)
+                    .contains(&index)
+                    .then(|| chart.interval_to_x(index))
             }
         }
-
-        // `region` is the transformed visible region the overlay was drawn
-        // with; deriving it from raw widget bounds here would produce a
-        // wrong price band and silently cull almost every marker.
-        let (highest, lowest) = chart.price_range(&region);
-        markers.retain(|(x, trade)| {
-            x.is_finite()
-                && Price::from_units(trade.price_units) <= highest
-                && Price::from_units(trade.price_units) >= lowest
-        });
-        markers
     }
 }
 
@@ -294,21 +383,16 @@ impl KlineIndicatorImpl for LargeTradesIndicator {
         }
 
         let scaling = chart.scaling.max(0.01);
+        let min_notional = f64::from(self.min_usd.max(capture_floor_usd()));
         let max_notional = markers
             .iter()
             .map(|(_, trade)| trade.notional)
-            .fold(0.0_f64, f64::max)
-            .max(f64::from(self.min_usd.max(capture_floor_usd())));
-        let radius_min = (2.25 / scaling).max(1.0);
-        let radius_max = (8.5 / scaling).max(radius_min + 0.5);
-        let ring_width = (1.1 / scaling).clamp(0.5, 2.0);
+            .fold(min_notional, f64::max);
+        let ring_width = (1.2 / scaling).clamp(0.6, 2.4);
         let (buy, sell) = delta_history_colors(palette);
-        let label_color = palette.background.base.text.scale_alpha(0.85);
-        let show_labels = markers.len() <= MAX_LABELED_MARKERS;
 
         for (x, trade) in markers {
-            let fraction = (trade.notional / max_notional).sqrt();
-            let radius = radius_min + (radius_max - radius_min) * fraction as f32;
+            let radius = marker_radius(trade.notional, min_notional, max_notional, scaling);
             if !radius.is_finite() || radius <= 0.0 {
                 continue;
             }
@@ -331,19 +415,69 @@ impl KlineIndicatorImpl for LargeTradesIndicator {
                     base.scale_alpha(0.95),
                 ),
             );
+        }
+    }
 
-            if show_labels && radius * scaling >= 5.0 {
-                let text = format!("${}", abbr_large_numbers(trade.notional));
-                draw_text(
-                    frame,
-                    &text,
-                    Point::new(x, y - radius - 6.0 / scaling),
-                    (9.0 / scaling).clamp(7.0, 11.0),
-                    label_color,
-                    Alignment::Center,
-                );
+    fn draw_hover(
+        &self,
+        frame: &mut canvas::Frame,
+        chart: &ViewState,
+        data_source: &PlotData<KlineDataPoint>,
+        palette: &Extended,
+        region: Rectangle,
+        cursor: Point,
+    ) {
+        let Some(window) = self.visible_window(chart, data_source, region) else {
+            return;
+        };
+        let markers = self.collect_markers(chart, data_source, &window, region);
+        if markers.is_empty() {
+            return;
+        }
+
+        let scaling = chart.scaling.max(0.01);
+        let min_notional = f64::from(self.min_usd.max(capture_floor_usd()));
+        let max_notional = markers
+            .iter()
+            .map(|(_, trade)| trade.notional)
+            .fold(min_notional, f64::max);
+
+        let mut hovered: Option<(f32, Point, f64)> = None;
+        for (x, trade) in &markers {
+            let radius = marker_radius(trade.notional, min_notional, max_notional, scaling);
+            if !radius.is_finite() || radius <= 0.0 {
+                continue;
+            }
+            let y = chart.price_to_y(Price::from_units(trade.price_units));
+            if !y.is_finite() {
+                continue;
+            }
+            let dx = cursor.x - x;
+            let dy = cursor.y - y;
+            let dist_sq = dx * dx + dy * dy;
+            if dist_sq > radius * radius {
+                continue;
+            }
+            let replace = hovered.is_none_or(|(best_dist, _, _)| dist_sq < best_dist);
+            if replace {
+                hovered = Some((dist_sq, Point::new(*x, y), trade.notional));
             }
         }
+
+        let Some((_, center, notional)) = hovered else {
+            return;
+        };
+        let radius = marker_radius(notional, min_notional, max_notional, scaling);
+        let label_color = palette.background.base.text;
+        let text = format!("${}", abbr_large_numbers(notional));
+        draw_text(
+            frame,
+            &text,
+            Point::new(center.x, center.y - radius - 8.0 / scaling),
+            (10.0 / scaling).clamp(8.0, 13.0),
+            label_color,
+            Alignment::Center,
+        );
     }
 }
 
@@ -391,24 +525,24 @@ mod tests {
             binance(),
             &[
                 trade(base + 1_000, 60_000.0, 0.05, false), // $3k — dropped
-                trade(base + 1_001, 60_000.0, 2.0, true),   // $120k — kept
+                trade(base + 1_001, 60_000.0, 25.0, true),  // $1.5M — kept
             ],
             false,
         );
 
         let day = day_start(UnixMs::new(base + 1_000));
-        assert!(
+        assert_eq!(
             indicator
                 .inner
                 .display_large_trades(day, capture_floor_usd())
-                .len()
-                == 1
+                .len(),
+            1
         );
         // The user-facing threshold filters at read time without refetching.
         assert!(
             indicator
                 .inner
-                .display_large_trades(day, KlineChartConfig::LARGE_TRADES_MIN_USD_DEFAULT)
+                .display_large_trades(day, 5_000_000.0)
                 .is_empty()
         );
     }
@@ -419,8 +553,12 @@ mod tests {
         let mut indicator = LargeTradesIndicator::new();
         indicator.configure_footprint_history(&[binance(), bybit()], true);
 
-        indicator.on_source_trades(binance(), &[trade(base + 100, 60_000.0, 1.0, false)], false);
-        indicator.on_source_trades(bybit(), &[trade(base + 101, 60_000.0, 1.0, true)], false);
+        indicator.on_source_trades(
+            binance(),
+            &[trade(base + 100, 60_000.0, 20.0, false)],
+            false,
+        );
+        indicator.on_source_trades(bybit(), &[trade(base + 101, 60_000.0, 20.0, true)], false);
 
         let day = day_start(UnixMs::new(base + 100));
         let merged = indicator
@@ -441,7 +579,7 @@ mod tests {
         // A large print lands live, after the session started.
         indicator.on_source_trades(
             binance(),
-            &[trade(cutoff.as_u64() + 1_000, 61_000.0, 2.0, false)],
+            &[trade(cutoff.as_u64() + 1_000, 61_000.0, 20.0, false)],
             false,
         );
 
@@ -449,7 +587,11 @@ mod tests {
         // later; it covers only up to the cutoff, so the live print must not
         // be dropped or duplicated.
         let day = day_start(UnixMs::new(cutoff.as_u64()));
-        indicator.on_source_trades(binance(), &[trade(day + 60_000, 60_000.0, 2.0, true)], true);
+        indicator.on_source_trades(
+            binance(),
+            &[trade(day + 60_000, 60_000.0, 20.0, true)],
+            true,
+        );
 
         let merged = indicator
             .inner
@@ -469,14 +611,14 @@ mod tests {
         indicator.configure_footprint_history(&[binance()], true);
 
         // Live tape inside the upcoming backfill window.
-        indicator.on_source_trades(binance(), &[trade(base + 130, 61_000.0, 1.0, true)], false);
+        indicator.on_source_trades(binance(), &[trade(base + 130, 61_000.0, 20.0, true)], false);
 
         // Authoritative Binance day batch covering [base+120, base+180].
         indicator.on_source_trades(
             binance(),
             &[
-                trade(base + 120, 62_000.0, 2.0, false),
-                trade(base + 180, 63_000.0, 2.0, true),
+                trade(base + 120, 62_000.0, 20.0, false),
+                trade(base + 180, 63_000.0, 20.0, true),
             ],
             true,
         );
@@ -495,7 +637,11 @@ mod tests {
         let base = now_base();
         let mut indicator = LargeTradesIndicator::new();
         indicator.configure_footprint_history(&[binance()], true);
-        indicator.on_source_trades(binance(), &[trade(base + 100, 60_000.0, 1.0, false)], false);
+        indicator.on_source_trades(
+            binance(),
+            &[trade(base + 100, 60_000.0, 20.0, false)],
+            false,
+        );
 
         indicator.reset_trade_history_backfill();
 
@@ -528,6 +674,47 @@ mod tests {
         let shown = indicator.inner.display_large_trades(day, 1_090_000.0);
         assert_eq!(shown.len(), 1);
         assert!((shown[0].notional - 1_600_000.0).abs() < 1.0);
+    }
+
+    fn stored(time: u64, price: f64, notional: f64, is_sell: bool) -> StoredLargeTrade {
+        StoredLargeTrade {
+            time: UnixMs::new(time),
+            price_units: Price::from_f64(price).units,
+            notional,
+            is_sell,
+        }
+    }
+
+    #[test]
+    fn same_side_prints_inside_100ms_merge_into_one_bubble() {
+        let clustered = cluster_same_side_prints(vec![
+            stored(1_000, 80_000.0, 1_200_000.0, false),
+            stored(1_040, 80_200.0, 1_800_000.0, false),
+            stored(1_090, 80_100.0, 1_000_000.0, false),
+        ]);
+        assert_eq!(clustered.len(), 1);
+        assert!(!clustered[0].is_sell);
+        assert!((clustered[0].notional - 4_000_000.0).abs() < 1.0);
+        let vwap = Price::from_units(clustered[0].price_units).to_f64();
+        assert!((vwap - 80_110.0).abs() < 50.0);
+    }
+
+    #[test]
+    fn opposite_sides_in_the_same_window_stay_two_bubbles() {
+        let clustered = cluster_same_side_prints(vec![
+            stored(1_000, 80_000.0, 1_200_000.0, false),
+            stored(1_010, 80_000.0, 1_200_000.0, true),
+        ]);
+        assert_eq!(clustered.len(), 2);
+    }
+
+    #[test]
+    fn prints_farther_than_100ms_are_not_clustered() {
+        let clustered = cluster_same_side_prints(vec![
+            stored(1_000, 80_000.0, 1_200_000.0, true),
+            stored(1_150, 80_000.0, 1_200_000.0, true),
+        ]);
+        assert_eq!(clustered.len(), 2);
     }
 
     #[test]

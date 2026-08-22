@@ -48,8 +48,8 @@ fn large_trades_capture_floor() -> f64 {
 /// Hard per-day ceiling so busy symbols cannot grow the shared day book
 /// without bound. Retention is by notional, not recency: when the cap is hit
 /// the smallest stored prints are dropped so a $10k flood cannot evict the
-/// $1M+ trades the overlay is for. The $10_000 capture floor on BTCUSDT
-/// produces well over this many prints per session.
+/// $1M+ trades the overlay is for. The $1_000_000 capture floor on BTCUSDT
+/// still fills this cap on the busiest sessions.
 const MAX_LARGE_TRADES_PER_DAY: usize = 100_000;
 /// Compact only after this many extras have accumulated, so a busy tape is
 /// not sorted on every insert.
@@ -283,8 +283,9 @@ impl DayStats {
         {
             self.largest_trade = Some(largest);
         }
-        self.large_trades.extend_from_slice(&other.large_trades);
-        self.compact_large_trades();
+        // Large prints are read per-venue by the overlay. Copying them into
+        // display merges (Daily Delta, standalone Footprint History) would
+        // clone and sort up to 100k entries per venue on every rebuild.
     }
 
     fn volume(&self) -> f64 {
@@ -664,32 +665,42 @@ impl FootprintHistoryIndicator {
         result
     }
 
-    /// Large executed trades recorded for a UTC day, merged across active
-    /// sources and pre-filtered by the caller's threshold. Copies only the
-    /// matching entries, never the whole day book.
-    pub(crate) fn display_large_trades(
+    /// Visit large executed trades for a UTC day across active sources.
+    /// Does not allocate; the overlay keeps only the markers it will draw.
+    pub(crate) fn for_each_large_trade(
         &self,
         day_start_ts: u64,
         threshold_usd: f32,
-    ) -> Vec<StoredLargeTrade> {
+        mut visit: impl FnMut(StoredLargeTrade),
+    ) {
         let floor =
             f64::from(threshold_usd.max(data::chart::kline::Config::LARGE_TRADES_MIN_USD_MIN));
-        let mut trades: Vec<StoredLargeTrade> = Vec::new();
         for source in self.active_sources() {
             if let Some(stats) = self
                 .histories
                 .get(&source.ticker)
                 .and_then(|history| history.days.get(&day_start_ts))
             {
-                trades.extend(
-                    stats
-                        .large_trades
-                        .iter()
-                        .copied()
-                        .filter(|trade| trade.notional >= floor),
-                );
+                for trade in &stats.large_trades {
+                    if trade.notional >= floor {
+                        visit(*trade);
+                    }
+                }
             }
         }
+    }
+
+    /// Large executed trades recorded for a UTC day, merged across active
+    /// sources and pre-filtered by the caller's threshold. Copies only the
+    /// matching entries, never the whole day book.
+    #[cfg(test)]
+    pub(crate) fn display_large_trades(
+        &self,
+        day_start_ts: u64,
+        threshold_usd: f32,
+    ) -> Vec<StoredLargeTrade> {
+        let mut trades: Vec<StoredLargeTrade> = Vec::new();
+        self.for_each_large_trade(day_start_ts, threshold_usd, |trade| trades.push(trade));
         if trades.len() > 1 {
             trades.sort_by_key(|trade| trade.time.as_u64());
         }
@@ -1810,50 +1821,39 @@ mod tests {
     }
 
     #[test]
-    fn merging_day_books_keeps_the_largest_prints() {
+    fn display_merge_does_not_copy_large_trades() {
         let mut left = DayStats::default();
         let mut right = DayStats::default();
-        for _ in 0..MAX_LARGE_TRADES_PER_DAY {
-            left.push_large_trade(stored_print(1, 10_000.0, false));
-            right.push_large_trade(stored_print(2, 12_000.0, true));
-        }
-        left.push_large_trade(stored_print(3, 3_000_000.0, false));
+        left.push_large_trade(stored_print(1, 2_000_000.0, false));
+        right.push_large_trade(stored_print(2, 3_000_000.0, true));
         left.merge(&right);
 
-        assert!(
-            left.large_trades
-                .iter()
-                .any(|trade| (trade.notional - 3_000_000.0).abs() < f64::EPSILON)
-        );
-        assert!(
-            left.large_trades
-                .iter()
-                .all(|trade| trade.notional >= 12_000.0)
-        );
-        assert!(left.large_trades.len() <= MAX_LARGE_TRADES_PER_DAY);
+        assert_eq!(left.large_trades.len(), 1);
+        assert!((left.large_trades[0].notional - 2_000_000.0).abs() < f64::EPSILON);
+        assert_eq!(left.volume(), 0.0);
     }
 
     #[test]
     fn insert_trade_retains_a_million_dollar_print_on_a_busy_btc_day() {
         let mut stats = DayStats::default();
-        let small_qty = 10_000.0 / 80_000.0;
+        let small_qty = 1_000_000.0 / 80_000.0;
         for i in 0..MAX_LARGE_TRADES_PER_DAY {
             stats.insert_trade(trade(i as u64, 80_000.0, small_qty, false));
         }
-        stats.insert_trade(trade(50_000, 80_000.0, 25.0, false));
-        let later_qty = 11_000.0 / 80_000.0;
+        stats.insert_trade(trade(50_000, 80_000.0, 50.0, false));
+        let later_qty = 1_100_000.0 / 80_000.0;
         for i in 0..MAX_LARGE_TRADES_PER_DAY {
             stats.insert_trade(trade(100_000 + i as u64, 80_000.0, later_qty, true));
         }
         stats.compact_large_trades();
 
-        let whale = 80_000.0 * 25.0;
+        let whale = 80_000.0 * 50.0;
         assert!(
             stats
                 .large_trades
                 .iter()
                 .any(|trade| (trade.notional - whale).abs() < 1.0),
-            "price * qty of 25 BTC at 80k must remain after the $10k floor floods the cap"
+            "price * qty of 50 BTC at 80k must remain after the $1M floor floods the cap"
         );
         assert!(stats.large_trades.len() <= MAX_LARGE_TRADES_PER_DAY);
     }

@@ -577,10 +577,10 @@ impl Config {
     /// Large Trades capture floor. Every trade at or above this notional is
     /// retained while it is in the retention window, so lowering the visible
     /// threshold never needs a re-backfill.
-    pub const LARGE_TRADES_MIN_USD_MIN: f32 = 10_000.0;
-    pub const LARGE_TRADES_MIN_USD_MAX: f32 = 5_000_000.0;
-    pub const LARGE_TRADES_MIN_USD_DEFAULT: f32 = 250_000.0;
-    pub const LARGE_TRADES_MIN_USD_STEP: f32 = 10_000.0;
+    pub const LARGE_TRADES_MIN_USD_MIN: f32 = 1_000_000.0;
+    pub const LARGE_TRADES_MIN_USD_MAX: f32 = 40_000_000.0;
+    pub const LARGE_TRADES_MIN_USD_DEFAULT: f32 = 1_000_000.0;
+    pub const LARGE_TRADES_MIN_USD_STEP: f32 = 1_000_000.0;
 
     /// TPO config used to build Previous Value Areas profiles.
     ///
