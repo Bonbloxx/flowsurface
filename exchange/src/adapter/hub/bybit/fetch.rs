@@ -299,7 +299,7 @@ pub(super) async fn fetch_historical_oi(
         let start = start.as_u64();
         let end = end.as_u64();
         let interval_ms = period.to_milliseconds();
-        let num_intervals = ((end - start) / interval_ms).min(200);
+        let num_intervals = (end.saturating_sub(start) / interval_ms).clamp(1, 200);
 
         url.push_str(&format!(
             "&startTime={start}&endTime={end}&limit={num_intervals}"

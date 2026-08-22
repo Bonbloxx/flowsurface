@@ -644,6 +644,7 @@ pub fn kline_cfg_view<'a>(
     liquidity_heatmap: LiquidityHeatmapSettings,
     daily_delta: Option<(u16, u16)>,
     previous_value_area: Option<u16>,
+    large_trades: Option<f32>,
 ) -> Element<'a, Message> {
     let uses_shared_price_grid = !aggregate_sources.is_empty();
     let display_readout_section = {
@@ -1278,6 +1279,35 @@ pub fn kline_cfg_view<'a>(
                 text("Combine live order books from Binance, Bybit, and Hyperliquid. History starts when enabled because venues do not provide historical L2 snapshots."),
                 order_size_filter,
                 source_choices,
+            ]
+            .spacing(8),
+        );
+    }
+
+    if let Some(min_usd) = large_trades {
+        use data::chart::kline::Config as KlineConfig;
+        let threshold_slider = labeled_slider(
+            "Minimum trade size",
+            KlineConfig::LARGE_TRADES_MIN_USD_MIN..=KlineConfig::LARGE_TRADES_MIN_USD_MAX,
+            min_usd,
+            move |value| {
+                Message::VisualConfigChanged(
+                    pane,
+                    VisualConfig::Kline(data::chart::kline::Config {
+                        large_trades_min_usd: value,
+                        ..cfg
+                    }),
+                    false,
+                )
+            },
+            |value| format!("${}", format_with_commas(*value as f64)),
+            Some(KlineConfig::LARGE_TRADES_MIN_USD_STEP),
+        );
+        content = content.push(
+            column![
+                text("Large Trades").size(crate::style::text_size::SECTION),
+                text("Circles mark executed trades above the threshold, merged across the selected trade venues. Buy markers use bid color, sells use ask color; size scales with notional."),
+                threshold_slider,
             ]
             .spacing(8),
         );

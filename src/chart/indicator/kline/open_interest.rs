@@ -36,9 +36,16 @@ pub struct OpenInterestIndicator {
     sources: Vec<TickerInfo>,
     source_data: FxHashMap<TickerInfo, BTreeMap<UnixMs, f64>>,
     timeframe: Option<Timeframe>,
+    /// Wall-clock time of the last developing-bucket re-poll, so the freshest
+    /// OI candle tracks venue revisions instead of freezing between buckets.
+    last_refresh_request: Option<UnixMs>,
 }
 
 impl OpenInterestIndicator {
+    /// How often the still-forming bucket is re-pollen beyond bucket-boundary
+    /// fetches, so the newest OI candle reflects venue revisions.
+    const DEVELOPING_REFRESH_MS: u64 = 60_000;
+
     pub fn new() -> Self {
         Self {
             cache: Caches::default(),
@@ -46,7 +53,14 @@ impl OpenInterestIndicator {
             sources: Vec::new(),
             source_data: FxHashMap::default(),
             timeframe: None,
+            last_refresh_request: None,
         }
+    }
+
+    fn bucket_interval_ms(&self) -> u64 {
+        self.timeframe
+            .map(Timeframe::to_milliseconds)
+            .unwrap_or_else(|| Timeframe::M5.to_milliseconds())
     }
 
     fn indicator_elem<'a>(
@@ -128,41 +142,63 @@ impl OpenInterestIndicator {
         }
 
         // Venues without a historical OI endpoint (e.g. Hyperliquid) only
-        // return a snapshot of the current value. Summing such snapshots into
-        // the aggregate makes total OI jump by the whole venue notional when
-        // the snapshot arrives and collapse again once it ages out of the
-        // freshness window, rendering as huge fake OI candles. A source must
-        // therefore accumulate real history before it may contribute, and
-        // once qualified its last known value is carried forward instead of
-        // being dropped when updates lag, so coverage changes never masquerade
-        // as OI flows.
+        // return a snapshot of the current value, and some venues cap how far
+        // back their OI history endpoint paginates. Summing such a source into
+        // the aggregate only from its first sample makes total OI jump by the
+        // whole venue notional mid-series, masquerading as an OI flow. A
+        // source must therefore accumulate real history before it may
+        // contribute, and once qualified its nearest known value is used in
+        // both directions — carried forward when updates lag and carried back
+        // across candles that predate its first sample — so coverage changes
+        // shift the level once at most and never render as fake OI candles.
         const MIN_QUALIFYING_SAMPLES: usize = 5;
+        // Forward carry-forward must expire: a venue that stops reporting
+        // must not keep its last notional in the sum indefinitely, because
+        // that presents frozen OI as live. Two buckets of silence is the
+        // widest lag that still reads as "publishes slowly" rather than "went
+        // quiet"; beyond it the source drops out and the coverage count says
+        // so.
+        const MAX_CARRY_FORWARD_BUCKETS: u64 = 2;
+        let interval_ms = self.bucket_interval_ms();
 
-        let times = self
-            .source_data
-            .values()
+        let qualified = self
+            .sources
+            .iter()
+            .filter_map(|source| {
+                let series = self.source_data.get(source)?;
+                if series.len() < MIN_QUALIFYING_SAMPLES {
+                    return None;
+                }
+                Some(series)
+            })
+            .collect::<Vec<_>>();
+
+        let times = qualified
+            .iter()
             .flat_map(|series| series.keys().copied())
             .collect::<BTreeSet<_>>();
         let mut rebuilt = BTreeMap::new();
         let mut previous_close = None;
 
         for time in times {
-            let values = self
-                .sources
-                .iter()
-                .filter_map(|source| {
-                    let series = self.source_data.get(source)?;
-                    if series.len() < MIN_QUALIFYING_SAMPLES {
-                        return None;
+            let mut close = 0.0;
+            let mut source_count = 0usize;
+            for series in &qualified {
+                // Last known value at or before `time`, else the earliest
+                // known value carried back across preceding candles.
+                let value = match series.range(..=time).next_back() {
+                    Some((sample_time, value)) => {
+                        let staleness = time.as_u64().saturating_sub(sample_time.as_u64());
+                        if staleness > MAX_CARRY_FORWARD_BUCKETS * interval_ms {
+                            continue;
+                        }
+                        source_count += 1;
+                        *value
                     }
-                    series.range(..=time).next_back()
-                })
-                .map(|(_, value)| *value)
-                .collect::<Vec<_>>();
-            if values.is_empty() {
-                continue;
+                    None => *series.values().next().expect("qualified series non-empty"),
+                };
+                close += value;
             }
-            let close = values.iter().sum::<f64>();
             let open = previous_close.unwrap_or(close);
             rebuilt.insert(
                 time,
@@ -171,7 +207,7 @@ impl OpenInterestIndicator {
                     high: open.max(close),
                     low: open.min(close),
                     close,
-                    source_count: values.len(),
+                    source_count,
                     expected_source_count: self.sources.len(),
                 },
             );
@@ -257,6 +293,25 @@ impl KlineIndicatorImpl for OpenInterestIndicator {
             ));
         }
 
+        // Bucket coverage is up to date, but the newest candle still spans the
+        // bucket that is forming right now, and venues keep revising their OI
+        // inside it. Re-poll the tail on a wall-clock cadence so the
+        // developing candle tracks those revisions instead of freezing at
+        // whatever the bucket's first snapshot reported. The range end moves
+        // with the clock so each refresh is a distinct request and cannot be
+        // suppressed as an already-completed range.
+        let now = UnixMs::now();
+        let refresh_due = self.last_refresh_request.is_none_or(|last| {
+            now.as_u64().saturating_sub(last.as_u64()) >= Self::DEVELOPING_REFRESH_MS
+        });
+        if refresh_due {
+            self.last_refresh_request = Some(now);
+            return Some(FetchRange::OpenInterest(
+                oi_latest.max(ctx.prefetch_earliest),
+                now,
+            ));
+        }
+
         None
     }
 
@@ -298,10 +353,7 @@ impl KlineIndicatorImpl for OpenInterestIndicator {
         if !self.sources.contains(&source) {
             return;
         }
-        let interval = self
-            .timeframe
-            .map(Timeframe::to_milliseconds)
-            .unwrap_or_else(|| Timeframe::M5.to_milliseconds());
+        let interval = self.bucket_interval_ms();
         let series = self.source_data.entry(source).or_default();
         for value in values {
             let bucket = value.time.as_u64() / interval * interval;
@@ -406,14 +458,75 @@ mod tests {
         );
 
         let first = indicator.data[&UnixMs::new(300_000)];
-        assert_eq!(first.close, 11_000_000_000.0);
+        // Hyperliquid has no sample this early; its first known value is
+        // carried back so the aggregate level is continuous across coverage.
+        assert_eq!(first.close, 13_500_000_000.0);
         assert_eq!(first.source_count, 2);
         let current = indicator.data[&UnixMs::new(600_000)];
-        assert_eq!(current.open, 11_000_000_000.0);
+        assert_eq!(current.open, 13_500_000_000.0);
         assert_eq!(current.close, 13_500_000_000.0);
         assert_eq!(current.high, 13_500_000_000.0);
-        assert_eq!(current.low, 11_000_000_000.0);
+        assert_eq!(current.low, 13_500_000_000.0);
+        // Hyperliquid's first actual sample buckets to 600_000.
         assert_eq!(current.source_count, 3);
+    }
+
+    #[test]
+    fn late_joining_source_does_not_step_the_aggregate() {
+        let binance = source(Exchange::BinanceLinear, "BTCUSDT");
+        let hyperliquid = source(Exchange::HyperliquidLinear, "BTC");
+        let mut indicator = OpenInterestIndicator::new();
+        indicator.timeframe = Some(Timeframe::M5);
+        indicator.configure_open_interest(&[binance, hyperliquid]);
+
+        let oi = |time: u64, value: f64| OpenInterest {
+            time: UnixMs::new(time),
+            value,
+        };
+        // Constant per-source values so any coverage-driven step in the
+        // aggregate would be visible as a candle whose close != open.
+        indicator.on_source_open_interest(
+            binance,
+            &[
+                oi(300_000, 7.0e9),
+                oi(600_000, 7.0e9),
+                oi(900_000, 7.0e9),
+                oi(1_200_000, 7.0e9),
+                oi(1_500_000, 7.0e9),
+                oi(1_800_000, 7.0e9),
+                oi(2_100_000, 7.0e9),
+                oi(2_400_000, 7.0e9),
+                oi(2_700_000, 7.0e9),
+            ],
+        );
+        // Hyperliquid's history only begins at 1_500_000 (snapshot venue or
+        // short history window). Once it qualifies it must not add a fake
+        // +2.5b step at that point: its first value is carried back instead.
+        indicator.on_source_open_interest(
+            hyperliquid,
+            &[
+                oi(1_500_000, 2.5e9),
+                oi(1_800_123, 2.5e9),
+                oi(2_100_123, 2.5e9),
+                oi(2_400_123, 2.5e9),
+                oi(2_700_123, 2.5e9),
+            ],
+        );
+
+        assert_eq!(indicator.data.len(), 9);
+        for candle in indicator.data.values() {
+            assert_eq!(candle.close, 9_500_000_000.0);
+            assert_eq!(candle.open, 9_500_000_000.0);
+            assert_eq!(candle.high, 9_500_000_000.0);
+            assert_eq!(candle.low, 9_500_000_000.0);
+        }
+        // Coverage stays honest even though the level is continuous.
+        for time in [300_000, 600_000, 900_000, 1_200_000] {
+            assert_eq!(indicator.data[&UnixMs::new(time)].source_count, 1);
+        }
+        for time in [1_500_000, 1_800_000, 2_100_000, 2_400_000, 2_700_000] {
+            assert_eq!(indicator.data[&UnixMs::new(time)].source_count, 2);
+        }
     }
 
     #[test]
@@ -479,9 +592,9 @@ mod tests {
             time: UnixMs::new(time),
             value,
         };
-        // Bybit stops updating after 1_500_000 but has enough history to
-        // qualify; its last known value must be carried forward instead of
-        // dropping out of the sum.
+        // Bybit stops updating after 1_800_000 but has enough history to
+        // qualify; within the carry-forward window its last known value is
+        // used so a slow publisher does not read as an OI outflow.
         indicator.on_source_open_interest(
             bybit,
             &[
@@ -490,6 +603,8 @@ mod tests {
                 oi(900_000, 4.2e9),
                 oi(1_200_000, 4.1e9),
                 oi(1_500_000, 4.0e9),
+                oi(1_800_000, 3.9e9),
+                oi(2_100_000, 3.85e9),
             ],
         );
         indicator.on_source_open_interest(
@@ -507,10 +622,62 @@ mod tests {
         );
 
         assert_eq!(
+            indicator.data[&UnixMs::new(2_100_000)].close,
+            11_050_000_000.0
+        );
+        assert_eq!(indicator.data[&UnixMs::new(2_100_000)].source_count, 2);
+        assert_eq!(
             indicator.data[&UnixMs::new(2_400_000)].close,
-            11_250_000_000.0
+            11_100_000_000.0
         );
         assert_eq!(indicator.data[&UnixMs::new(2_400_000)].source_count, 2);
+    }
+
+    #[test]
+    fn source_that_stops_reporting_drops_out_once_stale() {
+        let binance = source(Exchange::BinanceLinear, "BTCUSDT");
+        let bybit = source(Exchange::BybitLinear, "BTCUSDT");
+        let mut indicator = OpenInterestIndicator::new();
+        indicator.timeframe = Some(Timeframe::M5);
+        indicator.configure_open_interest(&[binance, bybit]);
+
+        let oi = |time: u64, value: f64| OpenInterest {
+            time: UnixMs::new(time),
+            value,
+        };
+        // Bybit qualifies but goes silent after 1_500_000. Its value may be
+        // carried forward across two buckets (1_800_000 and 2_100_000) but
+        // must then be excluded: keeping the stale notional in the sum would
+        // present frozen OI as live.
+        indicator.on_source_open_interest(
+            bybit,
+            &[
+                oi(300_000, 4.4e9),
+                oi(600_000, 4.3e9),
+                oi(900_000, 4.2e9),
+                oi(1_200_000, 4.1e9),
+                oi(1_500_000, 4.05e9),
+            ],
+        );
+        indicator.on_source_open_interest(
+            binance,
+            &[
+                oi(600_000, 6.9e9),
+                oi(900_000, 7.0e9),
+                oi(1_200_000, 7.0e9),
+                oi(1_500_000, 7.1e9),
+                oi(1_800_000, 7.15e9),
+                oi(2_100_000, 7.2e9),
+                oi(2_400_000, 7.25e9),
+            ],
+        );
+
+        assert_eq!(indicator.data[&UnixMs::new(2_100_000)].source_count, 2);
+        assert_eq!(
+            indicator.data[&UnixMs::new(2_400_000)].close,
+            7_250_000_000.0
+        );
+        assert_eq!(indicator.data[&UnixMs::new(2_400_000)].source_count, 1);
     }
 
     #[test]

@@ -8,6 +8,9 @@ use exchange::{
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
+/// Smallest on-screen height of one TPO price row when zoomed fully out.
+const TPO_MIN_ROW_HEIGHT_PX: f32 = 1.5;
+
 #[derive(Clone)]
 pub struct KlineDataPoint {
     pub kline: Kline,
@@ -421,7 +424,13 @@ impl KlineChartKind {
     pub fn min_cell_height(&self) -> f32 {
         match self {
             KlineChartKind::Footprint { .. } => 1.0,
-            KlineChartKind::Tpo { .. } => 0.02,
+            // Per-tick height; visual TPO row = cell_height * ticks_per_row.
+            // Bound the *visual* row (~1.5 px at scale 1) instead of the raw
+            // per-tick height, or large ticks-per-row values make further
+            // zoom-out impossible.
+            KlineChartKind::Tpo { config } => {
+                (TPO_MIN_ROW_HEIGHT_PX / config.ticks_per_row.max(1) as f32).max(0.000_5)
+            }
             KlineChartKind::Candles | KlineChartKind::Renko { .. } => 0.001,
         }
     }
@@ -557,10 +566,21 @@ pub struct Config {
     pub previous_value_area_value_area_percent: u8,
     /// Minimum displayed liquidity order size in quote currency (USD for USDT/USDC markets).
     pub liquidity_heatmap_order_size_filter: f32,
+    /// Minimum executed-trade notional in quote currency shown by the
+    /// Large Trades overlay.
+    pub large_trades_min_usd: f32,
 }
 
 impl Config {
     pub const DAILY_DELTA_DAY_PRESETS: [u16; 7] = [1, 2, 3, 4, 5, 7, 14];
+
+    /// Large Trades capture floor. Every trade at or above this notional is
+    /// retained while it is in the retention window, so lowering the visible
+    /// threshold never needs a re-backfill.
+    pub const LARGE_TRADES_MIN_USD_MIN: f32 = 10_000.0;
+    pub const LARGE_TRADES_MIN_USD_MAX: f32 = 5_000_000.0;
+    pub const LARGE_TRADES_MIN_USD_DEFAULT: f32 = 250_000.0;
+    pub const LARGE_TRADES_MIN_USD_STEP: f32 = 10_000.0;
 
     /// TPO config used to build Previous Value Areas profiles.
     ///
@@ -604,6 +624,7 @@ impl Default for Config {
             previous_value_area_session_start_minutes_utc: 0,
             previous_value_area_value_area_percent: 70,
             liquidity_heatmap_order_size_filter: 0.0,
+            large_trades_min_usd: Self::LARGE_TRADES_MIN_USD_DEFAULT,
         }
     }
 }

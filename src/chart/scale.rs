@@ -426,11 +426,11 @@ impl canvas::Program<Message> for AxisLabelsX<'_> {
                     }
                 }
                 mouse::Event::WheelScrolled { delta } => match delta {
-                    mouse::ScrollDelta::Lines { y, .. } | mouse::ScrollDelta::Pixels { y, .. } => {
+                    mouse::ScrollDelta::Lines { .. } | mouse::ScrollDelta::Pixels { .. } => {
                         cursor.position_in(drag_bounds)?;
 
                         let message = Message::XScaling(
-                            *y,
+                            super::wheel_zoom_delta(*delta),
                             {
                                 if let Some(cursor_to_center) =
                                     cursor.position_from(bounds.center())
@@ -644,11 +644,11 @@ impl canvas::Program<Message> for AxisLabelsY<'_> {
                     }
                 }
                 mouse::Event::WheelScrolled { delta } => match delta {
-                    mouse::ScrollDelta::Lines { y, .. } | mouse::ScrollDelta::Pixels { y, .. } => {
+                    mouse::ScrollDelta::Lines { .. } | mouse::ScrollDelta::Pixels { .. } => {
                         cursor.position_in(drag_bounds)?;
 
                         let message = Message::YScaling(
-                            *y,
+                            super::wheel_zoom_delta(*delta),
                             {
                                 if let Some(cursor_to_center) =
                                     cursor.position_from(bounds.center())

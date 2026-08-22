@@ -20,6 +20,7 @@ pub enum KlineIndicator {
     DailyDelta,
     PreviousValueArea,
     LiquidityHeatmap,
+    LargeTrades,
 }
 
 impl Indicator for KlineIndicator {
@@ -35,15 +36,16 @@ impl KlineIndicator {
     // Indicator togglers on UI menus depend on these arrays.
     // Every variant needs to be in either SPOT, PERPS or both.
     /// Indicators that can be used with spot market tickers
-    const FOR_SPOT: [KlineIndicator; 5] = [
+    const FOR_SPOT: [KlineIndicator; 6] = [
         KlineIndicator::Volume,
         KlineIndicator::BarAnalysis,
         KlineIndicator::CumulativeDelta,
         KlineIndicator::DailyDelta,
         KlineIndicator::PreviousValueArea,
+        KlineIndicator::LargeTrades,
     ];
     /// Indicators that can be used with perpetual swap market tickers
-    const FOR_PERPS: [KlineIndicator; 7] = [
+    const FOR_PERPS: [KlineIndicator; 8] = [
         KlineIndicator::Volume,
         KlineIndicator::BarAnalysis,
         KlineIndicator::CumulativeDelta,
@@ -51,19 +53,23 @@ impl KlineIndicator {
         KlineIndicator::DailyDelta,
         KlineIndicator::PreviousValueArea,
         KlineIndicator::LiquidityHeatmap,
+        KlineIndicator::LargeTrades,
     ];
 
     /// Overlay drawn on the main chart instead of a subplot row.
     pub fn is_overlay(self) -> bool {
         matches!(
             self,
-            Self::DailyDelta | Self::PreviousValueArea | Self::LiquidityHeatmap
+            Self::DailyDelta | Self::PreviousValueArea | Self::LiquidityHeatmap | Self::LargeTrades
         )
     }
 
     /// Needs the shared multi-venue daily trade history pipeline.
     pub fn needs_trade_history(self) -> bool {
-        matches!(self, Self::FootprintHistory | Self::DailyDelta)
+        matches!(
+            self,
+            Self::FootprintHistory | Self::DailyDelta | Self::CumulativeDelta | Self::LargeTrades
+        )
     }
 }
 
@@ -78,6 +84,7 @@ impl Display for KlineIndicator {
             KlineIndicator::DailyDelta => write!(f, "Daily Delta"),
             KlineIndicator::PreviousValueArea => write!(f, "Previous Value Areas"),
             KlineIndicator::LiquidityHeatmap => write!(f, "Liquidity Heatmap"),
+            KlineIndicator::LargeTrades => write!(f, "Large Trades"),
         }
     }
 }

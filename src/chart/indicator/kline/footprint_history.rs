@@ -26,8 +26,45 @@ pub(crate) const DAYS: usize = 3;
 /// v2: binary (bincode) encoding. A busy day serializes an order of magnitude
 /// faster than the previous JSON format, which blocked the UI thread for
 /// seconds per file when loading or persisting day caches.
-pub(crate) const CACHE_SCHEMA_VERSION: u16 = 2;
+/// v3: DayStats additionally retains individual large trades for the Large
+/// Trades overlay. Older caches cannot be upgraded in place, so they are
+/// dropped and re-fetched once.
+/// v4: the per-day large-trade cap keeps the largest notionals, not the
+/// oldest. v3 caches on busy symbols evicted $1M+ rally prints to make room
+/// for $10k tape, so they must be dropped and re-fetched.
+/// v5: Binance intraday aggTrades no longer persist truncated busy windows
+/// (hour-capped slices + fromId continuation). v4 days fetched during a
+/// rally can be missing those timespots and must be re-fetched.
+pub(crate) const CACHE_SCHEMA_VERSION: u16 = 5;
 const MAX_LOOKBACK_DAYS: usize = 732;
+
+/// Notional floor (quote currency) at which an executed trade is retained for
+/// the Large Trades overlay. Matches the lowest configurable UI threshold so
+/// lowering the threshold never requires a re-backfill within retention.
+fn large_trades_capture_floor() -> f64 {
+    f64::from(data::chart::kline::Config::LARGE_TRADES_MIN_USD_MIN)
+}
+
+/// Hard per-day ceiling so busy symbols cannot grow the shared day book
+/// without bound. Retention is by notional, not recency: when the cap is hit
+/// the smallest stored prints are dropped so a $10k flood cannot evict the
+/// $1M+ trades the overlay is for. The $10_000 capture floor on BTCUSDT
+/// produces well over this many prints per session.
+const MAX_LARGE_TRADES_PER_DAY: usize = 100_000;
+/// Compact only after this many extras have accumulated, so a busy tape is
+/// not sorted on every insert.
+const LARGE_TRADES_COMPACT_AT: usize = MAX_LARGE_TRADES_PER_DAY * 2;
+
+/// One executed trade retained by the Large Trades overlay. Lives inside the
+/// shared per-venue UTC-day book, inheriting its disk persistence, retention
+/// and live/historical seam handling.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
+pub(crate) struct StoredLargeTrade {
+    pub(crate) time: UnixMs,
+    pub(crate) price_units: i64,
+    pub(crate) notional: f64,
+    pub(crate) is_sell: bool,
+}
 
 /// Inclusive UTC-day windows from `00:00:00.000` through `23:59:59.999`,
 /// oldest first. The last window is clipped to `cutoff` so today stops at now.
@@ -137,6 +174,7 @@ pub(crate) struct DayStats {
     pub levels: BTreeMap<i64, LevelStats>,
     five_min_delta: BTreeMap<u64, f64>,
     largest_trade: Option<LargestTrade>,
+    pub(crate) large_trades: Vec<StoredLargeTrade>,
 }
 
 impl DayStats {
@@ -182,6 +220,34 @@ impl DayStats {
                 notional,
             });
         }
+
+        if notional >= large_trades_capture_floor() {
+            self.push_large_trade(StoredLargeTrade {
+                time: trade.time,
+                price_units: trade.price.units,
+                notional,
+                is_sell: trade.is_sell,
+            });
+        }
+    }
+
+    fn push_large_trade(&mut self, trade: StoredLargeTrade) {
+        self.large_trades.push(trade);
+        if self.large_trades.len() >= LARGE_TRADES_COMPACT_AT {
+            self.compact_large_trades();
+        }
+    }
+
+    /// Keep the largest notionals. FIFO eviction at the $10k capture floor
+    /// dropped rally-sized prints on busy majors once a few hours of $10k
+    /// tape filled the cap.
+    fn compact_large_trades(&mut self) {
+        if self.large_trades.len() <= MAX_LARGE_TRADES_PER_DAY {
+            return;
+        }
+        self.large_trades
+            .sort_unstable_by(|a, b| b.notional.total_cmp(&a.notional));
+        self.large_trades.truncate(MAX_LARGE_TRADES_PER_DAY);
     }
 
     fn merge(&mut self, other: &Self) {
@@ -217,6 +283,8 @@ impl DayStats {
         {
             self.largest_trade = Some(largest);
         }
+        self.large_trades.extend_from_slice(&other.large_trades);
+        self.compact_large_trades();
     }
 
     fn volume(&self) -> f64 {
@@ -237,6 +305,12 @@ impl DayStats {
             high = high.max(current);
         }
         (low, high)
+    }
+
+    /// Five-minute USD-delta buckets (`bucket_start_ms -> buy - sell notional`)
+    /// shared with the aggregated CVD subplot.
+    pub(crate) fn five_min_deltas(&self) -> &BTreeMap<u64, f64> {
+        &self.five_min_delta
     }
 
     fn largest_bucket(&self, positive: bool) -> Option<(u64, f64)> {
@@ -311,11 +385,13 @@ pub struct FootprintHistoryIndicator {
     lookback_days: usize,
     histories: FxHashMap<Ticker, SourceHistory>,
     history_cutoffs: FxHashMap<Ticker, UnixMs>,
-    historical_started: FxHashSet<Ticker>,
     historical_days_started: FxHashSet<(Ticker, u64)>,
+    /// Days whose book holds live trades captured after the backfill cutoff.
+    /// Their first historical batch merges instead of rebuilding so the live
+    /// seam is never destroyed (historical ranges never exceed the cutoff).
+    live_seam_days: FxHashSet<(Ticker, u64)>,
     completed_days: FxHashSet<(Ticker, u64)>,
     cache_checkpoints: FxHashMap<(Ticker, u64), Option<UnixMs>>,
-    pending_live: FxHashMap<Ticker, Vec<Trade>>,
 }
 
 impl FootprintHistoryIndicator {
@@ -327,11 +403,10 @@ impl FootprintHistoryIndicator {
             lookback_days: DAYS,
             histories: FxHashMap::default(),
             history_cutoffs: FxHashMap::default(),
-            historical_started: FxHashSet::default(),
             historical_days_started: FxHashSet::default(),
+            live_seam_days: FxHashSet::default(),
             completed_days: FxHashSet::default(),
             cache_checkpoints: FxHashMap::default(),
-            pending_live: FxHashMap::default(),
         }
     }
 
@@ -501,11 +576,12 @@ impl FootprintHistoryIndicator {
         let day = day_start(day);
         let Some(stats) = self
             .histories
-            .get(&source.ticker)
-            .and_then(|history| history.days.get(&day))
+            .get_mut(&source.ticker)
+            .and_then(|history| history.days.get_mut(&day))
         else {
             return;
         };
+        stats.compact_large_trades();
         if covered_through.as_u64() >= day.saturating_add(DAY_MS).saturating_sub(1) {
             self.completed_days.insert((source.ticker, day));
         }
@@ -534,6 +610,26 @@ impl FootprintHistoryIndicator {
 
     fn retain_oldest(&self, now: UnixMs) -> u64 {
         day_start(now).saturating_sub((self.lookback_days.saturating_sub(1) as u64) * DAY_MS)
+    }
+
+    /// Drop the per-price-level detail of one UTC day across every source,
+    /// keeping only the aggregates (five-minute delta buckets, totals). Used
+    /// by cumulative-style consumers after a day is safely persisted or
+    /// loaded complete, so long lookbacks do not retain level maps per venue.
+    /// In-memory only: disk caches are written before this runs and stay
+    /// complete for other consumers.
+    pub(crate) fn slim_day_levels(&mut self, day: u64) {
+        let day = day_start(UnixMs::new(day));
+        for history in self.histories.values_mut() {
+            if let Some(stats) = history.days.get_mut(&day) {
+                stats.levels.clear();
+            }
+        }
+    }
+
+    pub(crate) fn day_is_complete(day: UnixMs, covered_through: UnixMs) -> bool {
+        let day = day_start(day);
+        covered_through.as_u64() >= day.saturating_add(DAY_MS).saturating_sub(1)
     }
 
     fn active_sources(&self) -> &[TickerInfo] {
@@ -566,6 +662,38 @@ impl FootprintHistoryIndicator {
         }
         result.oi_delta = has_oi.then_some(oi_delta);
         result
+    }
+
+    /// Large executed trades recorded for a UTC day, merged across active
+    /// sources and pre-filtered by the caller's threshold. Copies only the
+    /// matching entries, never the whole day book.
+    pub(crate) fn display_large_trades(
+        &self,
+        day_start_ts: u64,
+        threshold_usd: f32,
+    ) -> Vec<StoredLargeTrade> {
+        let floor =
+            f64::from(threshold_usd.max(data::chart::kline::Config::LARGE_TRADES_MIN_USD_MIN));
+        let mut trades: Vec<StoredLargeTrade> = Vec::new();
+        for source in self.active_sources() {
+            if let Some(stats) = self
+                .histories
+                .get(&source.ticker)
+                .and_then(|history| history.days.get(&day_start_ts))
+            {
+                trades.extend(
+                    stats
+                        .large_trades
+                        .iter()
+                        .copied()
+                        .filter(|trade| trade.notional >= floor),
+                );
+            }
+        }
+        if trades.len() > 1 {
+            trades.sort_by_key(|trade| trade.time.as_u64());
+        }
+        trades
     }
 
     /// Merge only venues whose entire requested UTC period is available.
@@ -779,11 +907,10 @@ impl KlineIndicatorImpl for FootprintHistoryIndicator {
     }
 
     fn reset_trade_history_backfill(&mut self) {
-        self.historical_started.clear();
         self.historical_days_started.clear();
+        self.live_seam_days.clear();
         self.completed_days.clear();
         self.cache_checkpoints.clear();
-        self.pending_live.clear();
         self.histories.clear();
         self.history_cutoffs.clear();
         self.clear_all_caches();
@@ -839,12 +966,6 @@ impl KlineIndicatorImpl for FootprintHistoryIndicator {
             .find(|candidate| candidate.ticker.same_market(&source.ticker))
             .map_or(source.ticker, |candidate| candidate.ticker);
 
-        let first_historical_batch = historical && self.historical_started.insert(source_key);
-        let replay_live = if first_historical_batch {
-            self.pending_live.remove(&source_key).unwrap_or_default()
-        } else {
-            Vec::new()
-        };
         if historical {
             let touched_days = trades
                 .iter()
@@ -853,26 +974,34 @@ impl KlineIndicatorImpl for FootprintHistoryIndicator {
             let history = self.histories.entry(source_key).or_default();
             for day in touched_days {
                 if self.historical_days_started.insert((source_key, day)) {
-                    history.days.remove(&day);
+                    // Authoritative history replaces whatever the day held,
+                    // unless the book already captured live trades from after
+                    // the backfill cutoff. Historical fetch ranges are clipped
+                    // at that cutoff, so those live captures cannot duplicate
+                    // the batch and must survive it: backfill is paced one UTC
+                    // day at a time over the whole lookback, so today's batch
+                    // can arrive hours into a session and wiping here would
+                    // silently delete every large print seen in between.
+                    if !self.live_seam_days.remove(&(source_key, day)) {
+                        history.days.remove(&day);
+                    }
                 }
             }
         }
 
         let cutoff = self.history_cutoffs.get(&source_key).copied();
-        if !historical && !self.historical_started.contains(&source_key) {
-            self.pending_live.entry(source_key).or_default().extend(
-                trades
-                    .iter()
-                    .copied()
-                    .filter(|trade| cutoff.is_some_and(|boundary| trade.time > boundary)),
-            );
-        }
         let history = self.histories.entry(source_key).or_default();
-        for trade in trades.iter().chain(replay_live.iter()) {
+        for trade in trades.iter() {
             if trade.time.as_u64() < oldest
                 || (!historical && cutoff.is_some_and(|boundary| trade.time <= boundary))
             {
                 continue;
+            }
+            if !historical && cutoff.is_some_and(|boundary| trade.time > boundary) {
+                // Post-cutoff live capture; protect it from later rebuilds of
+                // its day (see above).
+                self.live_seam_days
+                    .insert((source_key, day_start(trade.time)));
             }
             history
                 .days
@@ -1053,6 +1182,19 @@ impl canvas::Program<Message> for FootprintHistoryCanvas<'_> {
                 .zip(price_rows.iter())
                 .map(|(day, (step, _))| group_levels(&day.stats, *step))
                 .collect::<Vec<_>>();
+            // Block currently being traded: the row holding each day's most
+            // recent traded price, so the live pocket stays easy to spot.
+            let traded_blocks = self
+                .days
+                .iter()
+                .zip(price_rows.iter())
+                .map(|(day, (step, rows))| {
+                    let block = day.stats.last.map(|(_, price)| {
+                        Price::from_f64(price).units.div_euclid(step.units) * step.units
+                    });
+                    block.filter(|block| rows.contains(block))
+                })
+                .collect::<Vec<_>>();
             let maxima = grouped
                 .iter()
                 .map(|levels| {
@@ -1083,11 +1225,13 @@ impl canvas::Program<Message> for FootprintHistoryCanvas<'_> {
                         *price_units,
                         grouped[day_index].get(price_units).copied(),
                         maxima[day_index],
+                        Some(traded_blocks[day_index] == Some(*price_units)),
                         fg,
                         muted,
                         buy,
                         sell,
                         warning,
+                        accent,
                     );
                 }
             }
@@ -1329,19 +1473,34 @@ fn draw_level_row(
     price_units: i64,
     level: Option<LevelStats>,
     maxima: (f64, f64),
+    is_traded_block: Option<bool>,
     fg: Color,
     muted: Color,
     buy: Color,
     sell: Color,
     warning: Color,
+    accent: Color,
 ) {
+    let is_traded_block = is_traded_block.unwrap_or(false);
+    if is_traded_block {
+        frame.fill_rectangle(
+            Point::new(left + 1.0, y - 7.5),
+            Size::new(width - 2.0, 15.0),
+            accent.scale_alpha(0.16),
+        );
+        frame.fill_rectangle(
+            Point::new(left + 1.0, y - 7.5),
+            Size::new(2.0, 15.0),
+            accent,
+        );
+    }
     let Some(level) = level else {
         draw_text(
             frame,
             &format_price(Price::from_units(price_units).to_f64()),
             Point::new(left + width * 0.39, y),
             9.5,
-            muted,
+            if is_traded_block { accent } else { muted },
             Alignment::Center,
         );
         return;
@@ -1378,7 +1537,7 @@ fn draw_level_row(
         &format_price(Price::from_units(price_units).to_f64()),
         Point::new(left + width * 0.39, y),
         9.5,
-        fg,
+        if is_traded_block { accent } else { fg },
         Alignment::Center,
     );
     draw_text(
@@ -1610,6 +1769,93 @@ mod tests {
         assert_eq!(stats.volume(), 290.0);
         assert_eq!(stats.delta(), 110.0);
         assert_eq!(stats.notional, 290.0);
+    }
+
+    fn stored_print(time: u64, notional: f64, is_sell: bool) -> StoredLargeTrade {
+        StoredLargeTrade {
+            time: UnixMs::new(time),
+            price_units: 1,
+            notional,
+            is_sell,
+        }
+    }
+
+    #[test]
+    fn large_trade_cap_keeps_the_whale_instead_of_the_oldest_small_prints() {
+        let mut stats = DayStats::default();
+        for i in 0..MAX_LARGE_TRADES_PER_DAY {
+            stats.push_large_trade(stored_print(i as u64, 10_000.0, false));
+        }
+        // The rally print lands in the middle of the session.
+        stats.push_large_trade(stored_print(50_000, 2_000_000.0, false));
+        for i in 0..MAX_LARGE_TRADES_PER_DAY {
+            stats.push_large_trade(stored_print(100_000 + i as u64, 11_000.0, true));
+        }
+        stats.compact_large_trades();
+
+        assert!(
+            stats
+                .large_trades
+                .iter()
+                .any(|trade| (trade.notional - 2_000_000.0).abs() < f64::EPSILON),
+            "a $2M rally print must survive a day of $10k tape"
+        );
+        assert!(stats.large_trades.len() <= MAX_LARGE_TRADES_PER_DAY);
+        assert!(
+            stats
+                .large_trades
+                .iter()
+                .all(|trade| trade.notional >= 11_000.0)
+        );
+    }
+
+    #[test]
+    fn merging_day_books_keeps_the_largest_prints() {
+        let mut left = DayStats::default();
+        let mut right = DayStats::default();
+        for _ in 0..MAX_LARGE_TRADES_PER_DAY {
+            left.push_large_trade(stored_print(1, 10_000.0, false));
+            right.push_large_trade(stored_print(2, 12_000.0, true));
+        }
+        left.push_large_trade(stored_print(3, 3_000_000.0, false));
+        left.merge(&right);
+
+        assert!(
+            left.large_trades
+                .iter()
+                .any(|trade| (trade.notional - 3_000_000.0).abs() < f64::EPSILON)
+        );
+        assert!(
+            left.large_trades
+                .iter()
+                .all(|trade| trade.notional >= 12_000.0)
+        );
+        assert!(left.large_trades.len() <= MAX_LARGE_TRADES_PER_DAY);
+    }
+
+    #[test]
+    fn insert_trade_retains_a_million_dollar_print_on_a_busy_btc_day() {
+        let mut stats = DayStats::default();
+        let small_qty = 10_000.0 / 80_000.0;
+        for i in 0..MAX_LARGE_TRADES_PER_DAY {
+            stats.insert_trade(trade(i as u64, 80_000.0, small_qty, false));
+        }
+        stats.insert_trade(trade(50_000, 80_000.0, 25.0, false));
+        let later_qty = 11_000.0 / 80_000.0;
+        for i in 0..MAX_LARGE_TRADES_PER_DAY {
+            stats.insert_trade(trade(100_000 + i as u64, 80_000.0, later_qty, true));
+        }
+        stats.compact_large_trades();
+
+        let whale = 80_000.0 * 25.0;
+        assert!(
+            stats
+                .large_trades
+                .iter()
+                .any(|trade| (trade.notional - whale).abs() < 1.0),
+            "price * qty of 25 BTC at 80k must remain after the $10k floor floods the cap"
+        );
+        assert!(stats.large_trades.len() <= MAX_LARGE_TRADES_PER_DAY);
     }
 
     #[test]
@@ -1918,7 +2164,74 @@ mod tests {
         indicator.on_source_trades(source, &[trade(DAY_MS, 100.0, 1.0, false)], true);
 
         assert!(indicator.histories.is_empty());
-        assert!(indicator.historical_started.is_empty());
+        assert!(indicator.historical_days_started.is_empty());
+    }
+
+    #[test]
+    fn live_captures_survive_their_days_first_historical_batch() {
+        let source = TickerInfo::new(
+            Ticker::new("BTCUSDT", Exchange::BinanceLinear),
+            0.1,
+            0.001,
+            None,
+        );
+        let mut indicator = FootprintHistoryIndicator::new();
+        indicator.configure_footprint_history(&[source], true);
+        let now = UnixMs::now();
+        let today = day_start(now);
+        // A cutoff guaranteed to fall inside today, whatever the wall clock.
+        let cutoff = UnixMs::new(today.max(now.as_u64().saturating_sub(60_000)));
+        indicator.prepare_footprint_history(source, cutoff);
+
+        // Live prints captured after startup accumulate into today's book.
+        indicator.on_source_trades(
+            source,
+            &[trade(cutoff.as_u64() + 1_000, 110.0, 2.0, false)],
+            false,
+        );
+
+        // The authoritative backfill for today finally arrives (it is paced
+        // last, after every older UTC day) and must not wipe the live seam.
+        indicator.on_source_trades(source, &[trade(today + 1_000, 90.0, 3.0, true)], true);
+
+        let stats = indicator.display_day_at(today).stats;
+        assert_eq!(stats.volume(), 490.0);
+        assert_eq!(stats.delta(), -50.0);
+    }
+
+    #[test]
+    fn late_live_captures_survive_backfills_that_started_on_another_day() {
+        let source = TickerInfo::new(
+            Ticker::new("BTCUSDT", Exchange::BinanceLinear),
+            0.1,
+            0.001,
+            None,
+        );
+        let mut indicator = FootprintHistoryIndicator::new();
+        indicator.configure_footprint_history(&[source], true);
+        let today = day_start(UnixMs::now());
+        let yesterday = today.saturating_sub(DAY_MS);
+        // A cutoff guaranteed to fall inside today, whatever the wall clock.
+        let cutoff = UnixMs::new(today.max(UnixMs::now().as_u64().saturating_sub(60_000)));
+        indicator.prepare_footprint_history(source, cutoff);
+
+        // Backfill starts on an older day.
+        indicator.on_source_trades(source, &[trade(yesterday + 1_000, 100.0, 1.0, false)], true);
+
+        // Live prints captured while backfill grinds through the lookback.
+        indicator.on_source_trades(
+            source,
+            &[trade(cutoff.as_u64() + 2_000, 120.0, 2.0, true)],
+            false,
+        );
+
+        // Today's batch arrives much later; the live capture must survive it
+        // exactly once.
+        indicator.on_source_trades(source, &[trade(today + 5_000, 90.0, 4.0, true)], true);
+
+        let stats = indicator.display_day_at(today).stats;
+        assert_eq!(stats.volume(), 600.0);
+        assert_eq!(stats.delta(), -600.0);
     }
 
     #[test]

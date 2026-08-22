@@ -23,7 +23,21 @@ use iced::{
 };
 
 const ZOOM_SENSITIVITY: f32 = 30.0;
+const PX_PER_NOTCH: f32 = 120.0;
+const ZOOM_BASE_PER_NOTCH: f32 = 1.08;
+const MAX_ABS_NOTCHES_PER_EVENT: f32 = 6.0;
 const TEXT_SIZE: f32 = crate::style::text_size::BODY;
+
+pub(crate) fn wheel_zoom_delta(delta: mouse::ScrollDelta) -> f32 {
+    let notches = match delta {
+        mouse::ScrollDelta::Lines { y, .. } => y,
+        mouse::ScrollDelta::Pixels { y, .. } => y / PX_PER_NOTCH,
+    }
+    .clamp(-MAX_ABS_NOTCHES_PER_EVENT, MAX_ABS_NOTCHES_PER_EVENT);
+
+    let factor = ZOOM_BASE_PER_NOTCH.powf(notches);
+    ZOOM_SENSITIVITY * (factor - 1.0)
+}
 
 #[derive(Default, Debug, Clone, Copy)]
 pub enum Interaction {
@@ -182,12 +196,13 @@ fn canvas_interaction<T: Chart>(
                         mouse::ScrollDelta::Lines { y, .. }
                         | mouse::ScrollDelta::Pixels { y, .. } => y,
                     };
+                    let zoom_delta = wheel_zoom_delta(*delta);
 
                     if let Some(Autoscale::FitToVisible) = state.layout.autoscale {
                         if chart.allows_vertical_navigation_from_fit() {
                             return Some(
                                 canvas::Action::publish(Message::YScaling(
-                                    *y,
+                                    zoom_delta,
                                     cursor_to_center.y,
                                     true,
                                 ))
@@ -197,7 +212,7 @@ fn canvas_interaction<T: Chart>(
 
                         return Some(
                             canvas::Action::publish(Message::XScaling(
-                                y / 2.0,
+                                zoom_delta / 2.0,
                                 cursor_to_center.x,
                                 false,
                             ))
@@ -232,7 +247,7 @@ fn canvas_interaction<T: Chart>(
                     if should_adjust_cell_width {
                         return Some(
                             canvas::Action::publish(Message::XScaling(
-                                y / 2.0,
+                                zoom_delta / 2.0,
                                 cursor_to_center.x,
                                 true,
                             ))
@@ -245,7 +260,7 @@ fn canvas_interaction<T: Chart>(
                         || (*y > 0.0 && state.scaling < max_scaling)
                     {
                         let old_scaling = state.scaling;
-                        let scaling = (state.scaling * (1.0 + y / ZOOM_SENSITIVITY))
+                        let scaling = (state.scaling * (1.0 + zoom_delta / ZOOM_SENSITIVITY))
                             .clamp(min_scaling, max_scaling);
 
                         let denominator = old_scaling * scaling;
@@ -340,6 +355,14 @@ pub fn update<T: Chart>(chart: &mut T, message: &Message) {
         }
         Message::Scaled(scaling, translation) => {
             let state = chart.mut_state();
+
+            if state.layout.autoscale.is_none()
+                && state.scaling == *scaling
+                && state.translation == *translation
+            {
+                return;
+            }
+
             state.scaling = *scaling;
             state.translation = *translation;
 
@@ -371,6 +394,10 @@ pub fn update<T: Chart>(chart: &mut T, message: &Message) {
         Message::XScaling(delta, cursor_to_center_x, is_wheel_scroll) => {
             let min_cell_width = T::min_cell_width(chart);
             let max_cell_width = T::max_cell_width(chart);
+
+            if *delta == 0.0 {
+                return;
+            }
 
             let state = chart.mut_state();
 
@@ -458,6 +485,10 @@ pub fn update<T: Chart>(chart: &mut T, message: &Message) {
         Message::YScaling(delta, cursor_to_center_y, is_wheel_scroll) => {
             let min_cell_height = T::min_cell_height(chart);
             let max_cell_height = T::max_cell_height(chart);
+
+            if *delta == 0.0 {
+                return;
+            }
 
             let state = chart.mut_state();
 

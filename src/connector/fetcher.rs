@@ -224,6 +224,16 @@ impl RequestHandler {
         }
     }
 
+    /// Forget a tracked request entirely.
+    ///
+    /// Used when a registered request could not be dispatched (for example a
+    /// kline fetch planned before any kline stream was ready): leaving it
+    /// `Pending` would suppress every retry of that range as an overlap while
+    /// the data never arrives.
+    pub fn remove(&mut self, id: Uuid) {
+        self.requests.remove(&id);
+    }
+
     /// Mark a request as completed with no data — the source returned an
     /// empty result.  The range will never be retried.
     pub fn mark_no_data(&mut self, id: Uuid) {
@@ -649,6 +659,35 @@ fn select_trade_stream(
         })
 }
 
+/// Whether [`request_fetch`] can produce a real task for this spec right now.
+///
+/// Kline/OI ranges need a ready kline stream and trade ranges a ready trade
+/// stream when no explicit stream is attached. A pane may plan fetches before
+/// its streams resolve (ticker metadata still loading); those specs must be
+/// reported back instead of silently registering as `Pending` forever.
+fn fetch_is_dispatchable(
+    fetch: &FetchRange,
+    stream: Option<StreamKind>,
+    ready_streams: &[StreamKind],
+) -> bool {
+    match fetch {
+        FetchRange::Kline(..)
+        | FetchRange::OpenInterest(..)
+        | FetchRange::FootprintHistoryOpenInterest(..) => {
+            let explicit_kline =
+                stream.is_some_and(|stream| matches!(stream, StreamKind::Kline { .. }));
+            explicit_kline
+                || ready_streams
+                    .iter()
+                    .any(|stream| matches!(stream, StreamKind::Kline { .. }))
+        }
+        FetchRange::Trades(..)
+        | FetchRange::FootprintTrades(..)
+        | FetchRange::FootprintHistoryTrades(..)
+        | FetchRange::TradesRecent(..) => select_trade_stream(stream, ready_streams).is_some(),
+    }
+}
+
 pub fn request_fetch_many(
     sources: &DataSources,
     pane_id: Uuid,
@@ -656,10 +695,18 @@ pub fn request_fetch_many(
     layout_id: Uuid,
     reqs: impl IntoIterator<Item = (Uuid, FetchRange, Option<StreamKind>)>,
     mut on_trade_handle: impl FnMut(Handle),
-) -> Task<FetchUpdate> {
+) -> (Task<FetchUpdate>, Vec<Uuid>) {
     let mut tasks = Vec::new();
+    let mut undispatched = Vec::new();
 
     for (req_id, fetch, stream) in reqs {
+        if !fetch_is_dispatchable(&fetch, stream, ready_streams) {
+            log::debug!(
+                "Fetch request {req_id} has no ready stream yet; releasing for retry: {fetch:?}"
+            );
+            undispatched.push(req_id);
+            continue;
+        }
         tasks.push(request_fetch(
             sources,
             pane_id,
@@ -672,7 +719,7 @@ pub fn request_fetch_many(
         ));
     }
 
-    Task::batch(tasks)
+    (Task::batch(tasks), undispatched)
 }
 
 pub fn oi_fetch_task(
@@ -1378,6 +1425,23 @@ mod tests {
         assert!(fetch_limit_reached(limits, 40, 0));
         assert!(fetch_limit_reached(limits, 0, 80_000));
         assert!(!fetch_limit_reached(limits, 39, 79_999));
+    }
+
+    #[test]
+    fn kline_requests_without_a_ready_stream_are_reported_undispatched() {
+        let stream = kline_stream(Exchange::BinanceLinear);
+        let range = FetchRange::Kline(UnixMs::new(1_000), UnixMs::new(2_000));
+
+        // No ready streams: the spec cannot be dispatched and must be handed
+        // back so the chart can release it instead of leaving it Pending
+        // forever.
+        assert!(!fetch_is_dispatchable(&range, None, &[]));
+
+        // With a ready kline stream the same spec dispatches normally.
+        assert!(fetch_is_dispatchable(&range, None, &[stream]));
+
+        // An explicit stream always dispatches.
+        assert!(fetch_is_dispatchable(&range, Some(stream), &[]));
     }
 
     #[test]

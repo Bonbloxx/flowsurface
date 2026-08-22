@@ -201,7 +201,8 @@ impl TickAggr {
             tick_aggr.insert_renko_price(trade.time, trade.price, Some(trade));
         }
 
-        tick_aggr.update_poc_status();
+        // No NPoC pass here: Renko never renders POC status, and the scan is
+        // quadratic in brick count — prohibitive on a month of seeded bricks.
 
         tick_aggr
     }
@@ -382,8 +383,9 @@ impl TickAggr {
         for trade in buffer {
             self.insert_renko_trade(trade);
         }
-
-        self.update_poc_status();
+        // POC/NPoC status is only rendered on Footprint charts; skipping the
+        // quadratic rescan here keeps live Renko inserts O(buffer) even with
+        // a month of bricks loaded.
     }
 
     fn insert_renko_trade(&mut self, trade: &Trade) {
@@ -606,41 +608,29 @@ impl TickAggr {
         }
     }
 
+    /// Convert an offset-from-newest visible range into absolute datapoint
+    /// indices. Tick-chart callers express ranges as distance from the newest
+    /// datapoint, so slice bounds must be mirrored before indexing.
+    fn visible_index_range(&self, earliest: usize, latest: usize) -> Option<(usize, usize)> {
+        let base = self.datapoints.len().checked_sub(1)?;
+        let upper = base.checked_sub(earliest)?;
+        let lower = base.saturating_sub(latest);
+        (lower <= upper).then_some((lower, upper))
+    }
+
     pub fn min_max_price_in_range_prices(
         &self,
         earliest: usize,
         latest: usize,
     ) -> Option<(Price, Price)> {
-        if earliest > latest {
-            return None;
-        }
+        // Index the visible slice directly — datapoints can span a month of
+        // bricks and this runs on every redraw for autoscaling.
+        let (start, end) = self.visible_index_range(earliest, latest)?;
 
-        let mut min_p: Option<Price> = None;
-        let mut max_p: Option<Price> = None;
-
-        self.datapoints
+        self.datapoints[start..=end]
             .iter()
-            .rev()
-            .enumerate()
-            .filter(|(idx, _)| *idx >= earliest && *idx <= latest)
-            .for_each(|(_, dp)| {
-                let low = dp.kline.low;
-                let high = dp.kline.high;
-
-                min_p = Some(match min_p {
-                    Some(value) => value.min(low),
-                    None => low,
-                });
-                max_p = Some(match max_p {
-                    Some(value) => value.max(high),
-                    None => high,
-                });
-            });
-
-        match (min_p, max_p) {
-            (Some(low), Some(high)) => Some((low, high)),
-            _ => None,
-        }
+            .map(|dp| (dp.kline.low, dp.kline.high))
+            .reduce(|(min_low, max_high), (low, high)| (min_low.min(low), max_high.max(high)))
     }
 
     pub fn min_max_price_in_range(&self, earliest: usize, latest: usize) -> Option<(f32, f32)> {
@@ -653,44 +643,20 @@ impl TickAggr {
         earliest: usize,
         latest: usize,
     ) -> Option<(Price, Price)> {
-        if earliest > latest {
-            return None;
-        }
+        let (start, end) = self.visible_index_range(earliest, latest)?;
 
-        let mut min_p: Option<Price> = None;
-        let mut max_p: Option<Price> = None;
-
-        self.datapoints
+        self.datapoints[start..=end]
             .iter()
-            .rev()
-            .enumerate()
-            .filter(|(idx, _)| *idx >= earliest && *idx <= latest)
-            .for_each(|(_, dp)| {
-                min_p = Some(match min_p {
-                    Some(value) => value.min(dp.kline.low),
-                    None => dp.kline.low,
-                });
-                max_p = Some(match max_p {
-                    Some(value) => value.max(dp.kline.high),
-                    None => dp.kline.high,
-                });
-
+            .map(|dp| {
+                let mut min_p = dp.kline.low;
+                let mut max_p = dp.kline.high;
                 for price in dp.footprint.trades.keys() {
-                    min_p = Some(match min_p {
-                        Some(value) => value.min(*price),
-                        None => *price,
-                    });
-                    max_p = Some(match max_p {
-                        Some(value) => value.max(*price),
-                        None => *price,
-                    });
+                    min_p = min_p.min(*price);
+                    max_p = max_p.max(*price);
                 }
-            });
-
-        match (min_p, max_p) {
-            (Some(low), Some(high)) => Some((low, high)),
-            _ => None,
-        }
+                (min_p, max_p)
+            })
+            .reduce(|(min_low, max_high), (low, high)| (min_low.min(low), max_high.max(high)))
     }
 
     pub fn min_max_tpo_price_in_range(
@@ -698,29 +664,15 @@ impl TickAggr {
         earliest: usize,
         latest: usize,
     ) -> Option<(Price, Price)> {
-        if earliest > latest {
-            return None;
-        }
+        let (start, end) = self.visible_index_range(earliest, latest)?;
 
-        let mut min_p: Option<Price> = None;
-        let mut max_p: Option<Price> = None;
-
-        self.datapoints
+        self.datapoints[start..=end]
             .iter()
-            .rev()
-            .enumerate()
-            .filter(|(idx, _)| *idx >= earliest && *idx <= latest)
-            .filter_map(|(_, dp)| dp.tpo.as_ref())
-            .for_each(|profile| {
-                if let Some((price, _)) = profile.rows.first_key_value() {
-                    min_p = Some(min_p.map_or(*price, |value| value.min(*price)));
-                }
-                if let Some((price, _)) = profile.rows.last_key_value() {
-                    max_p = Some(max_p.map_or(*price, |value| value.max(*price)));
-                }
-            });
-
-        min_p.zip(max_p)
+            .filter_map(|dp| {
+                let rows = &dp.tpo.as_ref()?.rows;
+                Some((*rows.first_key_value()?.0, *rows.last_key_value()?.0))
+            })
+            .reduce(|(min_low, max_high), (low, high)| (min_low.min(low), max_high.max(high)))
     }
 
     pub fn max_qty_idx_range(
@@ -731,19 +683,15 @@ impl TickAggr {
         highest: Price,
         lowest: Price,
     ) -> Qty {
-        let mut max_cluster_qty: Qty = Qty::default();
+        let Some((start, end)) = self.visible_index_range(earliest, latest) else {
+            return Qty::default();
+        };
 
-        self.datapoints
+        self.datapoints[start..=end]
             .iter()
-            .rev()
-            .enumerate()
-            .filter(|(index, _)| *index <= latest && *index >= earliest)
-            .for_each(|(_, dp)| {
-                max_cluster_qty =
-                    max_cluster_qty.max(dp.max_cluster_qty(cluster_kind, highest, lowest));
-            });
-
-        max_cluster_qty
+            .fold(Qty::default(), |max_cluster_qty, dp| {
+                max_cluster_qty.max(dp.max_cluster_qty(cluster_kind, highest, lowest))
+            })
     }
 }
 

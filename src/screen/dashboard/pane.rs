@@ -1655,6 +1655,9 @@ impl State {
                             indicators
                                 .contains(&KlineIndicator::PreviousValueArea)
                                 .then(|| chart.visual_config().previous_value_area_ticks),
+                            indicators
+                                .contains(&KlineIndicator::LargeTrades)
+                                .then(|| chart.visual_config().large_trades_min_usd),
                         )
                     };
 

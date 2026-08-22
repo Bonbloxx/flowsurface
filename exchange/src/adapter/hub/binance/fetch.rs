@@ -46,6 +46,8 @@ struct DeOpenInterest {
 
 #[derive(Deserialize, Debug)]
 struct DeTrade {
+    #[serde(rename = "a", default)]
+    id: u64,
     #[serde(rename = "T")]
     time: u64,
     #[serde(rename = "p", deserialize_with = "de_string_to_number")]
@@ -524,7 +526,10 @@ pub(super) async fn fetch_historical_oi(
         };
 
         let interval_ms = period.to_milliseconds();
-        let num_intervals = ((end - adjusted_start) / interval_ms).min(500);
+        // Ranges shorter than one bucket (e.g. the developing-candle OI
+        // re-poll) must still request at least one sample: Binance rejects
+        // `limit=0` with HTTP 400.
+        let num_intervals = (end.saturating_sub(adjusted_start) / interval_ms).clamp(1, 500);
 
         url.push_str(&format!(
             "&startTime={adjusted_start}&endTime={end}&limit={num_intervals}"
@@ -629,9 +634,12 @@ const AGGTRADES_PAGE_LIMIT: usize = 1000;
 /// aggTrades page this is 200 weight per wave — well inside the ~2300/min
 /// effective perps budget.
 const PARALLEL_SLICE_WAVE: usize = 10;
-/// Slices narrower than this are never split further â€” a capped page this
-/// small is kept as-is instead of recursing forever.
+/// Slices narrower than this are never split further — a capped page this
+/// small is kept as-is instead of recursing forever. Continuation then uses
+/// `fromId` so the burst is still fully read.
 const MIN_SLICE_SPAN_MS: u64 = 1_000;
+/// Binance requires `endTime - startTime` to be strictly less than 1 hour.
+const MAX_AGGTRADES_WINDOW_MS: u64 = 60 * 60 * 1_000 - 1;
 
 /// Split the inclusive range `[from, to]` into `[from, mid]` and
 /// `[mid + 1, to]`. Returns `(mid, mid + 1)` so both sub-ranges stay disjoint.
@@ -645,12 +653,34 @@ fn split_intraday_slice(from: UnixMs, to: UnixMs) -> Option<(UnixMs, UnixMs)> {
     Some((UnixMs::new(mid), UnixMs::new(mid + 1)))
 }
 
+/// Inclusive `[from, to]` windows no longer than Binance's aggTrades limit
+/// (`startTime`/`endTime` must be strictly less than one hour apart). A
+/// single `[day_start, now]` request is rejected or silently truncated,
+/// which punched holes in Large Trades during the busy part of the session.
+fn hour_windows(from: UnixMs, to: UnixMs) -> Vec<(UnixMs, UnixMs)> {
+    if to < from {
+        return Vec::new();
+    }
+    let mut windows = Vec::new();
+    let mut cursor = from.as_u64();
+    let end = to.as_u64();
+    while cursor <= end {
+        let window_end = cursor.saturating_add(MAX_AGGTRADES_WINDOW_MS).min(end);
+        windows.push((UnixMs::new(cursor), UnixMs::new(window_end)));
+        if window_end >= end {
+            break;
+        }
+        cursor = window_end.saturating_add(1);
+    }
+    windows
+}
+
 async fn fetch_intraday_page(
     hub: &HttpHub<BinanceLimiter>,
     ticker_info: TickerInfo,
     from: UnixMs,
     to: UnixMs,
-) -> Result<Vec<Trade>, AdapterError> {
+) -> Result<Vec<DeTrade>, AdapterError> {
     let (symbol_str, market_type) = ticker_info.ticker.to_full_symbol_and_type();
 
     let url = format!(
@@ -660,25 +690,85 @@ async fn fetch_intraday_page(
         to.as_u64()
     );
 
-    let de_trades: Vec<DeTrade> = hub
-        .http_json_with_limiter(&url, aggtrades_request_weight(market_type), None, None)
-        .await?;
+    hub.http_json_with_limiter(&url, aggtrades_request_weight(market_type), None, None)
+        .await
+}
 
-    Ok(map_de_trades(de_trades, ticker_info, market_type))
+async fn fetch_intraday_page_from_id(
+    hub: &HttpHub<BinanceLimiter>,
+    ticker_info: TickerInfo,
+    from_id: u64,
+) -> Result<Vec<DeTrade>, AdapterError> {
+    let (symbol_str, market_type) = ticker_info.ticker.to_full_symbol_and_type();
+
+    // Binance times out if fromId is combined with startTime/endTime.
+    let url = format!(
+        "{}?symbol={symbol_str}&limit=1000&fromId={from_id}",
+        aggtrades_base_url(market_type)
+    );
+
+    hub.http_json_with_limiter(&url, aggtrades_request_weight(market_type), None, None)
+        .await
+}
+
+/// Keep paging an unsplittable (sub-second) window with `fromId` so a
+/// liquidation burst that prints more than 1000 aggTrades is not truncated
+/// to the first page — that was dropping the large prints in the timespot.
+async fn fetch_intraday_from_id_until(
+    hub: &HttpHub<BinanceLimiter>,
+    ticker_info: TickerInfo,
+    mut from_id: u64,
+    until: UnixMs,
+) -> Result<Vec<Trade>, AdapterError> {
+    let market_type = ticker_info.market_type();
+    let until_ms = until.as_u64();
+    let mut merged = Vec::new();
+
+    loop {
+        let page = fetch_intraday_page_from_id(hub, ticker_info, from_id).await?;
+        if page.is_empty() {
+            break;
+        }
+        let page_len = page.len();
+        let mut last_id = from_id;
+        let mut past_end = false;
+        let mut kept = Vec::with_capacity(page_len);
+        for de_trade in page {
+            last_id = de_trade.id;
+            if de_trade.time > until_ms {
+                past_end = true;
+                break;
+            }
+            kept.push(de_trade);
+        }
+        merged.extend(map_de_trades(kept, ticker_info, market_type));
+        if past_end || page_len < AGGTRADES_PAGE_LIMIT || last_id < from_id {
+            break;
+        }
+        let next_id = last_id.saturating_add(1);
+        if next_id <= from_id {
+            break;
+        }
+        from_id = next_id;
+    }
+
+    Ok(merged)
 }
 
 /// Fetch today's trades by fetching several time slices concurrently instead
 /// of walking a serial cursor one 1000-row page at a time. Slices whose page
 /// comes back full are split in half and requeued until either the data fits
-/// or the minimum span is reached.
+/// or the minimum span is reached. A full page that cannot be split is then
+/// continued with `fromId` so busy milliseconds are not silently truncated.
 async fn fetch_intraday_trades_parallel(
     hub: &HttpHub<BinanceLimiter>,
     ticker_info: TickerInfo,
     from: UnixMs,
     to: UnixMs,
 ) -> Result<Vec<Trade>, AdapterError> {
+    let market_type = ticker_info.market_type();
     let mut merged: Vec<Trade> = Vec::new();
-    let mut pending: Vec<(UnixMs, UnixMs)> = vec![(from, to)];
+    let mut pending: Vec<(UnixMs, UnixMs)> = hour_windows(from, to);
 
     while !pending.is_empty() {
         let wave_len = pending.len().min(PARALLEL_SLICE_WAVE);
@@ -690,17 +780,31 @@ async fn fetch_intraday_trades_parallel(
         .await;
 
         for ((slice_from, slice_to), page) in wave.into_iter().zip(pages) {
-            let trades = page?;
-            if trades.len() >= AGGTRADES_PAGE_LIMIT
-                && let Some((mid, next)) = split_intraday_slice(slice_from, slice_to)
-            {
-                // Full page â€” likely truncated. Requeue the halves rather
-                // than keeping a capped window.
-                pending.insert(0, (next, slice_to));
-                pending.insert(0, (slice_from, mid));
+            let de_trades = page?;
+            if de_trades.len() >= AGGTRADES_PAGE_LIMIT {
+                if let Some((mid, next)) = split_intraday_slice(slice_from, slice_to) {
+                    // Full page — likely truncated. Requeue the halves rather
+                    // than keeping a capped window.
+                    pending.insert(0, (next, slice_to));
+                    pending.insert(0, (slice_from, mid));
+                    continue;
+                }
+                let last_id = de_trades.last().map(|trade| trade.id).unwrap_or(0);
+                merged.extend(map_de_trades(de_trades, ticker_info, market_type));
+                if last_id > 0 {
+                    merged.extend(
+                        fetch_intraday_from_id_until(
+                            hub,
+                            ticker_info,
+                            last_id.saturating_add(1),
+                            slice_to,
+                        )
+                        .await?,
+                    );
+                }
                 continue;
             }
-            merged.extend(trades);
+            merged.extend(map_de_trades(de_trades, ticker_info, market_type));
         }
     }
 
@@ -768,12 +872,15 @@ async fn get_hist_trades_with_client(
     let missing_marker_path = base_path.join(format!("{zip_file_name}.missing"));
 
     if missing_marker_path.exists() {
-        // Re-check periodically â€” Binance often publishes yesterday's zip later.
+        // Re-check periodically — Binance often publishes yesterday's zip a
+        // few hours after midnight UTC. A short window keeps the original
+        // download-storm protection while ensuring an early 404 (archive not
+        // published yet) does not hide the day for the rest of the session.
         let marker_is_fresh = std::fs::metadata(&missing_marker_path)
             .ok()
             .and_then(|meta| meta.modified().ok())
             .and_then(|modified| modified.elapsed().ok())
-            .is_some_and(|age| age < std::time::Duration::from_secs(12 * 60 * 60));
+            .is_some_and(|age| age < std::time::Duration::from_secs(60 * 60));
         if marker_is_fresh {
             return Err(AdapterError::InvalidRequest(format!(
                 "Archive previously unavailable (404): {zip_path}"
@@ -1054,5 +1161,37 @@ mod tests {
         let (mid, next) = split_intraday_slice(from, to).expect("exactly minimum span");
         assert_eq!(mid.as_u64(), MIN_SLICE_SPAN_MS / 2);
         assert_eq!(next.as_u64(), MIN_SLICE_SPAN_MS / 2 + 1);
+    }
+
+    #[test]
+    fn hour_windows_never_exceed_binance_aggtrades_limit() {
+        let from = UnixMs::new(0);
+        let to = UnixMs::new(3 * 60 * 60 * 1_000 + 12_345);
+        let windows = hour_windows(from, to);
+
+        assert!(
+            windows.len() >= 4,
+            "a 3h+ span must be more than one window"
+        );
+        assert_eq!(windows.first().map(|(start, _)| *start), Some(from));
+        assert_eq!(windows.last().map(|(_, end)| *end), Some(to));
+        for (start, end) in &windows {
+            assert!(end >= start);
+            assert!(
+                end.as_u64().saturating_sub(start.as_u64()) <= MAX_AGGTRADES_WINDOW_MS,
+                "window {start:?}..{end:?} is too wide for aggTrades"
+            );
+        }
+        for pair in windows.windows(2) {
+            assert_eq!(pair[1].0.as_u64(), pair[0].1.as_u64().saturating_add(1));
+        }
+    }
+
+    #[test]
+    fn short_intraday_range_stays_a_single_window() {
+        let from = UnixMs::new(1_000);
+        let to = UnixMs::new(1_000 + 10 * 60 * 1_000);
+        let windows = hour_windows(from, to);
+        assert_eq!(windows, vec![(from, to)]);
     }
 }

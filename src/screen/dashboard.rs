@@ -390,7 +390,7 @@ impl Dashboard {
                                     .map(|iter| iter.copied().collect::<Vec<_>>())
                                     .unwrap_or_default();
 
-                                fetcher::request_fetch_many(
+                                let (fetch_task, undispatched) = fetcher::request_fetch_many(
                                     data_sources,
                                     pane_id,
                                     &ready_streams,
@@ -409,9 +409,12 @@ impl Dashboard {
                                             history.set_handle(handle);
                                         }
                                     },
-                                )
-                                .map(Message::from)
-                                .chain(self.refresh_streams(main_window.id))
+                                );
+                                release_undispatched(state, &undispatched);
+
+                                fetch_task
+                                    .map(Message::from)
+                                    .chain(self.refresh_streams(main_window.id))
                             }
                             pane::Effect::SwitchTickersInGroup(ticker_info) => self
                                 .switch_tickers_in_group(
@@ -475,7 +478,7 @@ impl Dashboard {
                     .ready_iter()
                     .map(|iter| iter.copied().collect::<Vec<_>>())
                     .unwrap_or_default();
-                let task = fetcher::request_fetch_many(
+                let (task, undispatched) = fetcher::request_fetch_many(
                     data_sources,
                     pane_id,
                     &ready_streams,
@@ -492,9 +495,9 @@ impl Dashboard {
                             history.set_handle(handle);
                         }
                     },
-                )
-                .map(Message::from);
-                return (task, None);
+                );
+                release_undispatched(state, &undispatched);
+                return (task.map(Message::from), None);
             }
             Message::DistributeFetchedData {
                 layout_id,
@@ -1357,7 +1360,7 @@ impl Dashboard {
                         .map(|iter| iter.copied().collect::<Vec<_>>())
                         .unwrap_or_default();
 
-                    let fetch_tasks = fetcher::request_fetch_many(
+                    let (fetch_tasks, undispatched) = fetcher::request_fetch_many(
                         data_sources,
                         pane_id,
                         &ready_streams,
@@ -1374,10 +1377,10 @@ impl Dashboard {
                                 history.set_handle(handle);
                             }
                         },
-                    )
-                    .map(Message::from);
+                    );
+                    release_undispatched(state, &undispatched);
 
-                    tasks.push(fetch_tasks);
+                    tasks.push(fetch_tasks.map(Message::from));
                 }
                 chart::Action::RequestPalette => {
                     tasks.push(Task::done(Message::RequestPalette));
@@ -1552,6 +1555,23 @@ impl Dashboard {
         self.streams = UniqueStreams::from(all_pane_streams);
 
         Task::none()
+    }
+}
+
+/// Drop tracked requests that could not be dispatched because no matching
+/// stream was ready yet (ticker metadata still loading). Without this the
+/// request stays `Pending` forever and suppresses every retry of that range,
+/// which is how candle panes could end up with no klines at all.
+fn release_undispatched(state: &mut pane::State, ids: &[uuid::Uuid]) {
+    if ids.is_empty() {
+        return;
+    }
+    match &mut state.content {
+        pane::Content::Kline { chart: Some(c), .. } => c.release_undispatched_requests(ids),
+        pane::Content::FootprintHistory(Some(history)) => {
+            history.release_undispatched_requests(ids)
+        }
+        _ => {}
     }
 }
 

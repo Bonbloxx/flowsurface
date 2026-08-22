@@ -1,25 +1,57 @@
 use super::KlineIndicatorImpl;
 use super::footprint_history::{
-    DAY_MS, DayStats, DisplayDay, FootprintHistoryIndicator, day_start, draw_text, group_levels,
-    utc_days_covering,
+    DAY_MS, DayStats, DisplayDay, FootprintHistoryIndicator, LevelStats, day_start, draw_text,
+    group_levels, utc_days_covering,
 };
 use crate::chart::{Message, ViewState};
+
+use std::cell::RefCell;
+use std::collections::BTreeMap;
 
 use data::aggr::ticks::TickAggr;
 use data::aggr::time::TimeSeries;
 use data::chart::PlotData;
 use data::chart::kline::{KlineDataPoint, KlineTrades};
-use exchange::UnixMs;
 use exchange::unit::{Price, PriceStep};
+use exchange::{Trade, UnixMs};
 use iced::theme::palette::Extended;
 use iced::widget::canvas::{self, Path, Stroke};
 use iced::{Alignment, Color, Element, Point, Rectangle, Size};
 
 /// Daily dollar-delta profile overlay. Reuses Footprint History's UTC-day
 /// trade book and venue aggregation; only the chart drawing is new.
+///
+/// Aggregated per-day profiles are cached so panning and zooming never
+/// re-absorb whole days of klines per frame. Invalidation is precise:
+/// config-level changes rebuild every day, while incoming trades/klines only
+/// rebuild the UTC days they touch (live ticks therefore just refresh today).
 pub struct DailyDeltaIndicator {
     inner: FootprintHistoryIndicator,
     lookback_days: usize,
+    /// Bumped when inputs affecting *every* displayed day change
+    /// (sources, aggregation config, basis, tick size, full rebuilds).
+    full_rev: u64,
+    cache: RefCell<Option<OverlayCache>>,
+}
+
+struct OverlayCache {
+    full_rev: u64,
+    group_step_units: i64,
+    lookback_days: usize,
+    today: u64,
+    /// Days at/after this UTC-day start are stale and must be rebuilt
+    /// before the next draw.
+    dirty_from_day: Option<u64>,
+    days: Vec<CachedDayProfile>,
+}
+
+struct CachedDayProfile {
+    day_ts: u64,
+    grouped: BTreeMap<i64, LevelStats>,
+    max_abs: f64,
+    poc: Option<i64>,
+    profile_high: Option<i64>,
+    profile_low: Option<i64>,
 }
 
 /// Directional colors shared by Delta History and other profile-style charts.
@@ -41,6 +73,39 @@ impl DailyDeltaIndicator {
         Self {
             inner,
             lookback_days: 4,
+            full_rev: 0,
+            cache: RefCell::new(None),
+        }
+    }
+
+    fn mark_all_changed(&mut self) {
+        self.full_rev = self.full_rev.wrapping_add(1);
+    }
+
+    /// Mark the UTC day containing `earliest_time` (and everything after it)
+    /// as stale. No-op while no cache exists — the next draw builds fresh.
+    fn mark_days_dirty(&mut self, earliest_time: u64) {
+        let from = day_start(UnixMs::new(earliest_time));
+        if let Some(cache) = self.cache.borrow_mut().as_mut() {
+            cache.dirty_from_day = Some(
+                cache
+                    .dirty_from_day
+                    .map_or(from, |current| current.min(from)),
+            );
+        }
+    }
+
+    fn build_day_profile(
+        &self,
+        data_source: &PlotData<KlineDataPoint>,
+        day_ts: u64,
+        group_step: PriceStep,
+    ) -> CachedDayProfile {
+        let mut day = self.inner.display_day_at(day_ts);
+        apply_kline_day(&mut day, data_source, day_ts, group_step);
+        CachedDayProfile {
+            day_ts,
+            ..build_cached_profile(&day.stats, group_step)
         }
     }
 }
@@ -66,6 +131,7 @@ impl KlineIndicatorImpl for DailyDeltaIndicator {
     fn configure_footprint_history(&mut self, sources: &[exchange::TickerInfo], aggregate: bool) {
         self.inner.configure_footprint_history(sources, aggregate);
         self.inner.set_lookback_days(self.lookback_days as u16);
+        self.mark_all_changed();
     }
 
     fn set_trade_history_lookback(&mut self, days: u16) {
@@ -75,6 +141,7 @@ impl KlineIndicatorImpl for DailyDeltaIndicator {
 
     fn reset_trade_history_backfill(&mut self) {
         self.inner.reset_trade_history_backfill();
+        self.mark_all_changed();
     }
 
     fn prepare_footprint_history(&mut self, source: exchange::TickerInfo, cutoff: UnixMs) {
@@ -86,7 +153,11 @@ impl KlineIndicatorImpl for DailyDeltaIndicator {
         source: exchange::TickerInfo,
         day_start: UnixMs,
     ) -> Option<UnixMs> {
-        self.inner.load_cached_footprint_day(source, day_start)
+        let loaded = self.inner.load_cached_footprint_day(source, day_start);
+        if loaded.is_some() {
+            self.mark_days_dirty(day_start.as_u64());
+        }
+        loaded
     }
 
     fn persist_cached_footprint_day(
@@ -106,6 +177,38 @@ impl KlineIndicatorImpl for DailyDeltaIndicator {
         historical: bool,
     ) {
         self.inner.on_source_trades(source, trades, historical);
+        if let Some(earliest) = trades.iter().map(|trade| trade.time.as_u64()).min() {
+            self.mark_days_dirty(earliest);
+        }
+    }
+
+    fn on_insert_klines(&mut self, klines: &[exchange::Kline], _source: &PlotData<KlineDataPoint>) {
+        if let Some(earliest) = klines.iter().map(|kline| kline.time.as_u64()).min() {
+            self.mark_days_dirty(earliest);
+        }
+    }
+
+    fn on_insert_trades(
+        &mut self,
+        trades: &[Trade],
+        _old_dp_len: usize,
+        _source: &PlotData<KlineDataPoint>,
+    ) {
+        if let Some(earliest) = trades.iter().map(|trade| trade.time.as_u64()).min() {
+            self.mark_days_dirty(earliest);
+        }
+    }
+
+    fn rebuild_from_source(&mut self, _source: &PlotData<KlineDataPoint>) {
+        self.mark_all_changed();
+    }
+
+    fn on_ticksize_change(&mut self, _source: &PlotData<KlineDataPoint>) {
+        self.mark_all_changed();
+    }
+
+    fn on_basis_change(&mut self, _source: &PlotData<KlineDataPoint>) {
+        self.mark_all_changed();
     }
 
     fn on_source_open_interest(
@@ -140,15 +243,59 @@ impl KlineIndicatorImpl for DailyDeltaIndicator {
         let axis = palette.background.strong.color.scale_alpha(0.75);
         let label = palette.background.base.text;
 
-        let day_starts = display_day_starts(now, self.lookback_days);
+        // Rebuild aggregated profiles only when inputs actually changed.
+        // Panning and zooming reuse the cache instead of re-absorbing every
+        // kline of every displayed day on each frame; live ticks only refresh
+        // the days they touched.
+        {
+            let needs_full_rebuild = match self.cache.borrow().as_ref() {
+                None => true,
+                Some(cache) => {
+                    cache.full_rev != self.full_rev
+                        || cache.group_step_units != group_step.units
+                        || cache.lookback_days != self.lookback_days
+                        || cache.today != today
+                }
+            };
+            if needs_full_rebuild {
+                let days = display_day_starts(now, self.lookback_days)
+                    .into_iter()
+                    .map(|day_ts| self.build_day_profile(data_source, day_ts, group_step))
+                    .collect::<Vec<_>>();
+                *self.cache.borrow_mut() = Some(OverlayCache {
+                    full_rev: self.full_rev,
+                    group_step_units: group_step.units,
+                    lookback_days: self.lookback_days,
+                    today,
+                    dirty_from_day: None,
+                    days,
+                });
+            } else {
+                let mut cache = self.cache.borrow_mut();
+                if let Some(cache) = cache.as_mut() {
+                    let dirty_from = cache.dirty_from_day.take();
+                    for profile in &mut cache.days {
+                        if dirty_from.is_some_and(|from| profile.day_ts >= from) {
+                            *profile =
+                                self.build_day_profile(data_source, profile.day_ts, group_step);
+                        }
+                    }
+                }
+            }
+        }
+        let cache = self.cache.borrow();
+        let Some(cache) = cache.as_ref() else {
+            return;
+        };
 
-        for day_ts in day_starts {
-            let mut day = self.inner.display_day_at(day_ts);
-            apply_kline_day(&mut day, data_source, day_ts, group_step);
-            if day.stats.levels.is_empty() && day.stats.high.is_none() && day.stats.low.is_none() {
+        for profile in &cache.days {
+            if profile.profile_high.is_none()
+                && profile.profile_low.is_none()
+                && profile.grouped.is_empty()
+            {
                 continue;
             }
-            let is_current = day_ts == today;
+            let is_current = profile.day_ts == today;
             let profile_w = if is_current { current_w } else { history_w };
             let Some(x) = day_x(
                 chart,
@@ -156,17 +303,18 @@ impl KlineIndicatorImpl for DailyDeltaIndicator {
                 region,
                 profile_w,
                 pad,
-                day_ts,
+                profile.day_ts,
                 is_current,
                 now,
             ) else {
                 continue;
             };
-            let poc_line = poc_line_range(chart, data_source, region, x, day_ts, is_current);
+            let poc_line =
+                poc_line_range(chart, data_source, region, x, profile.day_ts, is_current);
 
             draw_day_profile(
-                frame, chart, &day, group_step, x, profile_w, highest, lowest, scaling, buy, sell,
-                axis, label, is_current, poc_line,
+                frame, chart, profile, group_step, x, profile_w, highest, lowest, scaling, buy,
+                sell, axis, label, is_current, poc_line,
             );
         }
     }
@@ -321,11 +469,42 @@ fn absorb_footprint(stats: &mut DayStats, footprint: &KlineTrades, step: PriceSt
     }
 }
 
+/// Aggregate a merged day into the view-independent numbers the overlay draws:
+/// grouped levels, delta scale, POC and the profile's price span.
+fn build_cached_profile(stats: &DayStats, step: PriceStep) -> CachedDayProfile {
+    let grouped = group_levels(stats, step);
+    let max_abs = grouped
+        .values()
+        .map(|level| level.delta().abs())
+        .fold(0.0_f64, f64::max);
+    let poc = grouped
+        .iter()
+        .max_by(|left, right| left.1.volume().total_cmp(&right.1.volume()))
+        .map(|(price_units, _)| *price_units);
+    let profile_high = stats
+        .high
+        .map(|price| Price::from_f64(price).units)
+        .or_else(|| grouped.keys().next_back().copied());
+    let profile_low = stats
+        .low
+        .map(|price| Price::from_f64(price).units)
+        .or_else(|| grouped.keys().next().copied());
+
+    CachedDayProfile {
+        day_ts: 0,
+        grouped,
+        max_abs,
+        poc,
+        profile_high,
+        profile_low,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn draw_day_profile(
     frame: &mut canvas::Frame,
     chart: &ViewState,
-    day: &DisplayDay,
+    profile: &CachedDayProfile,
     group_step: PriceStep,
     x: f32,
     profile_w: f32,
@@ -339,38 +518,26 @@ fn draw_day_profile(
     is_current: bool,
     poc_line: Option<(f32, f32)>,
 ) {
-    let step = group_step;
-    let step_u = step.units.max(1);
-    let grouped = group_levels(&day.stats, step);
-    let max_abs = grouped
-        .values()
-        .map(|level| level.delta().abs())
-        .fold(0.0_f64, f64::max);
+    let CachedDayProfile {
+        grouped,
+        max_abs,
+        poc,
+        profile_high,
+        profile_low,
+        ..
+    } = profile;
+    let step_u = group_step.units.max(1);
 
-    let poc = grouped
-        .iter()
-        .max_by(|left, right| left.1.volume().total_cmp(&right.1.volume()))
-        .map(|(price_units, _)| *price_units);
-
-    let profile_high = day
-        .stats
-        .high
-        .map(|price| Price::from_f64(price).units)
-        .or_else(|| grouped.keys().next_back().copied())
-        .unwrap_or(highest.units);
-    let profile_low = day
-        .stats
-        .low
-        .map(|price| Price::from_f64(price).units)
-        .or_else(|| grouped.keys().next().copied())
-        .unwrap_or(lowest.units);
-    if profile_high < profile_low {
+    let (Some(high_u), Some(low_u)) = (*profile_high, *profile_low) else {
+        return;
+    };
+    if high_u < low_u {
         return;
     }
-    let low_u = profile_low.div_euclid(step_u) * step_u;
-    let high_u = profile_high.div_euclid(step_u) * step_u;
-    let top_y = chart.price_to_y(Price::from_units(high_u.saturating_add(step_u)));
-    let bot_y = chart.price_to_y(Price::from_units(low_u));
+    let low_aligned = low_u.div_euclid(step_u) * step_u;
+    let high_aligned = high_u.div_euclid(step_u) * step_u;
+    let top_y = chart.price_to_y(Price::from_units(high_aligned.saturating_add(step_u)));
+    let bot_y = chart.price_to_y(Price::from_units(low_aligned));
 
     frame.fill_rectangle(
         Point::new(x, top_y),
@@ -384,9 +551,9 @@ fn draw_day_profile(
     let divider = Color::from_rgba(0.0, 0.0, 0.0, 0.45);
     let divider_h = (0.8 / scaling).clamp(0.4, 1.1);
 
-    for (price_units, level) in &grouped {
+    for (price_units, level) in grouped {
         let delta = level.delta();
-        if delta == 0.0 || max_abs <= 0.0 {
+        if delta == 0.0 || *max_abs <= 0.0 {
             continue;
         }
         let price = Price::from_units(*price_units);
@@ -425,7 +592,7 @@ fn draw_day_profile(
 
     if let (Some(poc_units), Some((line_start, line_end))) = (poc, poc_line) {
         let poc_y = {
-            let price = Price::from_units(poc_units);
+            let price = Price::from_units(*poc_units);
             let next = Price::from_units(poc_units.saturating_add(step_u));
             (chart.price_to_y(price) + chart.price_to_y(next)) * 0.5
         };

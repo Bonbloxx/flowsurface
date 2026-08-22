@@ -16,6 +16,7 @@ pub mod bar_analysis;
 pub mod cumulative_delta;
 pub mod daily_delta;
 pub mod footprint_history;
+pub mod large_trades;
 pub mod liquidity_heatmap;
 pub mod open_interest;
 pub mod previous_value_area;
@@ -139,6 +140,9 @@ pub trait KlineIndicatorImpl {
     fn configure_footprint_history(&mut self, _sources: &[exchange::TickerInfo], _aggregate: bool) {
     }
 
+    /// Minimum executed-trade notional shown by the Large Trades overlay.
+    fn set_large_trades_threshold(&mut self, _min_notional_usd: f32) {}
+
     /// Set the historical/live boundary before a source backfill begins.
     fn prepare_footprint_history(&mut self, _source: exchange::TickerInfo, _cutoff: UnixMs) {}
 
@@ -240,6 +244,9 @@ pub fn make_empty(which: KlineIndicator) -> Box<dyn KlineIndicatorImpl> {
         }
         KlineIndicator::LiquidityHeatmap => {
             Box::new(super::kline::liquidity_heatmap::LiquidityHeatmapIndicator)
+        }
+        KlineIndicator::LargeTrades => {
+            Box::new(super::kline::large_trades::LargeTradesIndicator::new())
         }
     }
 }

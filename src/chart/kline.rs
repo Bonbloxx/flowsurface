@@ -7,6 +7,7 @@ use crate::chart::indicator::kline::daily_delta::delta_history_colors;
 use crate::chart::indicator::kline::footprint_history::{
     DAYS as FOOTPRINT_HISTORY_DAYS, day_start, missing_day_range, utc_day_ranges,
 };
+use crate::chart::indicator::kline::large_trades::LARGE_TRADES_LOOKBACK_DAYS;
 use crate::chart::indicator::kline::previous_value_area::value_area_history_earliest;
 use crate::connector::fetcher::{
     FetchRange, FetchSpec, ReqError, RequestHandler, TradeFetchMode, is_trade_fetch_enabled,
@@ -14,7 +15,7 @@ use crate::connector::fetcher::{
 };
 use crate::widget::chart::heatmap::HeatmapShader;
 use crate::{modal::pane::settings::study, style};
-use data::aggr::ticks::{TickAccumulation, TickAggr};
+use data::aggr::ticks::TickAggr;
 use data::aggr::time::TimeSeries;
 use data::aggregation::{DepthAggregator, KlineAggregator, ResolvedFeed};
 use data::chart::indicator::{Indicator, KlineIndicator};
@@ -47,7 +48,10 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use std::time::Instant;
 
 const RENKO_SEED_TIMEFRAME: exchange::Timeframe = exchange::Timeframe::M1;
-const RENKO_HISTORY_MS: u64 = 3 * 24 * 60 * 60 * 1_000;
+/// A month of close-based seed bars. At 1000 bars per REST page this costs
+/// roughly one page per maintenance tick (~45 requests) of progressive
+/// backfill, which keeps each rebuild cheap and the pane responsive.
+const RENKO_HISTORY_MS: u64 = 31 * 24 * 60 * 60 * 1_000;
 
 fn shared_history_price_step(sources: &[TickerInfo], fallback: PriceStep) -> PriceStep {
     sources
@@ -358,7 +362,9 @@ impl KlineChart {
                 };
                 let cell_height = match &kind {
                     KlineChartKind::Footprint { .. } => 800.0 / y_ticks,
-                    KlineChartKind::Tpo { .. } => (800.0 / y_ticks).clamp(0.02, 12.0),
+                    KlineChartKind::Tpo { .. } => {
+                        (800.0 / y_ticks).clamp(kind.min_cell_height(), 12.0)
+                    }
                     KlineChartKind::Candles | KlineChartKind::Renko { .. } => 200.0 / y_ticks,
                 };
 
@@ -406,6 +412,9 @@ impl KlineChart {
                     if i == KlineIndicator::DailyDelta {
                         indi.set_trade_history_lookback(visual_config.daily_delta_days);
                     }
+                    if i == KlineIndicator::LargeTrades {
+                        indi.set_large_trades_threshold(visual_config.large_trades_min_usd);
+                    }
                     indi.rebuild_from_source(&data_source);
                     indicators[i] = Some(indi);
                 }
@@ -414,7 +423,9 @@ impl KlineChart {
                     chart,
                     tpo_klines: Box::new(KlineAggregator::new(&feed)),
                     pva_klines: Box::new(KlineAggregator::new(&feed)),
-                    pva_dirty: false,
+                    // Force a first sync so a restored PVA overlay populates
+                    // without needing to be toggled.
+                    pva_dirty: true,
                     pva_anchor_day: day_start(UnixMs::now()),
                     feed: Box::new(feed),
                     visual_config,
@@ -506,6 +517,9 @@ impl KlineChart {
                     if i == KlineIndicator::DailyDelta {
                         indi.set_trade_history_lookback(visual_config.daily_delta_days);
                     }
+                    if i == KlineIndicator::LargeTrades {
+                        indi.set_large_trades_threshold(visual_config.large_trades_min_usd);
+                    }
                     indi.rebuild_from_source(&data_source);
                     indicators[i] = Some(indi);
                 }
@@ -513,7 +527,9 @@ impl KlineChart {
                 KlineChart {
                     chart,
                     pva_klines: Box::new(KlineAggregator::new(&feed)),
-                    pva_dirty: false,
+                    // Force a first sync so a restored PVA overlay populates
+                    // without needing to be toggled.
+                    pva_dirty: true,
                     pva_anchor_day: day_start(UnixMs::now()),
                     feed: Box::new(feed),
                     visual_config,
@@ -666,7 +682,12 @@ impl KlineChart {
         }
         self.footprint_history.sources = sources;
         self.footprint_history.aggregate = aggregate;
-        for kind in [KlineIndicator::FootprintHistory, KlineIndicator::DailyDelta] {
+        for kind in [
+            KlineIndicator::FootprintHistory,
+            KlineIndicator::DailyDelta,
+            KlineIndicator::CumulativeDelta,
+            KlineIndicator::LargeTrades,
+        ] {
             if let Some(indicator) = self.indicators[kind].as_mut() {
                 indicator.configure_footprint_history(
                     &self.footprint_history.sources,
@@ -683,10 +704,17 @@ impl KlineChart {
     fn uses_trade_history(&self) -> bool {
         self.indicators[KlineIndicator::FootprintHistory].is_some()
             || self.indicators[KlineIndicator::DailyDelta].is_some()
+            || self.indicators[KlineIndicator::CumulativeDelta].is_some()
+            || self.indicators[KlineIndicator::LargeTrades].is_some()
     }
 
     fn for_each_trade_history(&mut self, mut f: impl FnMut(&mut dyn KlineIndicatorImpl)) {
-        for kind in [KlineIndicator::FootprintHistory, KlineIndicator::DailyDelta] {
+        for kind in [
+            KlineIndicator::FootprintHistory,
+            KlineIndicator::DailyDelta,
+            KlineIndicator::CumulativeDelta,
+            KlineIndicator::LargeTrades,
+        ] {
             if let Some(indicator) = self.indicators[kind].as_mut() {
                 f(indicator.as_mut());
             }
@@ -782,11 +810,19 @@ impl KlineChart {
         let delta_days = self.indicators[KlineIndicator::DailyDelta]
             .is_some()
             .then_some(u64::from(self.visual_config.daily_delta_days.max(1)));
-        let recent_lookback_days = match (footprint_days, delta_days) {
-            (Some(left), Some(right)) => left.max(right),
-            (Some(days), None) | (None, Some(days)) => days,
-            (None, None) => 0,
-        };
+        let cvd_days = self.indicators[KlineIndicator::CumulativeDelta]
+            .is_some()
+            .then_some(u64::from(
+                crate::chart::indicator::kline::cumulative_delta::FETCH_LOOKBACK_DAYS,
+            ));
+        let large_trades_days = self.indicators[KlineIndicator::LargeTrades]
+            .is_some()
+            .then_some(u64::from(LARGE_TRADES_LOOKBACK_DAYS));
+        let recent_lookback_days = [footprint_days, delta_days, cvd_days, large_trades_days]
+            .into_iter()
+            .flatten()
+            .max()
+            .unwrap_or(0);
         let recent_day_ranges = footprint_history_day_ranges(cutoff, recent_lookback_days);
         let from = recent_day_ranges
             .last()
@@ -1305,6 +1341,15 @@ impl KlineChart {
         }
     }
 
+    /// Forget requests that could not be dispatched (no matching ready stream
+    /// yet) so [`Self::fetch_missing_data`] plans them again once streams
+    /// resolve, instead of the ranges being suppressed as pending overlaps.
+    pub fn release_undispatched_requests(&mut self, ids: &[uuid::Uuid]) {
+        for id in ids {
+            self.request_handler.remove(*id);
+        }
+    }
+
     pub fn tick_size(&self) -> PriceStep {
         self.chart.tick_size
     }
@@ -1377,6 +1422,8 @@ impl KlineChart {
             .liquidity_heatmap_order_size_filter
             .to_bits()
             != visual_config.liquidity_heatmap_order_size_filter.to_bits();
+        let large_trades_threshold_changed = self.visual_config.large_trades_min_usd.to_bits()
+            != visual_config.large_trades_min_usd.to_bits();
         self.visual_config = visual_config;
         if lookback_changed {
             self.request_handler = RequestHandler::default();
@@ -1397,6 +1444,11 @@ impl KlineChart {
         }
         if let Some(indicator) = self.indicators[KlineIndicator::DailyDelta].as_mut() {
             indicator.set_trade_history_lookback(self.visual_config.daily_delta_days);
+        }
+        if large_trades_threshold_changed
+            && let Some(indicator) = self.indicators[KlineIndicator::LargeTrades].as_mut()
+        {
+            indicator.set_large_trades_threshold(self.visual_config.large_trades_min_usd);
         }
         if liquidity_filter_changed && let Some(runtime) = self.footprint_history.liquidity.as_mut()
         {
@@ -1520,6 +1572,27 @@ impl KlineChart {
                         &composite_klines,
                         &self.raw_trades,
                     ));
+                }
+            }
+            PlotData::TickBased(tick_aggr) if tick_aggr.is_renko() => {
+                // Rebuild from the full minute-close seed so a price-step
+                // change re-bricks the whole loaded history instead of
+                // collapsing to the current live session.
+                if let KlineChartKind::Renko { config } = &self.kind {
+                    let composite_klines = self.tpo_klines.composite_klines();
+                    self.data_source = PlotData::TickBased(TickAggr::new_renko_seeded(
+                        *config,
+                        new_step,
+                        &composite_klines,
+                        &self.raw_trades,
+                    ));
+                    self.chart.last_price = match &self.data_source {
+                        PlotData::TickBased(tick_aggr) => tick_aggr
+                            .datapoints
+                            .last()
+                            .map(|dp| PriceInfoLabel::new(dp.kline.close, dp.kline.open)),
+                        PlotData::TimeBased(_) => None,
+                    };
                 }
             }
             PlotData::TickBased(tick_aggr) => {
@@ -1691,11 +1764,12 @@ impl KlineChart {
             self.for_each_trade_history(|indicator| {
                 indicator.on_source_trades(source, &raw_trades, true);
             });
-            if is_batches_done {
-                if let Some(req_id) = req_id {
-                    self.request_handler.mark_completed(req_id);
-                }
-                self.invalidate(None);
+            // Redraw as pages arrive so Large Trades / Daily Delta do not stay
+            // blank until the last trade of a multi-million-print UTC day.
+            // `invalidate(None)` only clears caches; it does not plan fetches.
+            self.invalidate(None);
+            if is_batches_done && let Some(req_id) = req_id {
+                self.request_handler.mark_completed(req_id);
             }
             return;
         }
@@ -2241,6 +2315,9 @@ impl KlineChart {
                 if indicator == KlineIndicator::DailyDelta {
                     box_indi.set_trade_history_lookback(self.visual_config.daily_delta_days);
                 }
+                if indicator == KlineIndicator::LargeTrades {
+                    box_indi.set_large_trades_threshold(self.visual_config.large_trades_min_usd);
+                }
             }
             if indicator == KlineIndicator::PreviousValueArea {
                 self.pva_dirty = true;
@@ -2495,6 +2572,17 @@ impl canvas::Program<Message> for KlineChart {
                 );
             }
 
+            if let Some(indicator) = self.indicators[KlineIndicator::LargeTrades].as_ref() {
+                indicator.draw_overlay(
+                    frame,
+                    chart,
+                    &self.data_source,
+                    palette,
+                    region,
+                    chart.tick_size,
+                );
+            }
+
             chart.draw_last_price_line(frame, palette, region);
         });
 
@@ -2672,8 +2760,7 @@ fn draw_tpo_profile(
     let show_letters = match config.display_style {
         TpoDisplayStyle::Letters => screen_block_w >= 5.0 && screen_row_h >= 6.0,
         TpoDisplayStyle::Blocks => false,
-        // Readable A–Z glyphs need roughly 8×9 screen pixels.
-        TpoDisplayStyle::Auto => screen_block_w >= 7.0 && screen_row_h >= 8.0,
+        TpoDisplayStyle::Auto => screen_block_w >= 6.0 && screen_row_h >= 7.0,
     };
     // One bar per price row when individual letters would be sub-pixel noise.
     let compact_row_bars =
@@ -2689,7 +2776,7 @@ fn draw_tpo_profile(
         sell_color
     };
     let profile_strong = mix_color(profile_color, palette.background.base.text, 0.82);
-    let profile_muted = mix_color(profile_color, palette.background.base.color, 0.52);
+    let profile_muted = mix_color(profile_color, palette.background.base.color, 0.32);
     let y_pad = (cell_height * 2.0).max(4.0 / scale);
 
     let y_hi = price_to_y(visible_high);
@@ -2754,15 +2841,16 @@ fn draw_tpo_profile(
             let time_fade = if is_single {
                 1.0
             } else {
-                0.76 + 0.24 * (f32::from(*block % 8) / 7.0)
+                0.85 + 0.15 * (f32::from(*block % 8) / 7.0)
             };
             let color = base_color.scale_alpha(time_fade);
 
             if show_letters {
-                // Glyph size tracks the letter cell; never exceed the cell.
+                // Glyph size tracks the letter cell; floor at a readable size
+                // so letters never shrink into invisibility once LOD shows them.
                 let glyph = (block_width * 0.96)
                     .min(cell_height * 0.94)
-                    .max(6.0 / scale)
+                    .max(9.0 / scale)
                     .min(block_width.max(cell_height));
                 draw_cluster_text(
                     frame,
@@ -2805,10 +2893,10 @@ fn draw_tpo_profile(
     };
 
     // Labels once the column is wide enough on screen.
-    let show_level_labels = cell_width * scale >= 64.0 && screen_row_h >= 5.0;
+    let show_level_labels = cell_width * scale >= 64.0 && screen_row_h >= 4.0;
     let label_size = (cell_height * 0.55)
-        .clamp(5.0 / scale, 12.0 / scale)
-        .max(5.0 / scale);
+        .clamp(9.0 / scale, 14.0 / scale)
+        .max(9.0 / scale);
 
     if config.show_value_area {
         let available_gap = (cell_width - profile_width).max(12.0 / scale);
@@ -2991,24 +3079,39 @@ fn render_data_source<F>(
             let earliest = earliest as usize;
             let latest = latest as usize;
 
-            let mut draw_datapoints = |datapoints: &mut dyn Iterator<Item = &TickAccumulation>| {
-                datapoints
-                    .enumerate()
-                    .filter(|(index, _)| *index <= latest && *index >= earliest)
-                    .for_each(|(index, tick_aggr)| {
-                        let x_position = interval_to_x(index as u64);
+            // The final Renko datapoint is the unconfirmed projection.
+            // Omitting it keeps every visible Renko body fixed-size while the
+            // last-price line continues to show the live market.
+            let skip = usize::from(tick_aggr.is_renko());
+            let base = tick_aggr.datapoints.len().saturating_sub(1 + skip);
 
-                        draw_fn(frame, x_position, &tick_aggr.kline, &tick_aggr.footprint);
+            // `earliest`/`latest` count backwards from the newest drawn brick;
+            // convert to absolute datapoint indices and slice so a redraw only
+            // touches the visible window even on weeks of bricks.
+            let range = base
+                .checked_sub(earliest)
+                .map(|upper| (base.saturating_sub(latest), upper))
+                .filter(|(lower, upper)| lower <= upper);
+
+            if let Some((lower, upper)) = range {
+                // X positions must use each datapoint's true offset from the
+                // newest brick, not the position inside the visible slice, or
+                // panning back in time would drag every rendered brick along
+                // with the viewport and blank out the chart.
+                tick_aggr.datapoints[lower..=upper]
+                    .iter()
+                    .rev()
+                    .zip(earliest..=latest)
+                    .for_each(|(accumulation, offset)| {
+                        let x_position = interval_to_x(offset as u64);
+
+                        draw_fn(
+                            frame,
+                            x_position,
+                            &accumulation.kline,
+                            &accumulation.footprint,
+                        );
                     });
-            };
-
-            if tick_aggr.is_renko() {
-                // The final datapoint is the unconfirmed projection. Omitting it
-                // keeps every visible Renko body fixed-size while the last-price
-                // line continues to show the live market.
-                draw_datapoints(&mut tick_aggr.datapoints.iter().rev().skip(1));
-            } else {
-                draw_datapoints(&mut tick_aggr.datapoints.iter().rev());
             }
         }
         PlotData::TimeBased(timeseries) => {
@@ -4421,6 +4524,77 @@ mod tests {
             panic!("daily delta should continue with UTC-day trades");
         };
         assert!(next_start < first_start);
+        crate::connector::fetcher::set_trade_fetch_mode(TradeFetchMode::Off);
+    }
+
+    #[test]
+    fn cumulative_delta_backfill_is_bounded_to_its_fetch_horizon() {
+        crate::connector::fetcher::set_trade_fetch_mode(TradeFetchMode::Server);
+        let source = TickerInfo::new(
+            Ticker::new("CACHE_MISS_TEST", Exchange::HyperliquidLinear),
+            1.0,
+            0.001,
+            None,
+        );
+        let price = Price::from_f64(68_000.0);
+        let kline = Kline {
+            time: UnixMs::now(),
+            open: price,
+            high: price,
+            low: price,
+            close: price,
+            volume: Volume::TotalOnly(Qty::ZERO),
+        };
+        let mut chart = KlineChart::new(
+            ViewConfig::default(),
+            Basis::Time(Timeframe::M30),
+            PriceStep::from(source.min_ticksize),
+            &[kline],
+            Vec::new(),
+            &[KlineIndicator::CumulativeDelta],
+            source,
+            &KlineChartKind::Candles,
+            None,
+        );
+        chart.configure_footprint_history(vec![source], true);
+
+        // Drain the whole backfill, treating every day as empty. Planning must
+        // stop after the indicator's fetch horizon — not its multi-month
+        // retention window, which would flood rate-limited REST sources and
+        // starve the chart's own kline fetches.
+        let horizon =
+            u64::from(crate::chart::indicator::kline::cumulative_delta::FETCH_LOOKBACK_DAYS);
+        let cutoff = chart.footprint_history.cutoff.unwrap_or_else(UnixMs::now);
+        let oldest_allowed = crate::chart::indicator::kline::footprint_history::day_start(cutoff)
+            .saturating_sub(
+                (horizon.saturating_sub(1))
+                    * crate::chart::indicator::kline::footprint_history::DAY_MS,
+            );
+
+        let mut requested_days = Vec::new();
+        loop {
+            // The trade-fetch mode is process-global and sibling tests flip it;
+            // re-assert it so planning is not cut short mid-drain.
+            crate::connector::fetcher::set_trade_fetch_mode(TradeFetchMode::Server);
+            let Some(Action::RequestFetch(specs)) = chart.fetch_footprint_history() else {
+                break;
+            };
+            for spec in specs {
+                let FetchRange::FootprintHistoryTrades(start, _) = spec.fetch else {
+                    panic!("cumulative delta should only request UTC-day trades");
+                };
+                requested_days.push(start);
+                chart.mark_fetch_no_data(spec.req_id);
+            }
+        }
+
+        assert_eq!(requested_days.len(), horizon as usize);
+        assert!(
+            requested_days
+                .iter()
+                .all(|day| day.as_u64() >= oldest_allowed),
+            "requested {requested_days:?} extends past the {oldest_allowed} fetch horizon"
+        );
         crate::connector::fetcher::set_trade_fetch_mode(TradeFetchMode::Off);
     }
 }

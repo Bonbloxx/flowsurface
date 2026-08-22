@@ -149,6 +149,17 @@ impl FootprintHistory {
         self.fetch_handles.push(handle);
     }
 
+    /// Forget requests that could not be dispatched (no matching ready stream
+    /// yet) so [`Self::fetch_missing_data`] plans them again once streams
+    /// resolve, instead of the ranges being suppressed as pending overlaps.
+    pub fn release_undispatched_requests(&mut self, ids: &[uuid::Uuid]) {
+        for id in ids {
+            self.trade_requests.remove(id);
+            self.oi_requests.remove(id);
+            self.request_handler.remove(*id);
+        }
+    }
+
     pub fn finalize_fetch(&mut self, req_id: uuid::Uuid) {
         if let Some(request) = self.trade_requests.remove(&req_id) {
             self.indicator.persist_cached_footprint_day(
