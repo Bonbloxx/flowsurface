@@ -1,5 +1,5 @@
 use super::KlineIndicatorImpl;
-use super::footprint_history::{DAY_MS, FootprintHistoryIndicator, day_start};
+use super::footprint_history::{DAY_MS, DayBookRetain, FootprintHistoryIndicator, day_start};
 use crate::chart::{
     Basis, Caches, Message, ViewState,
     indicator::{
@@ -66,6 +66,7 @@ impl CumulativeDeltaIndicator {
     pub fn new() -> Self {
         let mut inner = FootprintHistoryIndicator::new();
         inner.set_lookback_days(LOOKBACK_DAYS as u16);
+        inner.set_day_book_retain(DayBookRetain::DELTAS_WITHOUT_PRINTS);
         Self {
             cache: Caches::default(),
             inner,
@@ -347,7 +348,7 @@ impl MergedDays {
 }
 
 fn merged_day_deltas(inner: &FootprintHistoryIndicator, day_ts: u64) -> BTreeMap<u64, f64> {
-    inner.display_day_at(day_ts).stats.five_min_deltas().clone()
+    inner.merged_five_min_deltas(day_ts)
 }
 
 #[cfg(test)]

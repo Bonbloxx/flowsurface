@@ -246,7 +246,7 @@ pub fn make_empty(which: KlineIndicator) -> Box<dyn KlineIndicatorImpl> {
             Box::new(super::kline::open_interest::OpenInterestIndicator::new())
         }
         KlineIndicator::FootprintHistory => {
-            Box::new(super::kline::footprint_history::FootprintHistoryIndicator::new())
+            Box::new(super::kline::footprint_history::FootprintHistoryIndicator::new_display())
         }
         KlineIndicator::DailyDelta => {
             Box::new(super::kline::daily_delta::DailyDeltaIndicator::new())

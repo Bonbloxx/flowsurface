@@ -1,9 +1,10 @@
 use super::KlineIndicatorImpl;
 use super::daily_delta::delta_history_colors;
 use super::footprint_history::{
-    DAY_MS, FootprintHistoryIndicator, StoredLargeTrade, day_start, draw_text,
+    DAY_MS, DayBookRetain, FootprintHistoryIndicator, StoredLargeTrade, day_start, draw_text,
 };
 use crate::chart::{Message, ViewState};
+use std::cell::RefCell;
 
 use data::chart::PlotData;
 use data::chart::kline::{Config as KlineChartConfig, KlineDataPoint};
@@ -131,18 +132,30 @@ struct VisibleWindow {
 ///
 /// Drawing copies only the entries above the threshold for the visible days,
 /// so a redraw costs O(visible markers), not O(day book).
+struct HoverMarker {
+    x: f32,
+    y: f32,
+    radius: f32,
+    notional: f64,
+}
+
 pub struct LargeTradesIndicator {
     inner: FootprintHistoryIndicator,
     min_usd: f32,
+    /// Filled by `draw_overlay` and reused by hover so mouse-move crosshair
+    /// frames do not re-scan the day books.
+    hover_markers: RefCell<Vec<HoverMarker>>,
 }
 
 impl LargeTradesIndicator {
     pub fn new() -> Self {
         let mut inner = FootprintHistoryIndicator::new();
         inner.set_lookback_days(LARGE_TRADES_LOOKBACK_DAYS);
+        inner.set_day_book_retain(DayBookRetain::LARGE_TRADES_ONLY);
         Self {
             inner,
             min_usd: KlineChartConfig::LARGE_TRADES_MIN_USD_DEFAULT,
+            hover_markers: RefCell::new(Vec::new()),
         }
     }
 
@@ -391,6 +404,7 @@ impl KlineIndicatorImpl for LargeTradesIndicator {
         let ring_width = (1.2 / scaling).clamp(0.6, 2.4);
         let (buy, sell) = delta_history_colors(palette);
 
+        let mut hover = Vec::with_capacity(markers.len());
         for (x, trade) in markers {
             let radius = marker_radius(trade.notional, min_notional, max_notional, scaling);
             if !radius.is_finite() || radius <= 0.0 {
@@ -415,59 +429,53 @@ impl KlineIndicatorImpl for LargeTradesIndicator {
                     base.scale_alpha(0.95),
                 ),
             );
+            hover.push(HoverMarker {
+                x,
+                y,
+                radius,
+                notional: trade.notional,
+            });
         }
+        *self.hover_markers.borrow_mut() = hover;
     }
 
     fn draw_hover(
         &self,
         frame: &mut canvas::Frame,
         chart: &ViewState,
-        data_source: &PlotData<KlineDataPoint>,
+        _data_source: &PlotData<KlineDataPoint>,
         palette: &Extended,
-        region: Rectangle,
+        _region: Rectangle,
         cursor: Point,
     ) {
-        let Some(window) = self.visible_window(chart, data_source, region) else {
-            return;
-        };
-        let markers = self.collect_markers(chart, data_source, &window, region);
+        let markers = self.hover_markers.borrow();
         if markers.is_empty() {
             return;
         }
 
-        let scaling = chart.scaling.max(0.01);
-        let min_notional = f64::from(self.min_usd.max(capture_floor_usd()));
-        let max_notional = markers
-            .iter()
-            .map(|(_, trade)| trade.notional)
-            .fold(min_notional, f64::max);
-
-        let mut hovered: Option<(f32, Point, f64)> = None;
-        for (x, trade) in &markers {
-            let radius = marker_radius(trade.notional, min_notional, max_notional, scaling);
-            if !radius.is_finite() || radius <= 0.0 {
-                continue;
-            }
-            let y = chart.price_to_y(Price::from_units(trade.price_units));
-            if !y.is_finite() {
-                continue;
-            }
-            let dx = cursor.x - x;
-            let dy = cursor.y - y;
+        let mut hovered: Option<(f32, Point, f32, f64)> = None;
+        for marker in markers.iter() {
+            let dx = cursor.x - marker.x;
+            let dy = cursor.y - marker.y;
             let dist_sq = dx * dx + dy * dy;
-            if dist_sq > radius * radius {
+            if dist_sq > marker.radius * marker.radius {
                 continue;
             }
-            let replace = hovered.is_none_or(|(best_dist, _, _)| dist_sq < best_dist);
+            let replace = hovered.is_none_or(|(best_dist, _, _, _)| dist_sq < best_dist);
             if replace {
-                hovered = Some((dist_sq, Point::new(*x, y), trade.notional));
+                hovered = Some((
+                    dist_sq,
+                    Point::new(marker.x, marker.y),
+                    marker.radius,
+                    marker.notional,
+                ));
             }
         }
 
-        let Some((_, center, notional)) = hovered else {
+        let Some((_, center, radius, notional)) = hovered else {
             return;
         };
-        let radius = marker_radius(notional, min_notional, max_notional, scaling);
+        let scaling = chart.scaling.max(0.01);
         let label_color = palette.background.base.text;
         let text = format!("${}", abbr_large_numbers(notional));
         draw_text(
@@ -729,6 +737,33 @@ mod tests {
         assert_eq!(
             indicator.min_usd,
             KlineChartConfig::LARGE_TRADES_MIN_USD_MAX
+        );
+    }
+
+    #[test]
+    fn overlay_ingest_does_not_build_price_level_maps() {
+        let base = now_base();
+        let mut indicator = LargeTradesIndicator::new();
+        indicator.configure_footprint_history(&[binance()], true);
+        indicator.on_source_trades(
+            binance(),
+            &[
+                trade(base + 1_000, 60_000.0, 0.05, false),
+                trade(base + 1_001, 60_000.0, 25.0, true),
+            ],
+            false,
+        );
+
+        let day = day_start(UnixMs::new(base + 1_000));
+        let shown = indicator.inner.display_day_at(day);
+        assert!(shown.stats.levels.is_empty());
+        assert!(shown.stats.five_min_deltas().is_empty());
+        assert_eq!(
+            indicator
+                .inner
+                .display_large_trades(day, capture_floor_usd())
+                .len(),
+            1
         );
     }
 }

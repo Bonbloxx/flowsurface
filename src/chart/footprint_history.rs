@@ -38,7 +38,7 @@ struct FootprintTradeRequest {
 
 impl FootprintHistory {
     pub fn new(sources: Vec<TickerInfo>, aggregate: bool, block_step: PriceStep) -> Self {
-        let mut indicator = FootprintHistoryIndicator::new();
+        let mut indicator = FootprintHistoryIndicator::new_display();
         indicator.configure_footprint_history(&sources, aggregate);
         Self {
             indicator,
