@@ -10,6 +10,26 @@ pub struct CameraUniform {
     pub b: [f32; 4], // (viewport_w, viewport_h, pad, pad)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn live_edge_jump_preserves_zoom_and_vertical_position() {
+        let mut camera = Camera {
+            scale: 275.0,
+            offset: [42.0, -17.0],
+            right_pad_frac: 0.2,
+        };
+
+        camera.reset_to_live_edge(1_200.0, false, false);
+
+        assert_eq!(camera.scale, 275.0);
+        assert_eq!(camera.offset, [0.0, -17.0]);
+        assert_eq!(camera.right_pad_frac, 0.2);
+    }
+}
+
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Camera {

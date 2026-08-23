@@ -2722,6 +2722,31 @@ impl State {
                 tooltip_pos,
                 modal_btn_style(Modal::Settings),
             ));
+
+            let jump_to_latest = match &self.content {
+                Content::Heatmap { chart: Some(_), .. } | Content::Kline { chart: Some(_), .. } => {
+                    Some(Event::ChartInteraction(chart::Message::JumpToLatest))
+                }
+                Content::Comparison(Some(_)) => Some(Event::ComparisonChartInteraction(
+                    chart::comparison::Message::JumpToLatest,
+                )),
+                Content::ShaderHeatmap { chart: Some(_), .. } => {
+                    Some(Event::HeatmapShaderInteraction(
+                        crate::widget::chart::heatmap::Message::JumpToLatest,
+                    ))
+                }
+                _ => None,
+            };
+
+            if let Some(event) = jump_to_latest {
+                buttons = buttons.push(button_with_tooltip(
+                    text("Latest \u{2192}").size(crate::style::text_size::TINY),
+                    Message::PaneEvent(pane, event),
+                    Some("Jump to the latest price action"),
+                    tooltip_pos,
+                    control_btn_style(false),
+                ));
+            }
         }
         if !treat_as_starter
             && matches!(

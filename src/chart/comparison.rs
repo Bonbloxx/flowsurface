@@ -20,6 +20,25 @@ pub enum Action {
     OpenSeriesEditor,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn jump_to_latest_resets_only_the_horizontal_pan() {
+        let mut chart = ComparisonChart::new(Basis::Time(Timeframe::M5), &[], None);
+        chart.pan = -500.0;
+        chart.zoom = Zoom::points(42);
+        let previous_revision = chart.cache_rev;
+
+        assert!(chart.update(Message::JumpToLatest).is_none());
+
+        assert_eq!(chart.pan, DEFAULT_PAN_POINTS);
+        assert_eq!(chart.zoom, Zoom::points(42));
+        assert_eq!(chart.cache_rev, previous_revision.wrapping_add(1));
+    }
+}
+
 pub struct ComparisonChart {
     zoom: Zoom,
     pan: f32,
@@ -37,6 +56,7 @@ pub struct ComparisonChart {
 #[derive(Debug, Clone)]
 pub enum Message {
     Chart(LineComparisonEvent),
+    JumpToLatest,
     Editor(series_editor::Message),
     OpenEditorFor(TickerInfo),
 }
@@ -110,6 +130,11 @@ impl ComparisonChart {
                     None
                 }
             },
+            Message::JumpToLatest => {
+                self.pan = DEFAULT_PAN_POINTS;
+                self.cache_rev = self.cache_rev.wrapping_add(1);
+                None
+            }
             Message::Editor(msg) => self.series_editor.update(msg),
             Message::OpenEditorFor(ticker_info) => self.open_editor_for_ticker(ticker_info),
         }

@@ -74,7 +74,7 @@ pub enum Message {
         viewport_w: f32,
     },
     CursorMoved,
-    PauseBtnClicked,
+    JumpToLatest,
 }
 
 pub struct HeatmapShader {
@@ -394,9 +394,11 @@ impl HeatmapShader {
                     }
                 }
             }
-            Message::PauseBtnClicked => {
+            Message::JumpToLatest => {
                 if let Some(size) = self.viewport_size_px() {
-                    self.scene.camera.reset_to_live_edge(size.width, true, true);
+                    self.scene
+                        .camera
+                        .reset_to_live_edge(size.width, false, false);
                     self.canvas_invalidation.mark_axis_x_motion();
 
                     let resumed = self.try_resume_if_x0_visible();
@@ -425,8 +427,6 @@ impl HeatmapShader {
 
         let render_latest_time = self.anchor.render_latest_time();
         let scroll_ref_bucket = self.anchor.scroll_ref_bucket();
-        let is_paused = self.anchor.is_paused();
-
         let aggr_time = self.depth_history.aggr_time_ms();
         let latest_bucket = (render_latest_time / aggr_time) as i64;
         let render_base_price = self.anchor.effective_base_price(self.base_price);
@@ -448,7 +448,7 @@ impl HeatmapShader {
             camera: &self.scene.camera,
             timezone,
             plot_bounds: self.viewport,
-            is_paused,
+            is_paused: false,
             latest_bucket,
             aggr_time,
             column_world: self.scene.cell.width_world(),
@@ -460,7 +460,7 @@ impl HeatmapShader {
         let y_axis = AxisYLabelCanvas {
             cache: &self.canvas_caches.y_axis,
             plot_bounds: self.viewport,
-            is_paused,
+            is_paused: false,
             camera: &self.scene.camera,
             base_price: render_base_price,
             step: self.step,
@@ -478,7 +478,7 @@ impl HeatmapShader {
             tooltip_cache: &self.canvas_caches.overlay,
             scale_labels_cache: &self.canvas_caches.scale_labels,
             geometry: overlay_geometry,
-            is_paused,
+            is_paused: false,
             volume_strip_max_qty: self.instances.volume_strip_scale_max_qty,
             depth_profile_max_qty: self.instances.depth_profile_scale_max_qty,
             volume_profile_max_qty: self.instances.volume_profile_scale_max_qty,

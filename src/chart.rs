@@ -57,6 +57,7 @@ pub enum AxisScaleClicked {
 pub enum Message {
     Translated(Vector),
     Scaled(f32, Vector),
+    JumpToLatest,
     AutoscaleToggled,
     CrosshairMoved,
     YScaling(f32, f32, bool),
@@ -360,6 +361,10 @@ pub fn update<T: Chart>(chart: &mut T, message: &Message) {
 
             state.layout.autoscale = None;
         }
+        Message::JumpToLatest => {
+            let latest = chart.autoscaled_coords();
+            chart.mut_state().translation.x = latest.x;
+        }
         Message::AutoscaleToggled => {
             let supports_fit_autoscaling = chart.supports_fit_autoscaling();
             let state = chart.mut_state();
@@ -626,7 +631,6 @@ pub fn view<'a, T: Chart>(
             Some(background) => iced::widget::stack![background, foreground].into(),
             None => foreground,
         };
-
         let main_chart: Element<_> = row![
             container(plot)
                 .width(Length::FillPortion(10))

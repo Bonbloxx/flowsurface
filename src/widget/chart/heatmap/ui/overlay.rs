@@ -172,7 +172,7 @@ impl<'a> canvas::Program<Message> for OverlayCanvas<'a> {
             iced::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
                 if let Some(cursor_in_abs) = cursor.position_over(bounds) {
                     if self.is_paused && self.paused_control_contains(bounds, cursor_in_abs) {
-                        return Some(canvas::Action::publish(Message::PauseBtnClicked));
+                        return Some(canvas::Action::publish(Message::JumpToLatest));
                     }
 
                     *interaction = Interaction::Panning {
