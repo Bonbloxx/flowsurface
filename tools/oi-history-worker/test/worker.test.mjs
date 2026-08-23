@@ -26,7 +26,7 @@ function recordingDb() {
   };
 }
 
-test("normalizes all three venues to one-sided USD OI", () => {
+test("normalizes all three venues to venue-reported USD OI", () => {
   const binance = normalizeBinance(
     { openInterest: "100", time: 1_700_000_012_345 },
     { markPrice: "50" },
@@ -45,8 +45,9 @@ test("normalizes all three venues to one-sided USD OI", () => {
       markPrice: "50",
     }] },
   });
-  assert.equal(bybit.rawOpenInterest, 100);
-  assert.equal(bybit.usdOpenInterest, 5_000);
+  assert.equal(bybit.rawOpenInterest, 200);
+  assert.equal(bybit.usdOpenInterest, 10_000);
+  assert.equal(bybit.oiDefinition, "venue_reported");
 
   const hyperliquid = normalizeHyperliquid([
     { universe: [{ name: "ETH" }, { name: "BTC" }] },
@@ -56,7 +57,7 @@ test("normalizes all three venues to one-sided USD OI", () => {
   assert.equal(hyperliquid.usdOpenInterest, 5_000);
 });
 
-test("Bybit falls back from documented both-side values without doubling OI", () => {
+test("Bybit uses documented both-side values without halving OI", () => {
   const value = normalizeBybit({
     retCode: 0,
     time: 1_700_000_012_345,
@@ -66,15 +67,44 @@ test("Bybit falls back from documented both-side values without doubling OI", ()
       markPrice: "50",
     }] },
   });
-  assert.equal(value.rawOpenInterest, 100);
-  assert.equal(value.usdOpenInterest, 5_000);
+  assert.equal(value.rawOpenInterest, 200);
+  assert.equal(value.usdOpenInterest, 10_000);
+});
+
+test("Bybit doubles single-side compatibility fields to the published definition", () => {
+  const value = normalizeBybit({
+    retCode: 0,
+    time: 1_700_000_012_345,
+    result: { list: [{
+      singleOpenInterest: "100",
+      singleOpenInterestValue: "5000",
+      markPrice: "50",
+    }] },
+  });
+  assert.equal(value.rawOpenInterest, 200);
+  assert.equal(value.usdOpenInterest, 10_000);
 });
 
 test("history endpoint is authenticated, ordered and paged", async () => {
   const rows = [
-    { bucket_ms: 60_000, observed_at_ms: 61_000, usd_open_interest: 10 },
-    { bucket_ms: 120_000, observed_at_ms: 121_000, usd_open_interest: 11 },
-    { bucket_ms: 180_000, observed_at_ms: 181_000, usd_open_interest: 12 },
+    {
+      bucket_ms: 60_000,
+      observed_at_ms: 61_000,
+      usd_open_interest: 10,
+      oi_definition: "venue_reported",
+    },
+    {
+      bucket_ms: 120_000,
+      observed_at_ms: 121_000,
+      usd_open_interest: 11,
+      oi_definition: "venue_reported",
+    },
+    {
+      bucket_ms: 180_000,
+      observed_at_ms: 181_000,
+      usd_open_interest: 12,
+      oi_definition: "venue_reported",
+    },
   ];
   const env = {
     READ_TOKEN: "secret",
@@ -118,6 +148,36 @@ test("history endpoint is authenticated, ordered and paged", async () => {
   });
 });
 
+test("history upgrades legacy Bybit single-side rows on read", async () => {
+  const env = {
+    READ_TOKEN: "secret",
+    DB: {
+      prepare() {
+        return {
+          bind() {
+            return {
+              all: async () => ({
+                results: [{
+                  bucket_ms: 60_000,
+                  observed_at_ms: 61_000,
+                  usd_open_interest: 5_000,
+                  oi_definition: "legacy",
+                }],
+              }),
+            };
+          },
+        };
+      },
+    },
+  };
+  const response = await route(new Request(
+    "https://worker.test/v1/open-interest?venue=bybit&market=linear&symbol=BTCUSDT",
+    { headers: { authorization: "Bearer secret" } },
+  ), env);
+  assert.equal(response.status, 200);
+  assert.deepEqual((await response.json()).points, [[60_000, 61_000, 10_000]]);
+});
+
 test("scheduled collection leaves Binance to the VPS and keeps direct venues independent", async () => {
   const requested = [];
   const fetcher = async (url) => {
@@ -127,8 +187,8 @@ test("scheduled collection leaves Binance to the VPS and keeps direct venues ind
         retCode: 0,
         time: 1_700_000_012_345,
         result: { list: [{
-          singleOpenInterest: "100",
-          singleOpenInterestValue: "5000",
+          openInterest: "200",
+          openInterestValue: "10000",
           markPrice: "50",
         }] },
       }));
@@ -144,6 +204,7 @@ test("scheduled collection leaves Binance to the VPS and keeps direct venues ind
 
   assert.deepEqual(samples.map((value) => value.venue), ["bybit", "hyperliquid"]);
   assert.equal(DB.writes.length, 2);
+  assert.equal(DB.writes.every((write) => write[9] === "venue_reported"), true);
   assert.equal(requested.some((url) => url.includes("binance.com")), false);
 });
 

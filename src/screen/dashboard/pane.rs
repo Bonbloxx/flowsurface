@@ -257,6 +257,44 @@ fn default_footprint_history_sources(available: &[TickerInfo]) -> Vec<TickerInfo
     selected
 }
 
+fn configured_open_interest_sources(
+    settings: &Settings,
+    available: &[TickerInfo],
+) -> (Vec<TickerInfo>, bool) {
+    let aggregate = settings.open_interest_aggregate.unwrap_or(true);
+    let selected = settings
+        .open_interest_sources
+        .as_deref()
+        .map(|wanted| {
+            available
+                .iter()
+                .copied()
+                .filter(|source| {
+                    wanted
+                        .iter()
+                        .any(|ticker| ticker.same_market(&source.ticker))
+                })
+                .collect::<Vec<_>>()
+        })
+        .filter(|sources| !sources.is_empty())
+        .unwrap_or_else(|| {
+            if aggregate {
+                available.to_vec()
+            } else {
+                available.iter().copied().take(1).collect()
+            }
+        });
+    (selected, aggregate)
+}
+
+fn active_open_interest_sources(selected: &[TickerInfo], aggregate: bool) -> Vec<TickerInfo> {
+    if aggregate {
+        selected.to_vec()
+    } else {
+        selected.iter().copied().take(1).collect()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Message {
     PaneClicked(pane_grid::Pane),
@@ -290,6 +328,8 @@ pub enum Event {
     RenkoConfigChanged(data::chart::kline::RenkoConfig),
     TpoConfigChanged(data::chart::tpo::Config),
     AggregateSourceToggled(TickerInfo, bool),
+    OpenInterestAggregationToggled(bool, Vec<TickerInfo>),
+    OpenInterestSourceToggled(TickerInfo, bool),
     FootprintHistoryAggregationToggled(bool),
     FootprintHistorySourceToggled(TickerInfo, bool),
     LiquidityHeatmapSourceToggled(TickerInfo, bool),
@@ -795,6 +835,28 @@ impl State {
             indicators,
             ..
         } = &mut content
+            && indicators.contains(&KlineIndicator::OpenInterest)
+        {
+            let available = data::aggregation::equivalent_footprint_sources(
+                base_ticker,
+                tickers.iter().copied(),
+            );
+            let (selected, aggregate) =
+                configured_open_interest_sources(&self.settings, &available);
+            let active = active_open_interest_sources(&selected, aggregate);
+            if !active.is_empty() {
+                self.settings.open_interest_sources =
+                    Some(selected.iter().map(|source| source.ticker).collect());
+                self.settings.open_interest_aggregate = Some(aggregate);
+                chart.configure_open_interest(active);
+            }
+        }
+
+        if let Content::Kline {
+            chart: Some(chart),
+            indicators,
+            ..
+        } = &mut content
             && has_trade_history_indicator(indicators)
         {
             let available = data::aggregation::equivalent_footprint_sources(
@@ -1043,6 +1105,7 @@ impl State {
                     let layout = chart.chart_layout();
                     let visual_config = chart.visual_config();
                     let feed = chart.feed().clone();
+                    let open_interest_sources = chart.open_interest_sources().to_vec();
                     let footprint_history_sources = chart.footprint_history_sources().to_vec();
                     let footprint_history_aggregate = chart.footprint_history_aggregate();
 
@@ -1061,6 +1124,7 @@ impl State {
                         Some(visual_config),
                     );
                     rebuilt.set_feed(feed);
+                    rebuilt.configure_open_interest(open_interest_sources);
                     rebuilt.restore_live_trade_starts(live_trade_starts);
                     rebuilt.change_tick_size(display_step);
                     rebuilt.configure_footprint_history(
@@ -1731,6 +1795,37 @@ impl State {
                                     .collect();
                                 (sources, chart.footprint_history_aggregate())
                             });
+                        let open_interest =
+                            indicators.contains(&KlineIndicator::OpenInterest).then(|| {
+                                let aggregate =
+                                    self.settings.open_interest_aggregate.unwrap_or(true);
+                                let configured = self.settings.open_interest_sources.as_deref();
+                                let sources = footprint_history_available
+                                    .iter()
+                                    .copied()
+                                    .map(|source| {
+                                        let selected = configured.map_or_else(
+                                            || {
+                                                chart.open_interest_sources().iter().any(|active| {
+                                                    active.ticker.same_market(&source.ticker)
+                                                })
+                                            },
+                                            |wanted| {
+                                                wanted.iter().any(|ticker| {
+                                                    ticker.same_market(&source.ticker)
+                                                })
+                                            },
+                                        );
+                                        let symbol = source.ticker.display_symbol_and_type().0;
+                                        (
+                                            source,
+                                            format!("{} · {}", source.exchange().venue(), symbol),
+                                            selected,
+                                        )
+                                    })
+                                    .collect();
+                                (sources, aggregate)
+                            });
                         let liquidity_heatmap = indicators
                             .contains(&KlineIndicator::LiquidityHeatmap)
                             .then(|| {
@@ -1760,6 +1855,7 @@ impl State {
                             chart.tick_size(),
                             self.settings.tick_multiply.unwrap_or(TickMultiplier(50)),
                             aggregate_sources,
+                            open_interest,
                             footprint_history,
                             liquidity_heatmap,
                             indicators.contains(&KlineIndicator::DailyDelta).then(|| {
@@ -2107,6 +2203,34 @@ impl State {
                         Content::Kline { indicators, .. }
                             if !has_liquidity_heatmap(indicators)
                     );
+                let is_open_interest =
+                    matches!(ind, UiIndicator::Kline(KlineIndicator::OpenInterest));
+                let enabling_open_interest = is_open_interest
+                    && matches!(
+                        &self.content,
+                        Content::Kline { indicators, .. }
+                            if !indicators.contains(&KlineIndicator::OpenInterest)
+                    );
+
+                if enabling_open_interest {
+                    let Content::Kline {
+                        chart: Some(chart), ..
+                    } = &mut self.content
+                    else {
+                        return None;
+                    };
+                    let available = data::aggregation::equivalent_footprint_sources(
+                        chart.feed().primary(),
+                        available_sources.iter().copied(),
+                    );
+                    let (selected, aggregate) =
+                        configured_open_interest_sources(&self.settings, &available);
+                    let active = active_open_interest_sources(&selected, aggregate);
+                    self.settings.open_interest_sources =
+                        Some(selected.iter().map(|source| source.ticker).collect());
+                    self.settings.open_interest_aggregate = Some(aggregate);
+                    chart.configure_open_interest(active);
+                }
 
                 if enabling {
                     let configured = self
@@ -2297,6 +2421,75 @@ impl State {
                 self.settings.aggregate_sources = Some(selected_sources);
                 self.set_content_and_streams(available_sources, content_kind);
                 return Some(Effect::RefreshStreams);
+            }
+            Event::OpenInterestAggregationToggled(aggregate, available) => {
+                let Content::Kline {
+                    chart: Some(chart), ..
+                } = &mut self.content
+                else {
+                    return None;
+                };
+                let current = self.settings.open_interest_aggregate.unwrap_or(true);
+                if aggregate == current {
+                    return None;
+                }
+
+                let selected = if aggregate {
+                    data::aggregation::equivalent_footprint_sources(
+                        chart.feed().primary(),
+                        available,
+                    )
+                } else {
+                    chart
+                        .open_interest_sources()
+                        .first()
+                        .copied()
+                        .or_else(|| Some(chart.feed().primary()))
+                        .into_iter()
+                        .collect()
+                };
+                if selected.is_empty() {
+                    return None;
+                }
+                self.settings.open_interest_sources =
+                    Some(selected.iter().map(|source| source.ticker).collect());
+                self.settings.open_interest_aggregate = Some(aggregate);
+                chart.configure_open_interest(selected);
+            }
+            Event::OpenInterestSourceToggled(ticker_info, enabled) => {
+                let Content::Kline {
+                    chart: Some(chart), ..
+                } = &mut self.content
+                else {
+                    return None;
+                };
+                let aggregate = self.settings.open_interest_aggregate.unwrap_or(true);
+                let mut selected = chart.open_interest_sources().to_vec();
+                if enabled {
+                    if aggregate {
+                        if !selected
+                            .iter()
+                            .any(|source| source.ticker.same_market(&ticker_info.ticker))
+                        {
+                            selected.push(ticker_info);
+                        }
+                    } else {
+                        selected = vec![ticker_info];
+                    }
+                } else {
+                    selected.retain(|source| !source.ticker.same_market(&ticker_info.ticker));
+                    if selected.is_empty() {
+                        self.notifications.push(Toast::warn(
+                            "At least one Open Interest venue must remain enabled".to_string(),
+                        ));
+                        return None;
+                    }
+                }
+
+                self.settings.open_interest_sources =
+                    Some(selected.iter().map(|source| source.ticker).collect());
+                self.settings.open_interest_aggregate = Some(aggregate);
+                chart.configure_open_interest(selected);
             }
             Event::FootprintHistoryAggregationToggled(aggregate) => {
                 let (mut sources, current) = (match &self.content {
@@ -3971,53 +4164,73 @@ mod tests {
     }
 
     #[test]
-    fn open_interest_follows_direct_and_aggregated_chart_sources() {
+    fn open_interest_defaults_to_all_venues_and_supports_single_venue_mode() {
         let binance = ticker_info(Exchange::BinanceLinear, "BTCUSDT", 0.1);
         let bybit = ticker_info(Exchange::BybitLinear, "BTCUSDT", 0.1);
         let hyperliquid = ticker_info(Exchange::HyperliquidLinear, "BTC", 1.0);
         let available = vec![binance, bybit, hyperliquid];
 
-        for source in available.iter().copied() {
-            let mut state = State::default();
-            state.set_content_and_streams(vec![source], ContentKind::CandlestickChart);
-            state.update(Event::ToggleIndicator(
-                UiIndicator::Kline(KlineIndicator::OpenInterest),
-                available.clone(),
-            ));
-            let Content::Kline {
-                chart: Some(chart), ..
-            } = &state.content
-            else {
-                panic!("direct candlestick chart initialized");
-            };
-            assert_eq!(chart.open_interest_sources(), &[source]);
-        }
-
-        let mut aggregate = State::default();
-        aggregate.set_content_and_streams(available.clone(), ContentKind::FootprintChart);
-        aggregate.update(Event::ToggleIndicator(
+        let mut state = State::default();
+        state.set_content_and_streams(vec![binance], ContentKind::CandlestickChart);
+        state.update(Event::ToggleIndicator(
             UiIndicator::Kline(KlineIndicator::OpenInterest),
             available.clone(),
         ));
         let Content::Kline {
             chart: Some(chart), ..
-        } = &aggregate.content
+        } = &state.content
         else {
-            panic!("aggregate footprint chart initialized");
+            panic!("candlestick chart initialized");
         };
         assert_eq!(chart.open_interest_sources(), available.as_slice());
+        assert_eq!(state.settings.open_interest_aggregate, Some(true));
+        assert_eq!(
+            state.settings.open_interest_sources,
+            Some(available.iter().map(|source| source.ticker).collect())
+        );
 
-        assert!(matches!(
-            aggregate.update(Event::AggregateSourceToggled(hyperliquid, false)),
-            Some(Effect::RefreshStreams)
+        state.update(Event::OpenInterestAggregationToggled(
+            false,
+            available.clone(),
         ));
         let Content::Kline {
             chart: Some(chart), ..
-        } = &aggregate.content
+        } = &state.content
         else {
-            panic!("aggregate footprint chart rebuilt");
+            panic!("candlestick chart remains initialized");
         };
-        assert_eq!(chart.open_interest_sources(), &[binance, bybit]);
+        assert_eq!(chart.open_interest_sources(), &[binance]);
+        assert_eq!(state.settings.open_interest_aggregate, Some(false));
+
+        state.update(Event::OpenInterestSourceToggled(bybit, true));
+        let Content::Kline {
+            chart: Some(chart), ..
+        } = &state.content
+        else {
+            panic!("candlestick chart remains initialized");
+        };
+        assert_eq!(chart.open_interest_sources(), &[bybit]);
+
+        state.update(Event::OpenInterestSourceToggled(hyperliquid, true));
+        let Content::Kline {
+            chart: Some(chart), ..
+        } = &state.content
+        else {
+            panic!("candlestick chart remains initialized");
+        };
+        assert_eq!(chart.open_interest_sources(), &[hyperliquid]);
+
+        state.update(Event::OpenInterestAggregationToggled(
+            true,
+            available.clone(),
+        ));
+        let Content::Kline {
+            chart: Some(chart), ..
+        } = &state.content
+        else {
+            panic!("candlestick chart remains initialized");
+        };
+        assert_eq!(chart.open_interest_sources(), available.as_slice());
     }
 
     #[test]

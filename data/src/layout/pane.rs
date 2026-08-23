@@ -118,6 +118,10 @@ pub struct Settings {
     pub footprint_history_sources: Option<Vec<Ticker>>,
     /// Combine selected Footprint History venues into one composite footprint.
     pub footprint_history_aggregate: bool,
+    /// Venue sources used by the Open Interest indicator.
+    pub open_interest_sources: Option<Vec<Ticker>>,
+    /// `None` preserves the aggregate-by-default behavior for older layouts.
+    pub open_interest_aggregate: Option<bool>,
     /// Venue books combined by the toggleable kline liquidity heatmap.
     pub liquidity_heatmap_sources: Option<Vec<Ticker>>,
 }
@@ -407,6 +411,8 @@ mod tests {
             aggregate_sources: Some(selected.clone()),
             footprint_history_sources: Some(selected.clone()),
             footprint_history_aggregate: true,
+            open_interest_sources: Some(selected.clone()),
+            open_interest_aggregate: Some(false),
             liquidity_heatmap_sources: Some(selected.clone()),
             ..Settings::default()
         };
@@ -415,12 +421,16 @@ mod tests {
         let decoded: Settings = serde_json::from_str(&encoded).expect("settings deserialize");
         assert_eq!(decoded.aggregate_sources, Some(selected.clone()));
         assert_eq!(decoded.footprint_history_sources, Some(selected.clone()));
+        assert_eq!(decoded.open_interest_sources, Some(selected.clone()));
+        assert_eq!(decoded.open_interest_aggregate, Some(false));
         assert_eq!(decoded.liquidity_heatmap_sources, Some(selected));
         assert!(decoded.footprint_history_aggregate);
 
         let legacy: Settings = serde_json::from_str("{}").expect("legacy settings deserialize");
         assert_eq!(legacy.aggregate_sources, None);
         assert_eq!(legacy.footprint_history_sources, None);
+        assert_eq!(legacy.open_interest_sources, None);
+        assert_eq!(legacy.open_interest_aggregate, None);
         assert_eq!(legacy.liquidity_heatmap_sources, None);
         assert!(!legacy.footprint_history_aggregate);
     }

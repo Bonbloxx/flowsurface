@@ -225,10 +225,19 @@ impl Flowsurface {
             Message::Tick(now) => {
                 let main_window_id = self.main_window.id;
                 let data_sources = Arc::clone(&self.data_sources);
+                let ticker_catalog = &self.sidebar.tickers_table.tickers_info;
+                let active_layout = self
+                    .layout_manager
+                    .active_layout_id()
+                    .expect("No active layout");
+                let dashboard = self
+                    .layout_manager
+                    .get_mut(active_layout.unique)
+                    .map(|layout| &mut layout.dashboard)
+                    .expect("No active dashboard");
 
-                return self
-                    .active_dashboard_mut()
-                    .tick(now, &data_sources, main_window_id)
+                return dashboard
+                    .tick(now, &data_sources, main_window_id, ticker_catalog)
                     .map(move |msg| Message::Dashboard {
                         layout_id: None,
                         event: msg,

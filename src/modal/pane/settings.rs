@@ -596,6 +596,7 @@ pub fn comparison_cfg_view<'a>(
 }
 
 type FootprintHistorySettings = Option<(Vec<(exchange::TickerInfo, String, bool)>, bool)>;
+type OpenInterestSettings = Option<(Vec<(exchange::TickerInfo, String, bool)>, bool)>;
 type LiquidityHeatmapSettings = Option<Vec<(exchange::TickerInfo, String, bool)>>;
 
 pub fn footprint_history_cfg_view(
@@ -641,6 +642,7 @@ pub fn kline_cfg_view<'a>(
     tick_size: exchange::unit::PriceStep,
     tick_multiply: TickMultiplier,
     aggregate_sources: Vec<(exchange::TickerInfo, String, bool)>,
+    open_interest: OpenInterestSettings,
     footprint_history: FootprintHistorySettings,
     liquidity_heatmap: LiquidityHeatmapSettings,
     daily_delta: Option<(u16, u16)>,
@@ -1226,6 +1228,35 @@ pub fn kline_cfg_view<'a>(
                     .align_y(Alignment::Center),
                 row![text("Value area %"), space::horizontal(), percent_choices]
                     .align_y(Alignment::Center),
+            ]
+            .spacing(8),
+        );
+    }
+
+    if let Some((sources, aggregate)) = open_interest {
+        let available_sources = sources
+            .iter()
+            .map(|(ticker_info, _, _)| *ticker_info)
+            .collect::<Vec<_>>();
+        let source_choices = sources.into_iter().fold(
+            column![].spacing(6),
+            |choices, (ticker_info, label, selected)| {
+                choices.push(checkbox(selected).label(label).on_toggle(move |enabled| {
+                    Message::PaneEvent(pane, Event::OpenInterestSourceToggled(ticker_info, enabled))
+                }))
+            },
+        );
+        content = content.push(
+            column![
+                text("Open Interest").size(crate::style::text_size::SECTION),
+                text("Use one venue or sum the published Binance, Bybit, and Hyperliquid values."),
+                checkbox(aggregate)
+                    .label("Aggregate all venues")
+                    .on_toggle(move |enabled| Message::PaneEvent(
+                        pane,
+                        Event::OpenInterestAggregationToggled(enabled, available_sources.clone(),),
+                    )),
+                source_choices,
             ]
             .spacing(8),
         );

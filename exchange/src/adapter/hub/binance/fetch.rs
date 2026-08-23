@@ -658,10 +658,10 @@ pub(super) async fn fetch_historical_oi(
                     x.time
                 )));
             }
-            Ok(OpenInterest {
-                time: x.time.into(),
-                value,
-            })
+            // Binance timestamps history at the completed interval's right
+            // edge. Keep that close in the interval it summarizes; live
+            // snapshots below retain their exact observation time.
+            Ok(OpenInterest::completed_interval(x.time.into(), value))
         })
         .collect::<Result<Vec<_>, AdapterError>>()?;
 

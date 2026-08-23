@@ -20,6 +20,7 @@ use crate::{
 };
 use data::{
     UserTimezone,
+    chart::indicator::KlineIndicator,
     layout::{WindowSpec, pane::ContentKind, pane::VisualConfig},
     stream::PersistStreamKind,
 };
@@ -49,6 +50,44 @@ use std::{
 /// Losslessly apply live market data at a frame-sized cadence. User input is a
 /// separate iced event path and remains immediate.
 const MARKET_BATCH_INTERVAL: Duration = Duration::from_micros(33_333);
+
+fn extend_open_interest_catalog_sources(
+    state: &pane::State,
+    tickers: &mut Vec<TickerInfo>,
+    catalog: &rustc_hash::FxHashMap<exchange::Ticker, Option<TickerInfo>>,
+) {
+    let pane_uses_open_interest = matches!(
+        &state.content,
+        pane::Content::Kline { indicators, .. }
+            if indicators.contains(&KlineIndicator::OpenInterest)
+    );
+    let Some(primary) = pane_uses_open_interest
+        .then(|| tickers.first().copied())
+        .flatten()
+    else {
+        return;
+    };
+
+    let available = data::aggregation::equivalent_footprint_sources(
+        primary,
+        catalog.values().filter_map(|ticker_info| *ticker_info),
+    );
+    let configured = state.settings.open_interest_sources.as_deref();
+    for source in available {
+        let selected = configured.is_none_or(|wanted| {
+            wanted
+                .iter()
+                .any(|ticker| ticker.same_market(&source.ticker))
+        });
+        if selected
+            && !tickers
+                .iter()
+                .any(|existing| existing.ticker.same_market(&source.ticker))
+        {
+            tickers.push(source);
+        }
+    }
+}
 
 #[derive(Clone, Hash)]
 enum MarketStreamPlan {
@@ -1395,6 +1434,7 @@ impl Dashboard {
         now: Instant,
         data_sources: &DataSources,
         _main_window: window::Id,
+        ticker_catalog: &rustc_hash::FxHashMap<exchange::Ticker, Option<TickerInfo>>,
     ) -> Task<Message> {
         let mut tasks = vec![];
 
@@ -1446,11 +1486,14 @@ impl Dashboard {
                 )));
             }
             Some(pane::Action::ResolveContent) => match state.stream_pair_kind() {
-                Some(StreamPairKind::MultiSource(tickers)) => {
+                Some(StreamPairKind::MultiSource(mut tickers)) => {
+                    extend_open_interest_catalog_sources(state, &mut tickers, ticker_catalog);
                     state.set_content_and_streams(tickers, state.content.kind());
                 }
                 Some(StreamPairKind::SingleSource(ticker)) => {
-                    state.set_content_and_streams(vec![ticker], state.content.kind());
+                    let mut tickers = vec![ticker];
+                    extend_open_interest_catalog_sources(state, &mut tickers, ticker_catalog);
+                    state.set_content_and_streams(tickers, state.content.kind());
                 }
                 None => {}
             },

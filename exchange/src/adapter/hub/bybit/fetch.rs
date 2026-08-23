@@ -25,8 +25,6 @@ struct DeOpenInterest {
         deserialize_with = "serde_util::de_string_to_number"
     )]
     pub value: f64,
-    #[serde(rename = "singleOpenInterest", default)]
-    pub single_side_value: Option<String>,
     #[serde(deserialize_with = "serde_util::de_string_to_number")]
     pub timestamp: u64,
 }
@@ -352,9 +350,10 @@ async fn fetch_current_oi(
         .and_then(|list| list.first())
         .ok_or_else(|| AdapterError::ParseError("Missing Bybit ticker OI".to_string()))?;
 
-    // Bybit now publishes both-side and single-side fields. Standard OI
-    // counts each outstanding contract once, so prefer the single-side value;
-    // halve the documented both-side field only as a compatibility fallback.
+    // Match Bybit and the order-flow platforms that report its venue-published
+    // OI: `openInterest` / `openInterestValue` are explicitly both-side fields.
+    // Single-side fields are compatibility fallbacks and are doubled back to
+    // the same published definition before aggregation.
     let value = current_oi_usd_value(item, market)
         .ok_or_else(|| AdapterError::ParseError("Missing Bybit ticker OI value".to_string()))?;
     if !value.is_finite() || value < 0.0 {
@@ -370,19 +369,20 @@ async fn fetch_current_oi(
 
 fn current_oi_usd_value(item: &Value, market: MarketKind) -> Option<f64> {
     match market {
-        MarketKind::LinearPerps => serde_util::value_as_f64(&item["singleOpenInterestValue"])
+        MarketKind::LinearPerps => serde_util::value_as_f64(&item["openInterestValue"])
             .or_else(|| {
-                serde_util::value_as_f64(&item["openInterestValue"]).map(|value| value / 2.0)
+                serde_util::value_as_f64(&item["singleOpenInterestValue"]).map(|value| value * 2.0)
             })
             .or_else(|| {
-                let base = serde_util::value_as_f64(&item["singleOpenInterest"]).or_else(|| {
-                    serde_util::value_as_f64(&item["openInterest"]).map(|value| value / 2.0)
+                let base = serde_util::value_as_f64(&item["openInterest"]).or_else(|| {
+                    serde_util::value_as_f64(&item["singleOpenInterest"]).map(|value| value * 2.0)
                 })?;
                 let mark = serde_util::value_as_f64(&item["markPrice"])?;
                 Some(base * mark)
             }),
-        MarketKind::InversePerps => serde_util::value_as_f64(&item["singleOpenInterest"])
-            .or_else(|| serde_util::value_as_f64(&item["openInterest"]).map(|value| value / 2.0)),
+        MarketKind::InversePerps => serde_util::value_as_f64(&item["openInterest"]).or_else(|| {
+            serde_util::value_as_f64(&item["singleOpenInterest"]).map(|value| value * 2.0)
+        }),
         MarketKind::Spot => None,
     }
 }
@@ -479,11 +479,7 @@ pub(super) async fn fetch_historical_oi(
         .into_iter()
         .filter_map(|x| {
             let time = UnixMs::from(x.timestamp);
-            let contracts = x
-                .single_side_value
-                .as_deref()
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(x.value / 2.0);
+            let contracts = x.value;
             let value = match market {
                 MarketKind::LinearPerps => prices
                     .range(..=time)
@@ -493,7 +489,9 @@ pub(super) async fn fetch_historical_oi(
                 MarketKind::InversePerps => contracts,
                 MarketKind::Spot => return None,
             };
-            Some(OpenInterest { time, value })
+            // Bybit history is interval data timestamped on its right edge.
+            // Current ticker snapshots remain at their exact observation time.
+            Some(OpenInterest::completed_interval(time, value))
         })
         .collect();
 
@@ -803,7 +801,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn current_linear_oi_prefers_single_side_usd_notional() {
+    fn current_linear_oi_uses_the_venue_published_both_side_notional() {
         let item = serde_json::json!({
             "openInterest": "49185.575",
             "openInterestValue": "3803594293.11",
@@ -813,25 +811,34 @@ mod tests {
         });
         assert_eq!(
             current_oi_usd_value(&item, MarketKind::LinearPerps),
-            Some(1_901_797_185.22)
+            Some(3_803_594_293.11)
         );
     }
 
     #[test]
-    fn documented_both_side_value_is_halved_when_single_side_is_absent() {
+    fn published_values_are_not_halved_and_single_side_fallbacks_are_doubled() {
         let linear = serde_json::json!({
             "openInterestValue": "3800000000",
             "markPrice": "77000"
         });
         assert_eq!(
             current_oi_usd_value(&linear, MarketKind::LinearPerps),
-            Some(1_900_000_000.0)
+            Some(3_800_000_000.0)
         );
 
         let inverse = serde_json::json!({ "openInterest": "240000000" });
         assert_eq!(
             current_oi_usd_value(&inverse, MarketKind::InversePerps),
-            Some(120_000_000.0)
+            Some(240_000_000.0)
+        );
+
+        let single_fallback = serde_json::json!({
+            "singleOpenInterestValue": "1900000000",
+            "markPrice": "77000"
+        });
+        assert_eq!(
+            current_oi_usd_value(&single_fallback, MarketKind::LinearPerps),
+            Some(3_800_000_000.0)
         );
     }
 }

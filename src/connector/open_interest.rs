@@ -7,7 +7,9 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 
-const CACHE_SCHEMA_VERSION: u16 = 2;
+// v3 invalidates Bybit values cached before the venue-published both-side OI
+// correction. Older cache directories remain untouched and are never read.
+const CACHE_SCHEMA_VERSION: u16 = 3;
 const MINUTE_MS: u64 = 60_000;
 const DAY_MS: u64 = 24 * 60 * MINUTE_MS;
 const RETENTION_DAYS: u64 = 90;

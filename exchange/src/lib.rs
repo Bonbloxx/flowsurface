@@ -702,6 +702,41 @@ pub struct OpenInterest {
     pub value: f64,
 }
 
+impl OpenInterest {
+    /// Converts a venue history timestamp at the right edge of a completed
+    /// interval into an observation inside the interval it summarizes.
+    ///
+    /// Current snapshots keep their exact observation time. Moving only a
+    /// completed interval boundary back by one millisecond lets every chart
+    /// timeframe bucket it correctly without a visual-only plot shift.
+    pub const fn completed_interval(end: UnixMs, value: f64) -> Self {
+        Self {
+            time: end.saturating_sub(1),
+            value,
+        }
+    }
+}
+
+#[cfg(test)]
+mod open_interest_tests {
+    use super::*;
+
+    #[test]
+    fn completed_interval_stays_inside_the_interval_it_summarizes() {
+        let observation = OpenInterest::completed_interval(UnixMs::new(600_000), 42.0);
+        assert_eq!(observation.time, UnixMs::new(599_999));
+        assert_eq!(
+            observation.time.floor_to(Timeframe::M1),
+            UnixMs::new(540_000)
+        );
+        assert_eq!(
+            observation.time.floor_to(Timeframe::M5),
+            UnixMs::new(300_000)
+        );
+        assert_eq!(observation.value, 42.0);
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Hash)]
 pub struct TickMultiplier(pub u16);
 

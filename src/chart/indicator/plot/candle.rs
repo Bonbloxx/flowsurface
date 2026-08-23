@@ -15,7 +15,6 @@ pub struct CandlePlot<O, H, L, C, T> {
     tooltip: Option<TooltipFn<T>>,
     padding: f32,
     bar_width_factor: f32,
-    x_shift_buckets: i32,
 }
 
 impl<O, H, L, C, T> CandlePlot<O, H, L, C, T> {
@@ -28,13 +27,7 @@ impl<O, H, L, C, T> CandlePlot<O, H, L, C, T> {
             tooltip: None,
             padding: 0.08,
             bar_width_factor: 0.72,
-            x_shift_buckets: 0,
         }
-    }
-
-    pub fn shift(mut self, buckets: i32) -> Self {
-        self.x_shift_buckets = buckets;
-        self
     }
 
     pub fn with_tooltip<F>(mut self, tooltip: F) -> Self
@@ -81,7 +74,6 @@ where
     ) {
         let palette = theme.extended_palette();
         let width = (ctx.cell_width * self.bar_width_factor).max(1.0);
-        let shift = self.x_shift_buckets as f32 * ctx.cell_width;
 
         datapoints.for_each_in(range, |x, candle| {
             let open = (self.open)(candle);
@@ -93,7 +85,7 @@ where
             } else {
                 palette.danger.strong.color
             };
-            let center_x = ctx.interval_to_x(x) + shift;
+            let center_x = ctx.interval_to_x(x);
             let high_y = scale.to_y(high);
             let low_y = scale.to_y(low);
             frame.fill_rectangle(
@@ -115,9 +107,5 @@ where
 
     fn tooltip_fn(&self) -> Option<&TooltipFn<S::Y>> {
         self.tooltip.as_ref()
-    }
-
-    fn x_shift_buckets(&self) -> i32 {
-        self.x_shift_buckets
     }
 }

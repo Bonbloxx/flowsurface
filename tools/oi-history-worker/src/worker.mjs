@@ -45,6 +45,7 @@ function sample(source, observedAtMs, rawOpenInterest, rawUnit, markPrice, usdOp
     rawUnit,
     markPrice: mark,
     usdOpenInterest: usd,
+    oiDefinition: "venue_reported",
   };
 }
 
@@ -69,13 +70,13 @@ export function normalizeBybit(payload) {
   const item = payload.result?.list?.[0];
   if (!item) throw new Error("Bybit ticker response is empty");
   const mark = positive(item.markPrice, "Bybit mark price");
-  const raw = item.singleOpenInterest != null
-    ? finiteNonNegative(item.singleOpenInterest, "Bybit single-side open interest")
-    : finiteNonNegative(item.openInterest, "Bybit both-side open interest") / 2;
-  const usd = item.singleOpenInterestValue != null
-    ? finiteNonNegative(item.singleOpenInterestValue, "Bybit single-side OI value")
-    : item.openInterestValue != null
-      ? finiteNonNegative(item.openInterestValue, "Bybit both-side OI value") / 2
+  const raw = item.openInterest != null
+    ? finiteNonNegative(item.openInterest, "Bybit both-side open interest")
+    : finiteNonNegative(item.singleOpenInterest, "Bybit single-side open interest") * 2;
+  const usd = item.openInterestValue != null
+    ? finiteNonNegative(item.openInterestValue, "Bybit both-side OI value")
+    : item.singleOpenInterestValue != null
+      ? finiteNonNegative(item.singleOpenInterestValue, "Bybit single-side OI value") * 2
       : raw * mark;
   return sample(
     { venue: "bybit", market: "linear", symbol: "BTCUSDT" },
@@ -128,14 +129,15 @@ async function collectHyperliquid(fetcher, observedAtMs) {
 const UPSERT = `
 INSERT INTO oi_samples (
   venue, market, symbol, bucket_ms, observed_at_ms,
-  raw_open_interest, raw_unit, mark_price, usd_open_interest
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  raw_open_interest, raw_unit, mark_price, usd_open_interest, oi_definition
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT (venue, market, symbol, bucket_ms) DO UPDATE SET
   observed_at_ms = excluded.observed_at_ms,
   raw_open_interest = excluded.raw_open_interest,
   raw_unit = excluded.raw_unit,
   mark_price = excluded.mark_price,
-  usd_open_interest = excluded.usd_open_interest
+  usd_open_interest = excluded.usd_open_interest,
+  oi_definition = excluded.oi_definition
 WHERE excluded.observed_at_ms >= oi_samples.observed_at_ms`;
 
 export async function collectAll(env, observedAtMs = Date.now(), fetcher = fetch) {
@@ -172,6 +174,7 @@ async function persistSamples(env, samples) {
     value.rawUnit,
     value.markPrice,
     value.usdOpenInterest,
+    value.oiDefinition,
   ));
   await env.DB.batch(statements);
 }
@@ -234,7 +237,7 @@ async function history(request, env) {
     const limit = Math.min(integerParameter(url, "limit", DEFAULT_PAGE_SIZE), MAX_PAGE_SIZE);
     if (from > to || limit === 0) throw new Error("invalid range");
     const query = env.DB.prepare(`
-      SELECT bucket_ms, observed_at_ms, usd_open_interest
+      SELECT bucket_ms, observed_at_ms, usd_open_interest, oi_definition
       FROM oi_samples
       WHERE venue = ? AND market = ? AND symbol = ?
         AND bucket_ms >= ? AND bucket_ms <= ?
@@ -256,7 +259,9 @@ async function history(request, env) {
       points: page.map((row) => [
         Number(row.bucket_ms),
         Number(row.observed_at_ms),
-        Number(row.usd_open_interest),
+        row.oi_definition === "legacy" && venue === "bybit"
+          ? Number(row.usd_open_interest) * 2
+          : Number(row.usd_open_interest),
       ]),
       next_from: nextFrom,
     }, 200, { "cache-control": "private, max-age=30" });

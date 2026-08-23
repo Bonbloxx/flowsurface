@@ -143,10 +143,15 @@ impl OpenInterestIndicator {
         }
 
         let source_intervals = self.source_intervals_label();
+        let value_label = if self.sources.len() > 1 {
+            "Combined venue-reported OI"
+        } else {
+            "Venue-reported OI"
+        };
         let tooltip = move |value: &OpenInterestCandle, next: Option<&OpenInterestCandle>| {
             let usd = |value: f64| format!("${}", format_with_commas(value));
             let value_text = format!(
-                "Aggregated OI: {} ({})\nO {}  H {}\nL {}  C {}",
+                "{value_label}: {} ({})\nO {}  H {}\nL {}  C {}",
                 usd(value.close),
                 abbr_large_numbers(value.close),
                 usd(value.open),
@@ -174,9 +179,6 @@ impl OpenInterestIndicator {
             |v: &OpenInterestCandle| v.low as f32,
             |v: &OpenInterestCandle| v.close as f32,
         )
-        // Open interest is snapshotted at candle open, not computed from close like regular indicators.
-        // Shift left by 1 so each OI value aligns with the equivalent candle close.
-        .shift(-1)
         .with_tooltip(tooltip);
 
         indicator_row(
@@ -754,6 +756,28 @@ mod tests {
         assert_eq!(candle.close, 2_500_000_000.0);
         assert_eq!(candle.source_count, 1);
         assert_eq!(candle.expected_source_count, 1);
+    }
+
+    #[test]
+    fn completed_history_and_live_snapshot_fill_previous_and_current_m1_candles() {
+        let binance = source(Exchange::BinanceLinear, "BTCUSDT");
+        let mut indicator = OpenInterestIndicator::new();
+        indicator.timeframe = Some(Timeframe::M1);
+        indicator.configure_open_interest(&[binance]);
+
+        indicator.on_source_open_interest(
+            binance,
+            &[
+                OpenInterest::completed_interval(UnixMs::new(600_000), 10.0),
+                OpenInterest {
+                    time: UnixMs::new(600_123),
+                    value: 11.0,
+                },
+            ],
+        );
+
+        assert_eq!(indicator.data[&UnixMs::new(540_000)].close, 10.0);
+        assert_eq!(indicator.data[&UnixMs::new(600_000)].close, 11.0);
     }
 
     #[test]
