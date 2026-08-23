@@ -23,7 +23,9 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 pub(crate) const DAY_MS: u64 = 24 * 60 * 60 * 1_000;
+const ONE_MIN_MS: u64 = 60 * 1_000;
 const FIVE_MIN_MS: u64 = 5 * 60 * 1_000;
+const DELTA_ROUNDING_EPSILON: f64 = 0.01;
 pub(crate) const DAYS: usize = 3;
 /// v2: binary (bincode) encoding. A busy day serializes an order of magnitude
 /// faster than the previous JSON format, which blocked the UI thread for
@@ -50,6 +52,15 @@ const MAX_LOOKBACK_DAYS: usize = 732;
 /// lowering the threshold never requires a re-backfill within retention.
 fn large_trades_capture_floor() -> f64 {
     f64::from(data::chart::kline::Config::LARGE_TRADES_MIN_USD_MIN)
+}
+
+pub(crate) fn trade_notional(trade: Trade, qty_is_quote: bool) -> f64 {
+    let qty = trade.qty.to_f64();
+    if qty_is_quote {
+        qty
+    } else {
+        trade.price.to_f64() * qty
+    }
 }
 
 /// Hard per-day ceiling so busy symbols cannot grow the shared day book
@@ -179,6 +190,11 @@ pub(crate) struct DayStats {
     sell: f64,
     notional: f64,
     pub levels: BTreeMap<i64, LevelStats>,
+    /// Session-local minute resolution for CVD. This is deliberately omitted
+    /// from the shared v7 footprint cache so existing day books remain valid;
+    /// cached history stays at its truthful five-minute source resolution.
+    #[serde(skip)]
+    one_min_delta: BTreeMap<u64, f64>,
     five_min_delta: BTreeMap<u64, f64>,
     largest_trade: Option<LargestTrade>,
     pub(crate) large_trades: Vec<StoredLargeTrade>,
@@ -190,6 +206,7 @@ pub(crate) struct DayStats {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DayBookRetain {
     pub levels: bool,
+    pub one_min_delta: bool,
     pub five_min_delta: bool,
     pub large_trades: bool,
 }
@@ -197,21 +214,34 @@ pub(crate) struct DayBookRetain {
 impl DayBookRetain {
     pub const ALL: Self = Self {
         levels: true,
+        one_min_delta: true,
         five_min_delta: true,
         large_trades: true,
     };
     /// Large Trades overlay: keep prints, skip price-level and CVD maps.
     pub const LARGE_TRADES_ONLY: Self = Self {
         levels: false,
+        one_min_delta: false,
         five_min_delta: false,
         large_trades: true,
     };
-    /// CVD subplot: keep five-minute buckets and levels so the shared disk
+    /// CVD subplot: keep minute/five-minute buckets and levels so the shared disk
     /// cache stays complete for Footprint History. Large prints are still
     /// captured on insert so a CVD persist cannot wipe the Large Trades
     /// overlay; they are slimmed from memory after a complete day is written.
+    #[cfg(test)]
     pub const DELTAS_WITHOUT_PRINTS: Self = Self {
         levels: true,
+        one_min_delta: true,
+        five_min_delta: true,
+        large_trades: false,
+    };
+    /// CVD runtime: retain only the exact aggregates it renders. This variant
+    /// deliberately cannot write the shared Footprint History cache because
+    /// that cache requires price levels and large prints to be authoritative.
+    pub const CVD_DELTAS_ONLY: Self = Self {
+        levels: false,
+        one_min_delta: true,
         five_min_delta: true,
         large_trades: false,
     };
@@ -230,8 +260,7 @@ impl DayStats {
 
     fn insert_trade_with_unit(&mut self, trade: Trade, retain: DayBookRetain, qty_is_quote: bool) {
         let price = trade.price.to_f64();
-        let qty = trade.qty.to_f64();
-        let notional = if qty_is_quote { qty } else { price * qty };
+        let notional = trade_notional(trade, qty_is_quote);
 
         if self.first.is_none_or(|(time, _)| trade.time < time) {
             self.first = Some((trade.time, price));
@@ -257,10 +286,14 @@ impl DayStats {
             }
         }
 
+        let signed_notional = if trade.is_sell { -notional } else { notional };
+        if retain.one_min_delta {
+            let bucket = trade.time.as_u64() / ONE_MIN_MS * ONE_MIN_MS;
+            *self.one_min_delta.entry(bucket).or_default() += signed_notional;
+        }
         if retain.five_min_delta {
             let bucket = trade.time.as_u64() / FIVE_MIN_MS * FIVE_MIN_MS;
-            *self.five_min_delta.entry(bucket).or_default() +=
-                if trade.is_sell { -notional } else { notional };
+            *self.five_min_delta.entry(bucket).or_default() += signed_notional;
         }
 
         if self
@@ -275,10 +308,10 @@ impl DayStats {
             });
         }
 
-        // Always capture large prints so a CVD-style persist still writes
-        // them to the shared day file. Consumers that do not draw the overlay
-        // slim the vec from memory after a complete day is on disk.
-        if notional >= large_trades_capture_floor() {
+        // Full day-book writers and the Large Trades consumer retain prints.
+        // Compact CVD staging must not build a large-print vector it never
+        // renders and is intentionally forbidden from persisting.
+        if (retain.large_trades || retain.levels) && notional >= large_trades_capture_floor() {
             self.push_large_trade(StoredLargeTrade {
                 time: trade.time,
                 price_units: trade.price.units,
@@ -365,6 +398,9 @@ impl DayStats {
         for (price, level) in &other.levels {
             self.levels.entry(*price).or_default().merge(*level);
         }
+        for (bucket, delta) in &other.one_min_delta {
+            *self.one_min_delta.entry(*bucket).or_default() += delta;
+        }
         for (bucket, delta) in &other.five_min_delta {
             *self.five_min_delta.entry(*bucket).or_default() += delta;
         }
@@ -400,10 +436,32 @@ impl DayStats {
         (low, high)
     }
 
-    /// Five-minute USD-delta buckets (`bucket_start_ms -> buy - sell notional`)
-    /// shared with the aggregated CVD subplot.
+    #[cfg(test)]
     pub(crate) fn five_min_deltas(&self) -> &BTreeMap<u64, f64> {
         &self.five_min_delta
+    }
+
+    /// One-minute USD-delta buckets used by CVD on every time-based kline
+    /// chart. These preserve exact bucket closes without retaining raw trades.
+    pub(crate) fn one_min_deltas(&self) -> &BTreeMap<u64, f64> {
+        &self.one_min_delta
+    }
+
+    fn one_min_deltas_cover_five_minute(&self) -> bool {
+        if self.one_min_delta.is_empty() {
+            return self.five_min_delta.is_empty();
+        }
+        let mut aggregated = BTreeMap::<u64, f64>::new();
+        for (minute, delta) in &self.one_min_delta {
+            let bucket = minute / FIVE_MIN_MS * FIVE_MIN_MS;
+            *aggregated.entry(bucket).or_default() += delta;
+        }
+        aggregated.len() == self.five_min_delta.len()
+            && aggregated.iter().all(|(bucket, delta)| {
+                self.five_min_delta
+                    .get(bucket)
+                    .is_some_and(|five_min| (five_min - delta).abs() <= DELTA_ROUNDING_EPSILON)
+            })
     }
 
     fn largest_bucket(&self, positive: bool) -> Option<(u64, f64)> {
@@ -745,10 +803,15 @@ impl FootprintHistoryIndicator {
         if !self.retain.levels {
             stats.levels.clear();
         }
+        if !self.retain.one_min_delta {
+            stats.one_min_delta.clear();
+        }
         if !self.retain.five_min_delta {
             stats.five_min_delta.clear();
         }
-        if !self.retain.large_trades && Self::day_is_complete(UnixMs::new(day), covered_through) {
+        if !self.retain.large_trades
+            && (!self.retain.levels || Self::day_is_complete(UnixMs::new(day), covered_through))
+        {
             stats.large_trades.clear();
         }
         let history = self.histories.entry(source.ticker).or_default();
@@ -781,6 +844,15 @@ impl FootprintHistoryIndicator {
         covered_through: UnixMs,
     ) {
         let day = day_start(day);
+        if self
+            .cache_checkpoints
+            .get(&(source.ticker, day))
+            .copied()
+            .flatten()
+            .is_some_and(|checkpoint| checkpoint >= covered_through)
+        {
+            return;
+        }
         let Some(stats) = self
             .histories
             .get_mut(&source.ticker)
@@ -797,6 +869,11 @@ impl FootprintHistoryIndicator {
             // Incomplete books (Large Trades skips price levels) must not
             // occupy the shared on-disk path: Footprint History would treat
             // an empty-level file as a complete day and skip the real fetch.
+            // They still consumed this request successfully in memory. Advance
+            // their local checkpoint or the planner will request the identical
+            // missing suffix again for the rest of the session.
+            self.cache_checkpoints
+                .insert((source.ticker, day), Some(covered_through));
             return;
         }
         let path = Self::cache_path(source, day);
@@ -829,17 +906,19 @@ impl FootprintHistoryIndicator {
         day_start(now).saturating_sub((self.lookback_days.saturating_sub(1) as u64) * DAY_MS)
     }
 
-    /// Drop the per-price-level detail of one UTC day across every source,
-    /// keeping only the aggregates (five-minute delta buckets, totals). Used
-    /// by cumulative-style consumers after a day is safely persisted or
-    /// loaded complete, so long lookbacks do not retain level maps per venue.
+    /// Drop detail CVD does not read from one UTC day across every source.
+    /// Minute-complete days keep only minute deltas; legacy cached days retain
+    /// their truthful five-minute deltas because they cannot be subdivided.
     /// In-memory only: disk caches are written before this runs and stay
     /// complete for other consumers.
-    pub(crate) fn slim_day_levels(&mut self, day: u64) {
+    pub(crate) fn slim_day_for_cvd(&mut self, day: u64) {
         let day = day_start(UnixMs::new(day));
         for history in self.histories.values_mut() {
             if let Some(stats) = history.days.get_mut(&day) {
                 stats.levels.clear();
+                if stats.one_min_deltas_cover_five_minute() {
+                    stats.five_min_delta.clear();
+                }
             }
         }
         self.rebuild_display();
@@ -883,26 +962,71 @@ impl FootprintHistoryIndicator {
         result
     }
 
-    /// Venue-merged five-minute USD-delta buckets for one UTC day.
+    /// Venue-merged CVD deltas for one UTC day, starting at `from`.
     ///
-    /// Avoids `display_day_at`, which also clones and merges per-price level
-    /// maps CVD never reads.
-    pub(crate) fn merged_five_min_deltas(&self, day: u64) -> BTreeMap<u64, f64> {
-        let mut merged = BTreeMap::new();
+    /// Existing disk caches contribute honest five-minute samples. Trades
+    /// ingested this session contribute one-minute samples; their amounts are
+    /// subtracted from the matching five-minute total before being reinserted
+    /// at minute resolution, so no execution can be counted twice.
+    pub(crate) fn merged_cvd_deltas_from(&self, day: u64, from: u64) -> BTreeMap<u64, f64> {
+        let mut merged = BTreeMap::<u64, f64>::new();
         for source in self.active_sources() {
-            let Some(deltas) = self
+            let Some(stats) = self
                 .histories
                 .get(&source.ticker)
                 .and_then(|history| history.days.get(&day))
-                .map(DayStats::five_min_deltas)
             else {
                 continue;
             };
-            for (bucket, delta) in deltas {
-                *merged.entry(*bucket).or_default() += *delta;
+            let mut source_deltas = BTreeMap::<u64, f64>::new();
+            for (bucket, delta) in stats.five_min_delta.range(from..) {
+                *source_deltas.entry(*bucket).or_default() += *delta;
+            }
+            for (minute, delta) in stats.one_min_deltas().range(from..) {
+                let five_min_bucket = minute / FIVE_MIN_MS * FIVE_MIN_MS;
+                if five_min_bucket >= from
+                    && stats.five_min_delta.contains_key(&five_min_bucket)
+                    && let Some(coarse) = source_deltas.get_mut(&five_min_bucket)
+                {
+                    *coarse -= *delta;
+                }
+                *source_deltas.entry(*minute).or_default() += *delta;
+            }
+            source_deltas.retain(|_, delta| delta.abs() > DELTA_ROUNDING_EPSILON);
+            for (time, delta) in source_deltas {
+                *merged.entry(time).or_default() += delta;
             }
         }
+        merged.retain(|_, delta| delta.abs() > DELTA_ROUNDING_EPSILON);
         merged
+    }
+
+    /// Add execution-derived minute deltas for one source/day. Once an exact
+    /// minute cache is present, its covered tape supersedes the coarse v7
+    /// five-minute fallback for CVD; keeping both would count it twice.
+    pub(crate) fn merge_exact_cvd_minutes(
+        &mut self,
+        source: Ticker,
+        day: u64,
+        deltas: &BTreeMap<u64, f64>,
+    ) {
+        let source = self
+            .sources
+            .iter()
+            .find(|candidate| candidate.ticker.same_market(&source))
+            .map_or(source, |candidate| candidate.ticker);
+        let stats = self
+            .histories
+            .entry(source)
+            .or_default()
+            .days
+            .entry(day_start(UnixMs::new(day)))
+            .or_default();
+        for (minute, delta) in deltas {
+            *stats.one_min_delta.entry(*minute).or_default() += delta;
+        }
+        stats.five_min_delta.clear();
+        self.clear_all_caches();
     }
 
     /// Visit large executed trades for a UTC day across active sources.
@@ -1318,13 +1442,22 @@ impl KlineIndicatorImpl for FootprintHistoryIndicator {
             return;
         }
         for trade in trades {
-            if trade.time.as_u64() < oldest || cutoff.is_some_and(|boundary| trade.time > boundary)
+            let day = day_start(trade.time);
+            let already_covered = self
+                .cache_checkpoints
+                .get(&(source_key, day))
+                .copied()
+                .flatten()
+                .is_some_and(|checkpoint| trade.time <= checkpoint);
+            if trade.time.as_u64() < oldest
+                || cutoff.is_some_and(|boundary| trade.time > boundary)
+                || already_covered
             {
                 continue;
             }
             stage
                 .days
-                .entry(day_start(trade.time))
+                .entry(day)
                 .or_default()
                 .insert_trade_with_unit(*trade, retain, qty_is_quote);
         }
@@ -2380,7 +2513,9 @@ mod tests {
         let (loaded, loaded_through) =
             FootprintHistoryIndicator::read_cached_day(&path, source, day).expect("read cache");
 
-        assert_eq!(loaded, stats);
+        let mut expected = stats;
+        expected.one_min_delta.clear();
+        assert_eq!(loaded, expected);
         assert_eq!(loaded_through, covered_through);
         std::fs::remove_file(&path).expect("remove cache file");
         std::fs::remove_dir(&root).expect("remove cache directory");
@@ -2761,7 +2896,7 @@ mod tests {
     }
 
     #[test]
-    fn five_min_delta_merge_does_not_need_level_maps() {
+    fn display_merge_combines_five_minute_deltas() {
         let binance = TickerInfo::new(
             Ticker::new("BTCUSDT", Exchange::BinanceLinear),
             0.1,
@@ -2780,15 +2915,49 @@ mod tests {
         indicator.on_source_trades(binance, &[trade(today + 60_000, 10.0, 100.0, false)], true);
         indicator.on_source_trades(bybit, &[trade(today + 60_000, 10.0, 50.0, true)], true);
 
-        let merged = indicator.merged_five_min_deltas(today);
-        let via_display = indicator
-            .display_day_at(today)
-            .stats
-            .five_min_deltas()
-            .clone();
-        assert_eq!(merged, via_display);
+        let merged = indicator.display_day_at(today).stats.five_min_delta;
         let bucket = today / FIVE_MIN_MS * FIVE_MIN_MS;
         assert!((merged[&bucket] - 500.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn cvd_merge_keeps_cached_five_minute_truth_and_adds_live_minute_once() {
+        let source = TickerInfo::new(
+            Ticker::new("BTCUSDT", Exchange::BinanceLinear),
+            0.1,
+            0.001,
+            None,
+        );
+        let today = day_start(UnixMs::now());
+        let mut indicator = FootprintHistoryIndicator::new();
+        indicator.configure_footprint_history(&[source], false);
+
+        let mut cached = DayStats::default();
+        cached.five_min_delta.insert(today, 500.0);
+        indicator
+            .histories
+            .entry(source.ticker)
+            .or_default()
+            .days
+            .insert(today, cached);
+
+        // A new $100 buy is present in both the regular five-minute map and
+        // the session-local minute map. The CVD merge must subtract it from
+        // the coarse bucket before placing it at its real minute timestamp.
+        indicator.on_source_trades(
+            source,
+            &[trade(today + ONE_MIN_MS + 1_000, 10.0, 10.0, false)],
+            false,
+        );
+
+        let merged = indicator.merged_cvd_deltas_from(today, today);
+        assert_eq!(merged[&today], 500.0);
+        assert_eq!(merged[&(today + ONE_MIN_MS)], 100.0);
+        assert_eq!(merged.values().sum::<f64>(), 600.0);
+
+        let suffix = indicator.merged_cvd_deltas_from(today, today + ONE_MIN_MS);
+        assert_eq!(suffix.len(), 1);
+        assert_eq!(suffix[&(today + ONE_MIN_MS)], 100.0);
     }
 
     fn whale(day: u64) -> Trade {
@@ -2805,6 +2974,55 @@ mod tests {
         assert_eq!(stats.levels.len(), 1);
         assert_eq!(stats.large_trades.len(), 1);
         assert!((stats.large_trades[0].notional - 1_600_000.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn compact_cvd_staging_never_builds_price_or_print_maps() {
+        let mut stats = DayStats::default();
+        for index in 0..20_000_u64 {
+            stats.insert_trade_with(
+                trade(
+                    index * 1_000,
+                    80_000.0 + (index % 5_000) as f64,
+                    20.0,
+                    false,
+                ),
+                DayBookRetain::CVD_DELTAS_ONLY,
+            );
+        }
+
+        assert!(stats.levels.is_empty());
+        assert!(stats.large_trades.is_empty());
+        assert!(stats.one_min_delta.len() <= 334);
+        assert!(stats.five_min_delta.len() <= 67);
+    }
+
+    #[test]
+    fn compact_consumer_advances_coverage_without_writing_shared_cache() {
+        let source = TickerInfo::new(
+            Ticker::new("BTCUSDT", Exchange::BinanceLinear),
+            0.1,
+            0.001,
+            None,
+        );
+        let day = day_start(UnixMs::now());
+        let covered_through = UnixMs::new(day + 60_000);
+        let mut indicator = FootprintHistoryIndicator::new();
+        indicator.set_day_book_retain(DayBookRetain::CVD_DELTAS_ONLY);
+        indicator.configure_footprint_history(&[source], false);
+        indicator.on_source_trades(source, &[trade(day + 1_000, 80_000.0, 1.0, false)], true);
+
+        indicator.persist_day_cache(source, UnixMs::new(day), covered_through);
+
+        assert_eq!(
+            indicator.cache_checkpoints[&(source.ticker, day)],
+            Some(covered_through)
+        );
+        assert!(
+            indicator.histories[&source.ticker].days[&day]
+                .levels
+                .is_empty()
+        );
     }
 
     #[test]

@@ -57,10 +57,52 @@ impl OpenInterestIndicator {
         }
     }
 
-    fn bucket_interval_ms(&self) -> u64 {
-        self.timeframe
-            .map(Timeframe::to_milliseconds)
-            .unwrap_or_else(|| Timeframe::M5.to_milliseconds())
+    /// Historical OI intervals are not the same as kline intervals. Use the
+    /// chart interval when the venue exposes it and otherwise fetch the
+    /// nearest finer interval, which can be aggregated upward without
+    /// inventing samples.
+    pub(crate) fn fetch_timeframe_for(exchange: Exchange, chart: Timeframe) -> Timeframe {
+        match exchange.venue() {
+            Venue::Bybit => match chart {
+                Timeframe::M1 | Timeframe::M3 | Timeframe::M5 => Timeframe::M5,
+                Timeframe::M15 => Timeframe::M15,
+                Timeframe::M30 => Timeframe::M30,
+                Timeframe::H1 | Timeframe::H2 => Timeframe::H1,
+                Timeframe::H4 | Timeframe::H12 => Timeframe::H4,
+                Timeframe::D1 => Timeframe::D1,
+                _ => Timeframe::M5,
+            },
+            Venue::Binance => match chart {
+                Timeframe::M1 | Timeframe::M3 => Timeframe::M5,
+                _ => chart,
+            },
+            // Hyperliquid returns a current asset-context snapshot rather than
+            // interval history. Keep the chart interval for request identity;
+            // no resampling claim is made for that snapshot.
+            Venue::Hyperliquid => chart,
+            Venue::Okex | Venue::Mexc => chart,
+        }
+    }
+
+    fn source_intervals_label(&self) -> String {
+        let Some(chart_timeframe) = self.timeframe else {
+            return Timeframe::M5.to_string();
+        };
+        let intervals = self
+            .sources
+            .iter()
+            .filter(|source| source.exchange().venue() != Venue::Hyperliquid)
+            .map(|source| Self::fetch_timeframe_for(source.exchange(), chart_timeframe))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(|timeframe| timeframe.to_string())
+            .collect::<Vec<_>>()
+            .join(" / ");
+        if intervals.is_empty() {
+            "current snapshot".to_string()
+        } else {
+            intervals
+        }
     }
 
     fn indicator_elem<'a>(
@@ -78,7 +120,8 @@ impl OpenInterestIndicator {
             return row![].into();
         }
 
-        let tooltip = |value: &OpenInterestCandle, next: Option<&OpenInterestCandle>| {
+        let source_intervals = self.source_intervals_label();
+        let tooltip = move |value: &OpenInterestCandle, next: Option<&OpenInterestCandle>| {
             let usd = |value: f64| format!("${}", format_with_commas(value));
             let value_text = format!(
                 "Aggregated OI: {} ({})\nO {}  H {}\nL {}  C {}",
@@ -97,8 +140,8 @@ impl OpenInterestIndicator {
                 "Change: N/A".to_string()
             };
             let coverage = format!(
-                "Sources: {}/{}",
-                value.source_count, value.expected_source_count
+                "Sources: {}/{}\nHistorical sampling: {}",
+                value.source_count, value.expected_source_count, source_intervals
             );
             PlotTooltip::new(format!("{value_text}\n{change_text}\n{coverage}"))
         };
@@ -137,9 +180,9 @@ impl OpenInterestIndicator {
     }
 
     fn rebuild_candles(&mut self) {
-        if self.timeframe.is_none() {
+        let Some(chart_timeframe) = self.timeframe else {
             return;
-        }
+        };
 
         // Venues without a historical OI endpoint (e.g. Hyperliquid) only
         // return a snapshot of the current value, and some venues cap how far
@@ -159,7 +202,7 @@ impl OpenInterestIndicator {
         // quiet"; beyond it the source drops out and the coverage count says
         // so.
         const MAX_CARRY_FORWARD_BUCKETS: u64 = 2;
-        let interval_ms = self.bucket_interval_ms();
+        let interval_ms = chart_timeframe.to_milliseconds();
 
         let qualified = self
             .sources
@@ -169,13 +212,13 @@ impl OpenInterestIndicator {
                 if series.len() < MIN_QUALIFYING_SAMPLES {
                     return None;
                 }
-                Some(series)
+                Some((*source, series))
             })
             .collect::<Vec<_>>();
 
         let times = qualified
             .iter()
-            .flat_map(|series| series.keys().copied())
+            .flat_map(|(_, series)| series.keys().copied())
             .collect::<BTreeSet<_>>();
         let mut rebuilt = BTreeMap::new();
         let mut previous_close = None;
@@ -183,13 +226,16 @@ impl OpenInterestIndicator {
         for time in times {
             let mut close = 0.0;
             let mut source_count = 0usize;
-            for series in &qualified {
+            for (source, series) in &qualified {
                 // Last known value at or before `time`, else the earliest
                 // known value carried back across preceding candles.
                 let value = match series.range(..=time).next_back() {
                     Some((sample_time, value)) => {
                         let staleness = time.as_u64().saturating_sub(sample_time.as_u64());
-                        if staleness > MAX_CARRY_FORWARD_BUCKETS * interval_ms {
+                        let source_interval =
+                            Self::fetch_timeframe_for(source.exchange(), chart_timeframe);
+                        if staleness > MAX_CARRY_FORWARD_BUCKETS * source_interval.to_milliseconds()
+                        {
                             continue;
                         }
                         source_count += 1;
@@ -199,9 +245,9 @@ impl OpenInterestIndicator {
                 };
                 close += value;
             }
-            let open = previous_close.unwrap_or(close);
-            rebuilt.insert(
-                time,
+            let bucket = UnixMs::new(time.as_u64() / interval_ms * interval_ms);
+            let candle = rebuilt.entry(bucket).or_insert_with(|| {
+                let open = previous_close.unwrap_or(close);
                 OpenInterestCandle {
                     open,
                     high: open.max(close),
@@ -209,8 +255,12 @@ impl OpenInterestIndicator {
                     close,
                     source_count,
                     expected_source_count: self.sources.len(),
-                },
-            );
+                }
+            });
+            candle.high = candle.high.max(close);
+            candle.low = candle.low.min(close);
+            candle.close = close;
+            candle.source_count = source_count;
             previous_close = Some(close);
         }
         self.data = rebuilt;
@@ -226,7 +276,7 @@ impl OpenInterestIndicator {
     }
 
     fn is_supported_timeframe(timeframe: Timeframe) -> bool {
-        timeframe >= Timeframe::M5 && timeframe <= Timeframe::H4 && timeframe != Timeframe::H2
+        Timeframe::KLINE.contains(&timeframe)
     }
 
     fn availability_for(basis: Basis, exchange: Exchange) -> IndicatorAvailability {
@@ -353,11 +403,9 @@ impl KlineIndicatorImpl for OpenInterestIndicator {
         if !self.sources.contains(&source) {
             return;
         }
-        let interval = self.bucket_interval_ms();
         let series = self.source_data.entry(source).or_default();
         for value in values {
-            let bucket = value.time.as_u64() / interval * interval;
-            series.insert(UnixMs::new(bucket), value.value);
+            series.insert(value.time, value.value);
         }
         self.rebuild_candles();
     }
@@ -678,6 +726,88 @@ mod tests {
             7_250_000_000.0
         );
         assert_eq!(indicator.data[&UnixMs::new(2_400_000)].source_count, 1);
+    }
+
+    #[test]
+    fn every_kline_timeframe_uses_a_truthful_native_oi_interval() {
+        for timeframe in Timeframe::KLINE {
+            assert!(matches!(
+                OpenInterestIndicator::availability_for(
+                    Basis::Time(timeframe),
+                    Exchange::BybitLinear
+                ),
+                IndicatorAvailability::Available
+            ));
+        }
+
+        for (chart, expected) in [
+            (Timeframe::M1, Timeframe::M5),
+            (Timeframe::M3, Timeframe::M5),
+            (Timeframe::M5, Timeframe::M5),
+            (Timeframe::H2, Timeframe::H1),
+            (Timeframe::H12, Timeframe::H4),
+            (Timeframe::D1, Timeframe::D1),
+        ] {
+            assert_eq!(
+                OpenInterestIndicator::fetch_timeframe_for(Exchange::BybitLinear, chart),
+                expected
+            );
+        }
+        assert_eq!(
+            OpenInterestIndicator::fetch_timeframe_for(Exchange::BinanceLinear, Timeframe::H12),
+            Timeframe::H12
+        );
+    }
+
+    #[test]
+    fn native_samples_are_preserved_and_rebucketed_without_fabricated_points() {
+        let binance = source(Exchange::BinanceLinear, "BTCUSDT");
+        let mut indicator = OpenInterestIndicator::new();
+        indicator.timeframe = Some(Timeframe::M1);
+        indicator.configure_open_interest(&[binance]);
+
+        indicator.on_source_open_interest(
+            binance,
+            &[
+                OpenInterest {
+                    time: UnixMs::new(300_000),
+                    value: 10.0,
+                },
+                OpenInterest {
+                    time: UnixMs::new(600_000),
+                    value: 12.0,
+                },
+                OpenInterest {
+                    time: UnixMs::new(900_000),
+                    value: 11.0,
+                },
+                OpenInterest {
+                    time: UnixMs::new(1_200_000),
+                    value: 14.0,
+                },
+                OpenInterest {
+                    time: UnixMs::new(1_500_000),
+                    value: 13.0,
+                },
+            ],
+        );
+
+        assert_eq!(indicator.data.len(), 5);
+        assert!(indicator.data.contains_key(&UnixMs::new(300_000)));
+        assert!(!indicator.data.contains_key(&UnixMs::new(360_000)));
+
+        indicator.timeframe = Some(Timeframe::M15);
+        indicator.rebuild_candles();
+        let first = indicator.data[&UnixMs::new(0)];
+        assert_eq!(first.open, 10.0);
+        assert_eq!(first.high, 12.0);
+        assert_eq!(first.low, 10.0);
+        assert_eq!(first.close, 12.0);
+        let second = indicator.data[&UnixMs::new(900_000)];
+        assert_eq!(second.open, 12.0);
+        assert_eq!(second.high, 14.0);
+        assert_eq!(second.low, 11.0);
+        assert_eq!(second.close, 13.0);
     }
 
     #[test]

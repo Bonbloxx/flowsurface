@@ -328,7 +328,6 @@ impl KlineIndicatorImpl for DailyDeltaIndicator {
                 chart,
                 data_source,
                 region,
-                profile_w,
                 pad,
                 profile.day_ts,
                 is_current,
@@ -338,6 +337,9 @@ impl KlineIndicatorImpl for DailyDeltaIndicator {
             };
             let poc_line =
                 poc_line_range(chart, data_source, region, x, profile.day_ts, is_current);
+            if !profile_intersects_region(region, x, profile_w) && poc_line.is_none() {
+                continue;
+            }
 
             draw_day_profile(
                 frame, chart, profile, group_step, x, profile_w, highest, lowest, scaling, buy,
@@ -351,7 +353,6 @@ fn day_x(
     chart: &ViewState,
     data_source: &PlotData<KlineDataPoint>,
     region: Rectangle,
-    profile_w: f32,
     pad: f32,
     day_ts: u64,
     is_current: bool,
@@ -379,9 +380,11 @@ fn day_x(
         PlotData::TickBased(tick_aggr) => tick_day_x(chart, tick_aggr, day_ts)?,
     };
 
-    let left = region.x - profile_w;
-    let right = region.x + region.width + profile_w;
-    (x >= left && x <= right).then_some(x)
+    Some(x)
+}
+
+fn profile_intersects_region(region: Rectangle, profile_x: f32, profile_w: f32) -> bool {
+    profile_x >= region.x && profile_x - profile_w <= region.x + region.width
 }
 
 fn display_day_starts(now: UnixMs, cap: usize) -> Vec<u64> {
@@ -702,6 +705,7 @@ fn trim_decimals(value: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use data::chart::{Basis, ViewConfig};
     use exchange::{Kline, TickerInfo, Timeframe, Trade, Volume, adapter::Exchange, unit::Qty};
 
     fn trade(time: u64, price: f64, qty: f64, is_sell: bool) -> Trade {
@@ -780,6 +784,46 @@ mod tests {
     fn completed_day_sits_at_that_days_close_not_its_open() {
         let tuesday_open = 10 * DAY_MS;
         assert_eq!(completed_day_close_ts(tuesday_open), 11 * DAY_MS);
+    }
+
+    #[test]
+    fn one_minute_poc_remains_visible_after_profile_spine_leaves_view() {
+        let step = PriceStep::from(source().min_ticksize);
+        let mut chart = ViewState::new(
+            Basis::Time(Timeframe::M1),
+            step,
+            step.decimal_places(),
+            source(),
+            ViewConfig::default(),
+            10.0,
+            10.0,
+        );
+        chart.latest_x = 3 * DAY_MS;
+        let data_source =
+            PlotData::TimeBased(TimeSeries::<KlineDataPoint>::new(Timeframe::M1, step, &[]));
+        let region = Rectangle {
+            x: chart.interval_to_x(DAY_MS + DAY_MS / 2),
+            y: 0.0,
+            width: 120.0 * chart.cell_width,
+            height: 100.0,
+        };
+
+        let profile_x = day_x(
+            &chart,
+            &data_source,
+            region,
+            8.0,
+            0,
+            false,
+            UnixMs::new(3 * DAY_MS),
+        )
+        .expect("completed-day profile must retain its time-axis anchor");
+        assert!(profile_x < region.x);
+        assert!(!profile_intersects_region(region, profile_x, 64.0));
+
+        let poc_line = poc_line_range(&chart, &data_source, region, profile_x, 0, false)
+            .expect("the forward POC interval crosses the one-minute viewport");
+        assert_eq!(poc_line, (region.x, region.x + region.width));
     }
 
     #[test]

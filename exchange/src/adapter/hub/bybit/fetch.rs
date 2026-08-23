@@ -290,9 +290,19 @@ pub(super) async fn fetch_historical_oi(
             )));
         }
     };
+    let market = ticker_info.market_type();
+    let category = match market {
+        MarketKind::LinearPerps => "linear",
+        MarketKind::InversePerps => "inverse",
+        MarketKind::Spot => {
+            return Err(AdapterError::InvalidRequest(
+                "Open interest is unavailable for Bybit spot markets".to_string(),
+            ));
+        }
+    };
 
     let mut url = format!(
-        "{FETCH_DOMAIN}/v5/market/open-interest?category=linear&symbol={ticker_str}&intervalTime={period_str}",
+        "{FETCH_DOMAIN}/v5/market/open-interest?category={category}&symbol={ticker_str}&intervalTime={period_str}",
     );
 
     if let Some((start, end)) = range {
@@ -335,12 +345,15 @@ pub(super) async fn fetch_historical_oi(
             AdapterError::ParseError(format!("Failed to parse open interest: {e}"))
         })?;
 
-    let prices = fetch_klines(hub, ticker_info, period, range).await?;
-    let prices = prices
-        .into_iter()
-        .map(|kline| (kline.time, kline.close.to_f64()))
-        .collect::<std::collections::BTreeMap<_, _>>();
-    let market = ticker_info.market_type();
+    let prices = if market == MarketKind::LinearPerps {
+        fetch_klines(hub, ticker_info, period, range)
+            .await?
+            .into_iter()
+            .map(|kline| (kline.time, kline.close.to_f64()))
+            .collect::<std::collections::BTreeMap<_, _>>()
+    } else {
+        std::collections::BTreeMap::new()
+    };
     let open_interest: Vec<OpenInterest> = bybit_oi
         .into_iter()
         .filter_map(|x| {

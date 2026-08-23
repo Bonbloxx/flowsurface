@@ -1244,9 +1244,13 @@ impl KlineChart {
             {
                 let mut specs = Vec::new();
                 for source in indi.open_interest_sources().iter().copied() {
+                    let fetch_timeframe = crate::chart::indicator::kline::open_interest::OpenInterestIndicator::fetch_timeframe_for(
+                        source.exchange(),
+                        interval,
+                    );
                     let stream = StreamKind::Kline {
                         ticker_info: source,
-                        timeframe: interval,
+                        timeframe: fetch_timeframe,
                     };
                     if let Ok(Some(req_id)) = self.request_handler.add_request(range, Some(stream))
                     {
