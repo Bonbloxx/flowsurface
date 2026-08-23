@@ -15,7 +15,12 @@ use crate::adapter::hub::AdapterError;
 use csv::ReaderBuilder;
 use serde::Deserialize;
 use serde_json::Value;
-use std::{collections::HashMap, io::BufReader, path::PathBuf, time::UNIX_EPOCH};
+use std::{
+    collections::{BTreeMap, HashMap},
+    io::BufReader,
+    path::PathBuf,
+    time::UNIX_EPOCH,
+};
 
 #[derive(Deserialize, Debug, Clone)]
 struct FetchedKline(
@@ -42,6 +47,21 @@ struct DeOpenInterest {
     pub sum: f64,
     #[serde(rename = "sumOpenInterestValue", default)]
     pub notional: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DeCurrentOpenInterest {
+    #[serde(deserialize_with = "de_string_to_number")]
+    open_interest: f64,
+    time: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DePremiumIndex {
+    #[serde(deserialize_with = "de_string_to_number")]
+    mark_price: f64,
 }
 
 #[derive(Deserialize, Debug)]
@@ -457,6 +477,65 @@ pub(super) async fn fetch_klines(
     Ok(klines)
 }
 
+fn oi_range_reaches_live_edge(
+    range: Option<(UnixMs, UnixMs)>,
+    requested_period: Timeframe,
+    now: UnixMs,
+) -> bool {
+    range.is_none_or(|(_, end)| {
+        end.saturating_add(requested_period.to_milliseconds().max(60_000) * 2) >= now
+    })
+}
+
+async fn fetch_current_oi(
+    hub: &mut HttpHub<BinanceLimiter>,
+    ticker_info: TickerInfo,
+) -> Result<OpenInterest, AdapterError> {
+    let (ticker_str, market) = ticker_info.ticker.to_full_symbol_and_type();
+    let (url, weight) = match market {
+        MarketKind::LinearPerps => (
+            format!("{LINEAR_PERP_DOMAIN}/fapi/v1/openInterest?symbol={ticker_str}"),
+            1,
+        ),
+        MarketKind::InversePerps => (
+            format!("{INVERSE_PERP_DOMAIN}/dapi/v1/openInterest?symbol={ticker_str}"),
+            1,
+        ),
+        MarketKind::Spot => {
+            return Err(AdapterError::InvalidRequest(
+                "Open interest is unavailable for Binance spot markets".to_string(),
+            ));
+        }
+    };
+    let snapshot: DeCurrentOpenInterest =
+        hub.http_json_with_limiter(&url, weight, None, None).await?;
+    let value = match market {
+        MarketKind::LinearPerps => {
+            let mark_url = format!("{LINEAR_PERP_DOMAIN}/fapi/v1/premiumIndex?symbol={ticker_str}");
+            let mark: DePremiumIndex = hub.http_json_with_limiter(&mark_url, 1, None, None).await?;
+            snapshot.open_interest * mark.mark_price
+        }
+        MarketKind::InversePerps => {
+            let contract_size = ticker_info.contract_size.ok_or_else(|| {
+                AdapterError::ParseError(format!(
+                    "Missing contract size for Binance inverse OI {ticker_str}"
+                ))
+            })?;
+            snapshot.open_interest * contract_size.as_f64()
+        }
+        MarketKind::Spot => unreachable!("spot open interest was rejected above"),
+    };
+    if !value.is_finite() || value < 0.0 {
+        return Err(AdapterError::ParseError(format!(
+            "Invalid current Binance OI for {ticker_str}: {value}"
+        )));
+    }
+    Ok(OpenInterest {
+        time: UnixMs::new(snapshot.time),
+        value,
+    })
+}
+
 pub(super) async fn fetch_historical_oi(
     hub: &mut HttpHub<BinanceLimiter>,
     ticker_info: TickerInfo,
@@ -464,7 +543,14 @@ pub(super) async fn fetch_historical_oi(
     period: Timeframe,
 ) -> Result<Vec<OpenInterest>, AdapterError> {
     let (ticker_str, market) = ticker_info.ticker.to_full_symbol_and_type();
-    let period_str = period.to_string();
+    // Binance's downloadable OI history starts at 5m. Sub-5m charts combine
+    // that native history with exact current snapshots archived by the
+    // connector; no 1m points are synthesized from these 5m rows.
+    let historical_period = match period {
+        Timeframe::M1 | Timeframe::M3 => Timeframe::M5,
+        other => other,
+    };
+    let period_str = historical_period.to_string();
 
     let (base_url, pair_str, weight) = match market {
         MarketKind::LinearPerps => (
@@ -525,7 +611,7 @@ pub(super) async fn fetch_historical_oi(
             start
         };
 
-        let interval_ms = period.to_milliseconds();
+        let interval_ms = historical_period.to_milliseconds();
         // Ranges shorter than one bucket (e.g. the developing-candle OI
         // re-poll) must still request at least one sample: Binance rejects
         // `limit=0` with HTTP 400.
@@ -542,25 +628,62 @@ pub(super) async fn fetch_historical_oi(
         hub.http_json_with_limiter(&url, weight, None, None).await?;
 
     let contract_size = ticker_info.contract_size;
-    let open_interest = binance_oi
+    let mut open_interest = binance_oi
         .iter()
-        .map(|x| OpenInterest {
-            time: x.time.into(),
-            value: match market {
+        .map(|x| {
+            let value = match market {
                 MarketKind::LinearPerps => x
                     .notional
                     .as_deref()
                     .and_then(|value| value.parse().ok())
-                    .unwrap_or(x.sum),
+                    .ok_or_else(|| {
+                        AdapterError::ParseError(format!(
+                            "Missing USD notional in Binance OI history for {ticker_str} at {}",
+                            x.time
+                        ))
+                    })?,
                 MarketKind::InversePerps => {
-                    contract_size.map_or(x.sum, |size| x.sum * size.as_f64())
+                    let contract_size = contract_size.ok_or_else(|| {
+                        AdapterError::ParseError(format!(
+                            "Missing contract size for Binance inverse OI {ticker_str}"
+                        ))
+                    })?;
+                    x.sum * contract_size.as_f64()
                 }
                 MarketKind::Spot => unreachable!("spot open interest was rejected above"),
-            },
+            };
+            if !value.is_finite() || value < 0.0 {
+                return Err(AdapterError::ParseError(format!(
+                    "Invalid Binance OI for {ticker_str} at {}: {value}",
+                    x.time
+                )));
+            }
+            Ok(OpenInterest {
+                time: x.time.into(),
+                value,
+            })
         })
-        .collect::<Vec<OpenInterest>>();
+        .collect::<Result<Vec<_>, AdapterError>>()?;
 
-    Ok(open_interest)
+    let now = UnixMs::now();
+    if oi_range_reaches_live_edge(range, period, now) {
+        match fetch_current_oi(hub, ticker_info).await {
+            Ok(snapshot) => open_interest.push(snapshot),
+            Err(err) if open_interest.is_empty() => return Err(err),
+            Err(err) => log::warn!(
+                "Failed to refresh current Binance OI for {ticker_str}; using native history: {err}"
+            ),
+        }
+    }
+
+    let mut deduplicated = BTreeMap::new();
+    for point in open_interest {
+        deduplicated.insert(point.time, point.value);
+    }
+    Ok(deduplicated
+        .into_iter()
+        .map(|(time, value)| OpenInterest { time, value })
+        .collect())
 }
 
 fn aggtrades_request_weight(market: MarketKind) -> usize {

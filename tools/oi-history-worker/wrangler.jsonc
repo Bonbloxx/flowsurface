@@ -1,0 +1,28 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "flowsurface-oi-history",
+  "main": "src/worker.mjs",
+  "compatibility_date": "2026-08-23",
+  "observability": {
+    "enabled": true,
+    "logs": {
+      "enabled": true,
+      "invocation_logs": false,
+      "head_sampling_rate": 1
+    },
+    "traces": {
+      "enabled": false
+    }
+  },
+  "triggers": {
+    "crons": ["* * * * *"]
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "flowsurface-oi-history",
+      "database_id": "4e2eaed9-212a-4a79-b05e-7d8641aa88bf",
+      "migrations_dir": "migrations"
+    }
+  ]
+}

@@ -1,0 +1,12 @@
+[Unit]
+Description=Collect truthful Binance OI once per minute
+
+[Timer]
+OnCalendar=*-*-* *:*:07
+AccuracySec=1s
+RandomizedDelaySec=0
+Persistent=true
+Unit=flowsurface-oi-collector.service
+
+[Install]
+WantedBy=timers.target

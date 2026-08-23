@@ -1,13 +1,13 @@
 use exchange::adapter::{AdapterError, FetchError, MarketKind};
 use exchange::unit::price::Price;
 use exchange::unit::qty::{QtyNormalization, RawQtyUnit, SizeUnit, volume_size_unit};
-use exchange::{TickerInfo, Trade, UnixMs};
+use exchange::{OpenInterest, Ticker, TickerInfo, Trade, UnixMs};
 
 use arrow_array::{Array, BooleanArray, Float64Array, Int64Array, RecordBatch};
 use arrow_ipc::reader::StreamReader;
 use rustc_hash::FxHashMap;
 use serde::Deserialize;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use exchange::adapter::{AdapterHandles, Venue};
@@ -17,6 +17,7 @@ use exchange::proxy::Proxy;
 pub struct DataSources {
     pub exchange: AdapterHandles,
     pub server: Option<ServerClient>,
+    pub oi_history: Option<OiHistoryClient>,
 }
 
 impl DataSources {
@@ -27,9 +28,14 @@ impl DataSources {
         let (exchange_http, server_http) = Self::build_http_clients(proxy);
 
         let server = ServerClient::from_mode(&server_http, network);
+        let oi_history = OiHistoryClient::from_network(&exchange_http, network);
         let exchange = AdapterHandles::spawn_venues(&exchange_http, Venue::ALL, proxy);
 
-        Self { exchange, server }
+        Self {
+            exchange,
+            server,
+            oi_history,
+        }
     }
 
     /// Build the two HTTP clients used by the application.
@@ -80,7 +86,289 @@ impl std::fmt::Debug for DataSources {
         f.debug_struct("DataSources")
             .field("exchange", &"…")
             .field("server", &self.server.as_ref().map(|_| "…"))
+            .field("oi_history", &self.oi_history.as_ref().map(|_| "…"))
             .finish()
+    }
+}
+
+const OI_HISTORY_VERSION: u8 = 1;
+const OI_HISTORY_INTERVAL_MS: u64 = 60_000;
+const OI_HISTORY_PAGE_SIZE: usize = 20_000;
+const MAX_OI_HISTORY_PAGES: usize = 64;
+const OI_HISTORY_CACHE_TTL: Duration = Duration::from_secs(30);
+const MAX_OI_HISTORY_CACHE_ENTRIES: usize = 8;
+const MAX_CACHED_OI_POINTS: usize = 100_000;
+
+#[derive(Debug, Clone)]
+pub struct OiHistoryClient {
+    base_url: String,
+    client: reqwest::Client,
+    auth_token: Option<String>,
+    cache: Arc<Mutex<OiHistoryCache>>,
+}
+
+#[derive(Debug, Default)]
+struct OiHistoryCache {
+    entries: FxHashMap<(Ticker, u64, u64), CachedOiHistory>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedOiHistory {
+    fetched_at: Instant,
+    values: Vec<OpenInterest>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OiSourceKey {
+    venue: String,
+    market: String,
+    symbol: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct OiHistoryResponse {
+    version: u8,
+    venue: String,
+    market: String,
+    symbol: String,
+    interval_ms: u64,
+    points: Vec<(u64, u64, f64)>,
+    next_from: Option<u64>,
+}
+
+impl OiHistoryClient {
+    fn new(base_url: &str, auth_token: Option<String>, client: reqwest::Client) -> Option<Self> {
+        let trimmed = base_url.trim().trim_end_matches('/');
+        if trimmed.is_empty() {
+            return None;
+        }
+        let parsed = trimmed
+            .parse::<url::Url>()
+            .map_err(|err| log::warn!("Invalid OI history URL '{trimmed}': {err}"))
+            .ok()?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            log::warn!("OI history URL must use HTTP or HTTPS: {trimmed}");
+            return None;
+        }
+
+        Some(Self {
+            base_url: trimmed.to_string(),
+            client,
+            auth_token,
+            cache: Arc::new(Mutex::new(OiHistoryCache::default())),
+        })
+    }
+
+    fn from_network(http_client: &reqwest::Client, network: &data::Network) -> Option<Self> {
+        let url = network.oi_history_url.as_deref()?;
+        Self::new(
+            url,
+            network.oi_history_auth_token.clone(),
+            http_client.clone(),
+        )
+    }
+
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    pub async fn fetch_open_interest(
+        &self,
+        ticker_info: TickerInfo,
+        from: UnixMs,
+        to: UnixMs,
+    ) -> Result<Vec<OpenInterest>, AdapterError> {
+        let Some(key) = oi_source_key(ticker_info) else {
+            return Ok(Vec::new());
+        };
+        if from > to {
+            return Ok(Vec::new());
+        }
+        let cache_key = (ticker_info.ticker, from.as_u64(), to.as_u64());
+        if let Some(values) = self.cached_open_interest(cache_key) {
+            return Ok(values);
+        }
+
+        let endpoint = format!("{}/v1/open-interest", self.base_url);
+        let mut cursor = from.as_u64();
+        let mut last_seen = None;
+        let mut values = Vec::new();
+
+        for page_number in 0..MAX_OI_HISTORY_PAGES {
+            let mut request = self.client.get(&endpoint).query(&[
+                ("venue", key.venue.as_str()),
+                ("market", key.market.as_str()),
+                ("symbol", key.symbol.as_str()),
+            ]);
+            request = request.query(&[
+                ("from", cursor.to_string()),
+                ("to", to.as_u64().to_string()),
+                ("limit", OI_HISTORY_PAGE_SIZE.to_string()),
+            ]);
+            if let Some(token) = self.auth_token.as_deref() {
+                request = request.bearer_auth(token);
+            }
+
+            let response = request.send().await.map_err(|err| {
+                AdapterError::FetchError(FetchError::new(
+                    format!("OI history request failed: {err}"),
+                    "Open-interest history service unavailable. Check logs for details.",
+                ))
+            })?;
+            let status = response.status();
+            if !status.is_success() {
+                let body = response.text().await.unwrap_or_default();
+                return Err(AdapterError::http_status_failed(
+                    status,
+                    format!("OI history: {body}"),
+                ));
+            }
+            let payload = response
+                .json::<OiHistoryResponse>()
+                .await
+                .map_err(|err| AdapterError::ParseError(format!("OI history response: {err}")))?;
+            let next = validate_oi_history_page(
+                &payload,
+                &key,
+                cursor,
+                to.as_u64(),
+                &mut last_seen,
+                &mut values,
+            )?;
+            let Some(next) = next else {
+                self.cache_open_interest(cache_key, &values);
+                return Ok(values);
+            };
+            cursor = next;
+
+            if page_number + 1 == MAX_OI_HISTORY_PAGES {
+                return Err(AdapterError::ParseError(
+                    "OI history response exceeded the bounded page limit".to_string(),
+                ));
+            }
+        }
+
+        Ok(values)
+    }
+
+    fn cached_open_interest(&self, key: (Ticker, u64, u64)) -> Option<Vec<OpenInterest>> {
+        let mut cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache
+            .entries
+            .retain(|_, entry| entry.fetched_at.elapsed() < OI_HISTORY_CACHE_TTL);
+        cache.entries.get(&key).map(|entry| entry.values.clone())
+    }
+
+    fn cache_open_interest(&self, key: (Ticker, u64, u64), values: &[OpenInterest]) {
+        if values.len() > MAX_CACHED_OI_POINTS {
+            return;
+        }
+        let mut cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache
+            .entries
+            .retain(|_, entry| entry.fetched_at.elapsed() < OI_HISTORY_CACHE_TTL);
+        if cache.entries.len() >= MAX_OI_HISTORY_CACHE_ENTRIES
+            && !cache.entries.contains_key(&key)
+            && let Some(oldest) = cache
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.fetched_at)
+                .map(|(key, _)| *key)
+        {
+            cache.entries.remove(&oldest);
+        }
+        cache.entries.insert(
+            key,
+            CachedOiHistory {
+                fetched_at: Instant::now(),
+                values: values.to_vec(),
+            },
+        );
+    }
+}
+
+fn oi_source_key(ticker_info: TickerInfo) -> Option<OiSourceKey> {
+    let venue = match ticker_info.exchange().venue() {
+        Venue::Binance => "binance",
+        Venue::Bybit => "bybit",
+        Venue::Hyperliquid => "hyperliquid",
+        Venue::Okex | Venue::Mexc => return None,
+    };
+    let market = match ticker_info.exchange().market_type() {
+        MarketKind::LinearPerps => "linear",
+        MarketKind::InversePerps => "inverse",
+        MarketKind::Spot => return None,
+    };
+    Some(OiSourceKey {
+        venue: venue.to_string(),
+        market: market.to_string(),
+        symbol: ticker_info
+            .ticker
+            .to_full_symbol_and_type()
+            .0
+            .to_ascii_uppercase(),
+    })
+}
+
+fn validate_oi_history_page(
+    payload: &OiHistoryResponse,
+    expected: &OiSourceKey,
+    cursor: u64,
+    to: u64,
+    last_seen: &mut Option<u64>,
+    output: &mut Vec<OpenInterest>,
+) -> Result<Option<u64>, AdapterError> {
+    if payload.version != OI_HISTORY_VERSION
+        || payload.interval_ms != OI_HISTORY_INTERVAL_MS
+        || !payload.venue.eq_ignore_ascii_case(&expected.venue)
+        || !payload.market.eq_ignore_ascii_case(&expected.market)
+        || !payload.symbol.eq_ignore_ascii_case(&expected.symbol)
+    {
+        return Err(AdapterError::ParseError(
+            "OI history response metadata did not match the request".to_string(),
+        ));
+    }
+
+    for (bucket, observed_at, value) in &payload.points {
+        if *bucket < cursor
+            || *bucket > to
+            || *bucket % OI_HISTORY_INTERVAL_MS != 0
+            || *observed_at < *bucket
+            || *observed_at >= bucket.saturating_add(OI_HISTORY_INTERVAL_MS)
+            || last_seen.is_some_and(|last| *bucket <= last)
+            || !value.is_finite()
+            || *value < 0.0
+        {
+            return Err(AdapterError::ParseError(
+                "OI history response contained invalid or unordered data".to_string(),
+            ));
+        }
+        *last_seen = Some(*bucket);
+        output.push(OpenInterest {
+            time: UnixMs::new(*observed_at),
+            value: *value,
+        });
+    }
+
+    match payload.next_from {
+        Some(next)
+            if !payload.points.is_empty()
+                && next > cursor
+                && next <= to
+                && last_seen.is_some_and(|last| next > last) =>
+        {
+            Ok(Some(next))
+        }
+        Some(_) => Err(AdapterError::ParseError(
+            "OI history paging cursor did not advance".to_string(),
+        )),
+        None => Ok(None),
     }
 }
 
@@ -370,6 +658,112 @@ mod tests {
             server_ticker_key(source).as_deref(),
             Some("binancelinear:btcusdt")
         );
+    }
+
+    #[test]
+    fn oi_history_source_uses_native_venue_symbol() {
+        let source = TickerInfo::new(
+            Ticker::new_with_display("BTC", Exchange::HyperliquidLinear, Some("BTCUSDC")),
+            1.0,
+            0.001,
+            None,
+        );
+
+        assert_eq!(
+            oi_source_key(source),
+            Some(OiSourceKey {
+                venue: "hyperliquid".to_string(),
+                market: "linear".to_string(),
+                symbol: "BTC".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn oi_history_page_rejects_false_or_unordered_data() {
+        let expected = OiSourceKey {
+            venue: "binance".to_string(),
+            market: "linear".to_string(),
+            symbol: "BTCUSDT".to_string(),
+        };
+        let mut output = Vec::new();
+        let mut last_seen = None;
+        let payload = OiHistoryResponse {
+            version: OI_HISTORY_VERSION,
+            venue: expected.venue.clone(),
+            market: expected.market.clone(),
+            symbol: expected.symbol.clone(),
+            interval_ms: OI_HISTORY_INTERVAL_MS,
+            points: vec![(120_000, 121_000, 10.0), (60_000, 61_000, 11.0)],
+            next_from: None,
+        };
+
+        assert!(
+            validate_oi_history_page(
+                &payload,
+                &expected,
+                60_000,
+                180_000,
+                &mut last_seen,
+                &mut output,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn oi_history_page_accepts_exact_minute_usd_values() {
+        let expected = OiSourceKey {
+            venue: "bybit".to_string(),
+            market: "linear".to_string(),
+            symbol: "BTCUSDT".to_string(),
+        };
+        let mut output = Vec::new();
+        let mut last_seen = None;
+        let payload = OiHistoryResponse {
+            version: OI_HISTORY_VERSION,
+            venue: expected.venue.clone(),
+            market: expected.market.clone(),
+            symbol: expected.symbol.clone(),
+            interval_ms: OI_HISTORY_INTERVAL_MS,
+            points: vec![(60_000, 61_000, 10.0), (120_000, 121_000, 11.0)],
+            next_from: Some(180_000),
+        };
+
+        assert_eq!(
+            validate_oi_history_page(
+                &payload,
+                &expected,
+                60_000,
+                240_000,
+                &mut last_seen,
+                &mut output,
+            )
+            .expect("valid page"),
+            Some(180_000)
+        );
+        assert_eq!(output.len(), 2);
+        assert_eq!(output[1].value, 11.0);
+    }
+
+    #[test]
+    fn cloned_oi_clients_share_a_bounded_short_lived_cache() {
+        let client = OiHistoryClient::new("https://oi.example", None, reqwest::Client::new())
+            .expect("OI client");
+        let clone = client.clone();
+        let key = (
+            Ticker::new("BTCUSDT", Exchange::BinanceLinear),
+            60_000,
+            120_000,
+        );
+        let values = [OpenInterest {
+            time: UnixMs::new(61_000),
+            value: 10.0,
+        }];
+
+        client.cache_open_interest(key, &values);
+
+        assert_eq!(clone.cached_open_interest(key), Some(values.to_vec()));
     }
 }
 

@@ -601,6 +601,7 @@ impl KlineChart {
     }
 
     pub fn set_feed(&mut self, feed: ResolvedFeed) {
+        let open_interest_sources = feed.sources().to_vec();
         let existing = self.tpo_klines.composite_klines();
         let mut tpo_klines = KlineAggregator::new(&feed);
         tpo_klines.insert(feed.primary(), &existing);
@@ -619,6 +620,7 @@ impl KlineChart {
         *self.tpo_klines = tpo_klines;
         *self.pva_klines = pva_klines;
         self.pva_dirty = true;
+        self.configure_open_interest(open_interest_sources);
     }
 
     pub fn feed(&self) -> &ResolvedFeed {
@@ -634,6 +636,10 @@ impl KlineChart {
             indicator.configure_open_interest(&self.open_interest_sources);
         }
         self.invalidate(None);
+    }
+
+    pub fn open_interest_sources(&self) -> &[TickerInfo] {
+        &self.open_interest_sources
     }
 
     pub fn allows_liquidity_heatmap(&self) -> bool {

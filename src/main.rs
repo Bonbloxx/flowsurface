@@ -608,21 +608,36 @@ impl Flowsurface {
                         mode,
                         url,
                         auth_token,
+                        oi_url,
+                        oi_auth_token,
                     }) => {
-                        if let Some(ref url) = url
-                            && let Some(ref token) = auth_token
+                        if let Some(ref old_url) = self.network_config.server_url
+                            && (url.as_deref() != Some(old_url.as_str()) || auth_token.is_none())
                         {
-                            data::config::auth::save_server_token(url, token);
-                        } else if let Some(ref old_url) = self.network_config.server_url {
                             data::config::auth::delete_server_token(old_url);
+                        }
+                        if let (Some(url), Some(token)) = (&url, &auth_token) {
+                            data::config::auth::save_server_token(url, token);
                         }
                         self.network_config.server_url = url;
                         self.network_config.server_auth_token = auth_token;
                         self.network_config.trade_fetch_mode = mode;
+                        if let Some(ref old_url) = self.network_config.oi_history_url
+                            && (oi_url.as_deref() != Some(old_url.as_str())
+                                || oi_auth_token.is_none())
+                        {
+                            data::config::auth::delete_oi_history_token(old_url);
+                        }
+                        if let (Some(url), Some(token)) = (&oi_url, &oi_auth_token) {
+                            data::config::auth::save_oi_history_token(url, token);
+                        }
+                        self.network_config.oi_history_url = oi_url;
+                        self.network_config.oi_history_auth_token = oi_auth_token;
 
                         self.confirm_dialog = Some(
                             screen::ConfirmDialog::new(
-                                "Trade fetch mode changed. Restart now to apply?".to_string(),
+                                "Historical data settings changed. Restart now to apply?"
+                                    .to_string(),
                                 Box::new(Message::RestartRequested(None)),
                             )
                             .with_confirm_btn_text("Restart now".to_string()),

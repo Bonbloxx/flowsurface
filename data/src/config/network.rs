@@ -11,6 +11,13 @@ pub struct Network {
     /// Stored in the system keychain, never persisted to JSON.
     #[serde(skip)]
     pub server_auth_token: Option<String>,
+    /// Optional always-on one-minute open-interest history service.
+    #[serde(default)]
+    pub oi_history_url: Option<String>,
+    /// Bearer token for the open-interest history service.
+    /// Stored in the system keychain, never persisted to JSON.
+    #[serde(skip)]
+    pub oi_history_auth_token: Option<String>,
     pub trade_fetch_mode: TradeFetchMode,
 }
 
@@ -22,6 +29,35 @@ impl Network {
             proxy: self.proxy.clone().map(|p| p.without_auth()),
             ..self.clone()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_network_config_defaults_open_interest_history_to_off() {
+        let network: Network = serde_json::from_str(
+            r#"{"proxy":null,"server_url":null,"trade_fetch_mode":{"type":"Off"}}"#,
+        )
+        .expect("old network config");
+
+        assert_eq!(network.oi_history_url, None);
+        assert_eq!(network.oi_history_auth_token, None);
+    }
+
+    #[test]
+    fn persistence_never_contains_open_interest_history_token() {
+        let network = Network {
+            oi_history_url: Some("https://oi.example".to_string()),
+            oi_history_auth_token: Some("secret".to_string()),
+            ..Network::default()
+        };
+
+        let json = serde_json::to_string(&network.for_persistence()).expect("network json");
+        assert!(json.contains("https://oi.example"));
+        assert!(!json.contains("secret"));
     }
 }
 

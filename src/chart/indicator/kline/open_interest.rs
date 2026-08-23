@@ -42,7 +42,7 @@ pub struct OpenInterestIndicator {
 }
 
 impl OpenInterestIndicator {
-    /// How often the still-forming bucket is re-pollen beyond bucket-boundary
+    /// How often the still-forming bucket is re-polled beyond bucket-boundary
     /// fetches, so the newest OI candle reflects venue revisions.
     const DEVELOPING_REFRESH_MS: u64 = 60_000;
 
@@ -57,14 +57,13 @@ impl OpenInterestIndicator {
         }
     }
 
-    /// Historical OI intervals are not the same as kline intervals. Use the
-    /// chart interval when the venue exposes it and otherwise fetch the
-    /// nearest finer interval, which can be aggregated upward without
-    /// inventing samples.
+    /// Keep sub-5m request identity so venue adapters can combine their native
+    /// 5m history with connector-archived one-minute snapshots. For larger
+    /// unsupported Bybit intervals, use the nearest finer native history.
     pub(crate) fn fetch_timeframe_for(exchange: Exchange, chart: Timeframe) -> Timeframe {
         match exchange.venue() {
             Venue::Bybit => match chart {
-                Timeframe::M1 | Timeframe::M3 | Timeframe::M5 => Timeframe::M5,
+                Timeframe::M1 | Timeframe::M3 | Timeframe::M5 => chart,
                 Timeframe::M15 => Timeframe::M15,
                 Timeframe::M30 => Timeframe::M30,
                 Timeframe::H1 | Timeframe::H2 => Timeframe::H1,
@@ -72,15 +71,32 @@ impl OpenInterestIndicator {
                 Timeframe::D1 => Timeframe::D1,
                 _ => Timeframe::M5,
             },
-            Venue::Binance => match chart {
-                Timeframe::M1 | Timeframe::M3 => Timeframe::M5,
-                _ => chart,
-            },
+            Venue::Binance => chart,
             // Hyperliquid returns a current asset-context snapshot rather than
             // interval history. Keep the chart interval for request identity;
             // no resampling claim is made for that snapshot.
             Venue::Hyperliquid => chart,
             Venue::Okex | Venue::Mexc => chart,
+        }
+    }
+
+    fn native_history_timeframe_for(exchange: Exchange, chart: Timeframe) -> Option<Timeframe> {
+        match exchange.venue() {
+            Venue::Binance => Some(match chart {
+                Timeframe::M1 | Timeframe::M3 => Timeframe::M5,
+                other => other,
+            }),
+            Venue::Bybit => Some(match chart {
+                Timeframe::M1 | Timeframe::M3 | Timeframe::M5 => Timeframe::M5,
+                Timeframe::M15 => Timeframe::M15,
+                Timeframe::M30 => Timeframe::M30,
+                Timeframe::H1 | Timeframe::H2 => Timeframe::H1,
+                Timeframe::H4 | Timeframe::H12 => Timeframe::H4,
+                Timeframe::D1 => Timeframe::D1,
+                _ => Timeframe::M5,
+            }),
+            Venue::Hyperliquid => None,
+            Venue::Okex | Venue::Mexc => Some(chart),
         }
     }
 
@@ -91,13 +107,19 @@ impl OpenInterestIndicator {
         let intervals = self
             .sources
             .iter()
-            .filter(|source| source.exchange().venue() != Venue::Hyperliquid)
-            .map(|source| Self::fetch_timeframe_for(source.exchange(), chart_timeframe))
+            .map(|source| {
+                let venue = source.exchange().venue();
+                match Self::native_history_timeframe_for(source.exchange(), chart_timeframe) {
+                    Some(history) => {
+                        format!("{venue}: 1m collected snapshots + {history} venue history")
+                    }
+                    None => format!("{venue}: 1m collected snapshots from collection start"),
+                }
+            })
             .collect::<BTreeSet<_>>()
             .into_iter()
-            .map(|timeframe| timeframe.to_string())
             .collect::<Vec<_>>()
-            .join(" / ");
+            .join("; ");
         if intervals.is_empty() {
             "current snapshot".to_string()
         } else {
@@ -167,83 +189,156 @@ impl OpenInterestIndicator {
         )
     }
 
-    // helper to compute (earliest, latest) present OI keys
-    fn oi_timerange(&self, latest_kline: UnixMs) -> (UnixMs, UnixMs) {
-        let mut from_time = latest_kline;
-        let mut to_time = UnixMs::ZERO;
-
-        self.data.iter().for_each(|(time, _)| {
-            from_time = from_time.min(*time);
-            to_time = to_time.max(*time);
+    /// Fetch coverage must follow the real per-venue observations, not only
+    /// drawable aggregate candles. In particular, a snapshot-only venue can
+    /// keep an aggregate intentionally empty while it accumulates enough
+    /// samples; using `self.data` here would strand it before the refresh path.
+    fn fetch_timerange(&self, latest_kline: UnixMs) -> (UnixMs, UnixMs) {
+        let Some(chart_timeframe) = self.timeframe else {
+            return (latest_kline, UnixMs::ZERO);
+        };
+        let has_any_data = self.sources.iter().any(|source| {
+            self.source_data
+                .get(source)
+                .is_some_and(|series| !series.is_empty())
         });
-        (from_time, to_time)
+        if !has_any_data {
+            return (latest_kline, UnixMs::ZERO);
+        }
+
+        // Only venues with a history endpoint can satisfy a request for older
+        // coverage. Snapshot-only sources truthfully begin at collection time
+        // and must not force the same impossible historical request forever.
+        let historical_earliest = self
+            .sources
+            .iter()
+            .filter(|source| {
+                Self::native_history_timeframe_for(source.exchange(), chart_timeframe).is_some()
+            })
+            .map(|source| {
+                self.source_data
+                    .get(source)
+                    .and_then(|series| series.first_key_value().map(|(time, _)| *time))
+                    .unwrap_or(latest_kline)
+            })
+            .max()
+            .unwrap_or(UnixMs::ZERO);
+
+        // The common live edge is the oldest latest observation. This makes
+        // a lagging venue trigger a tail refresh instead of being hidden by a
+        // fresher source.
+        let common_latest = self
+            .sources
+            .iter()
+            .map(|source| {
+                self.source_data
+                    .get(source)
+                    .and_then(|series| series.last_key_value().map(|(time, _)| *time))
+                    .unwrap_or(UnixMs::ZERO)
+            })
+            .min()
+            .unwrap_or(UnixMs::ZERO);
+
+        (historical_earliest, common_latest)
     }
 
     fn rebuild_candles(&mut self) {
+        self.rebuild_candles_from(None);
+    }
+
+    fn rebuild_candles_from(&mut self, changed_at: Option<UnixMs>) {
         let Some(chart_timeframe) = self.timeframe else {
             return;
         };
 
-        // Venues without a historical OI endpoint (e.g. Hyperliquid) only
-        // return a snapshot of the current value, and some venues cap how far
-        // back their OI history endpoint paginates. Summing such a source into
-        // the aggregate only from its first sample makes total OI jump by the
-        // whole venue notional mid-series, masquerading as an OI flow. A
-        // source must therefore accumulate real history before it may
-        // contribute, and once qualified its nearest known value is used in
-        // both directions — carried forward when updates lag and carried back
-        // across candles that predate its first sample — so coverage changes
-        // shift the level once at most and never render as fake OI candles.
+        // A single venue can truthfully show its first current snapshot at
+        // once. A multi-venue sum starts only after every configured venue has
+        // enough real observations; this avoids presenting a venue joining the
+        // series as an OI increase. Values are never carried backward into time
+        // before they were observed.
         const MIN_QUALIFYING_SAMPLES: usize = 5;
         // Forward carry-forward must expire: a venue that stops reporting
         // must not keep its last notional in the sum indefinitely, because
         // that presents frozen OI as live. Two buckets of silence is the
         // widest lag that still reads as "publishes slowly" rather than "went
-        // quiet"; beyond it the source drops out and the coverage count says
-        // so.
+        // quiet"; beyond it the incomplete aggregate bucket is omitted.
         const MAX_CARRY_FORWARD_BUCKETS: u64 = 2;
         let interval_ms = chart_timeframe.to_milliseconds();
 
+        let minimum_samples = if self.sources.len() == 1 {
+            1
+        } else {
+            MIN_QUALIFYING_SAMPLES
+        };
         let qualified = self
             .sources
             .iter()
             .filter_map(|source| {
                 let series = self.source_data.get(source)?;
-                if series.len() < MIN_QUALIFYING_SAMPLES {
+                if series.len() < minimum_samples {
                     return None;
                 }
                 Some((*source, series))
             })
             .collect::<Vec<_>>();
 
-        let times = qualified
-            .iter()
-            .flat_map(|(_, series)| series.keys().copied())
-            .collect::<BTreeSet<_>>();
-        let mut rebuilt = BTreeMap::new();
-        let mut previous_close = None;
+        if qualified.len() != self.sources.len() {
+            self.data.clear();
+            self.clear_all_caches();
+            return;
+        }
+
+        let rebuild_from =
+            changed_at.map(|time| UnixMs::new(time.as_u64() / interval_ms * interval_ms));
+        let mut times = BTreeSet::new();
+        for (_, series) in &qualified {
+            if let Some(from) = rebuild_from {
+                times.extend(series.range(from..).map(|(time, _)| *time));
+            } else {
+                times.extend(series.keys().copied());
+            }
+        }
+        let mut rebuilt = if let Some(from) = rebuild_from {
+            let _discarded_tail = self.data.split_off(&from);
+            std::mem::take(&mut self.data)
+        } else {
+            BTreeMap::new()
+        };
+        let mut previous_close = rebuilt.last_key_value().map(|(_, candle)| candle.close);
+        let recent_snapshot_cutoff = UnixMs::now()
+            .as_u64()
+            .saturating_sub(10 * Self::DEVELOPING_REFRESH_MS);
 
         for time in times {
             let mut close = 0.0;
             let mut source_count = 0usize;
             for (source, series) in &qualified {
-                // Last known value at or before `time`, else the earliest
-                // known value carried back across preceding candles.
-                let value = match series.range(..=time).next_back() {
-                    Some((sample_time, value)) => {
-                        let staleness = time.as_u64().saturating_sub(sample_time.as_u64());
-                        let source_interval =
-                            Self::fetch_timeframe_for(source.exchange(), chart_timeframe);
-                        if staleness > MAX_CARRY_FORWARD_BUCKETS * source_interval.to_milliseconds()
-                        {
-                            continue;
-                        }
-                        source_count += 1;
-                        *value
-                    }
-                    None => *series.values().next().expect("qualified series non-empty"),
+                // Use only a real observation at or before `time`. Never
+                // carry a source backward before its first observation.
+                let Some((sample_time, value)) = series.range(..=time).next_back() else {
+                    continue;
                 };
-                close += value;
+                let staleness = time.as_u64().saturating_sub(sample_time.as_u64());
+                let source_interval =
+                    Self::native_history_timeframe_for(source.exchange(), chart_timeframe)
+                        .unwrap_or(Timeframe::M1);
+                // Venue history is interval data and can be held through its
+                // native bucket. Near the live edge, however, all venues are
+                // polled once per minute: never present a stopped venue as
+                // live for the five-minute historical carry window.
+                let carry_interval = if sample_time.as_u64() >= recent_snapshot_cutoff {
+                    Self::DEVELOPING_REFRESH_MS
+                } else {
+                    source_interval.to_milliseconds()
+                };
+                if staleness > MAX_CARRY_FORWARD_BUCKETS * carry_interval {
+                    continue;
+                }
+                source_count += 1;
+                close += *value;
+            }
+            if source_count != self.sources.len() {
+                continue;
             }
             let bucket = UnixMs::new(time.as_u64() / interval_ms * interval_ms);
             let candle = rebuilt.entry(bucket).or_insert_with(|| {
@@ -330,7 +425,7 @@ impl KlineIndicatorImpl for OpenInterestIndicator {
             return None;
         }
 
-        let (oi_earliest, oi_latest) = self.oi_timerange(ctx.kline_latest);
+        let (oi_earliest, oi_latest) = self.fetch_timerange(ctx.kline_latest);
 
         if ctx.visible_earliest < oi_earliest {
             return Some(FetchRange::OpenInterest(ctx.prefetch_earliest, oi_earliest));
@@ -403,11 +498,32 @@ impl KlineIndicatorImpl for OpenInterestIndicator {
         if !self.sources.contains(&source) {
             return;
         }
+        let minimum_samples = if self.sources.len() == 1 { 1 } else { 5 };
+        let already_qualified = !self.data.is_empty()
+            && self.sources.iter().all(|source| {
+                self.source_data
+                    .get(source)
+                    .is_some_and(|series| series.len() >= minimum_samples)
+            });
         let series = self.source_data.entry(source).or_default();
+        let mut earliest_changed = None;
         for value in values {
+            if series.get(&value.time) == Some(&value.value) {
+                continue;
+            }
             series.insert(value.time, value.value);
+            earliest_changed = Some(
+                earliest_changed.map_or(value.time, |earliest: UnixMs| earliest.min(value.time)),
+            );
         }
-        self.rebuild_candles();
+        let Some(earliest_changed) = earliest_changed else {
+            return;
+        };
+        if already_qualified {
+            self.rebuild_candles_from(Some(earliest_changed));
+        } else {
+            self.rebuild_candles();
+        }
     }
 }
 
@@ -505,11 +621,8 @@ mod tests {
             ],
         );
 
-        let first = indicator.data[&UnixMs::new(300_000)];
-        // Hyperliquid has no sample this early; its first known value is
-        // carried back so the aggregate level is continuous across coverage.
-        assert_eq!(first.close, 13_500_000_000.0);
-        assert_eq!(first.source_count, 2);
+        // No aggregate is emitted before every venue has a real observation.
+        assert!(!indicator.data.contains_key(&UnixMs::new(300_000)));
         let current = indicator.data[&UnixMs::new(600_000)];
         assert_eq!(current.open, 13_500_000_000.0);
         assert_eq!(current.close, 13_500_000_000.0);
@@ -547,9 +660,8 @@ mod tests {
                 oi(2_700_000, 7.0e9),
             ],
         );
-        // Hyperliquid's history only begins at 1_500_000 (snapshot venue or
-        // short history window). Once it qualifies it must not add a fake
-        // +2.5b step at that point: its first value is carried back instead.
+        // Hyperliquid's history only begins at 1_500_000. The aggregate must
+        // begin there instead of fabricating its value in earlier buckets.
         indicator.on_source_open_interest(
             hyperliquid,
             &[
@@ -561,16 +673,12 @@ mod tests {
             ],
         );
 
-        assert_eq!(indicator.data.len(), 9);
+        assert_eq!(indicator.data.len(), 5);
         for candle in indicator.data.values() {
             assert_eq!(candle.close, 9_500_000_000.0);
             assert_eq!(candle.open, 9_500_000_000.0);
             assert_eq!(candle.high, 9_500_000_000.0);
             assert_eq!(candle.low, 9_500_000_000.0);
-        }
-        // Coverage stays honest even though the level is continuous.
-        for time in [300_000, 600_000, 900_000, 1_200_000] {
-            assert_eq!(indicator.data[&UnixMs::new(time)].source_count, 1);
         }
         for time in [1_500_000, 1_800_000, 2_100_000, 2_400_000, 2_700_000] {
             assert_eq!(indicator.data[&UnixMs::new(time)].source_count, 2);
@@ -620,12 +728,32 @@ mod tests {
             }],
         );
 
-        assert_eq!(indicator.data.len(), 5);
-        for candle in indicator.data.values() {
-            assert_eq!(candle.source_count, 1);
-            assert_eq!(candle.expected_source_count, 2);
-            assert!(candle.close < 8_000_000_000.0);
-        }
+        assert!(indicator.data.is_empty());
+        assert_eq!(
+            indicator.fetch_timerange(UnixMs::new(1_500_000)),
+            (UnixMs::new(300_000), UnixMs::new(600_123))
+        );
+    }
+
+    #[test]
+    fn single_hyperliquid_source_displays_its_current_snapshot() {
+        let hyperliquid = source(Exchange::HyperliquidLinear, "BTC");
+        let mut indicator = OpenInterestIndicator::new();
+        indicator.timeframe = Some(Timeframe::M1);
+        indicator.configure_open_interest(&[hyperliquid]);
+
+        indicator.on_source_open_interest(
+            hyperliquid,
+            &[OpenInterest {
+                time: UnixMs::new(660_123),
+                value: 2_500_000_000.0,
+            }],
+        );
+
+        let candle = indicator.data[&UnixMs::new(660_000)];
+        assert_eq!(candle.close, 2_500_000_000.0);
+        assert_eq!(candle.source_count, 1);
+        assert_eq!(candle.expected_source_count, 1);
     }
 
     #[test]
@@ -721,11 +849,52 @@ mod tests {
         );
 
         assert_eq!(indicator.data[&UnixMs::new(2_100_000)].source_count, 2);
-        assert_eq!(
-            indicator.data[&UnixMs::new(2_400_000)].close,
-            7_250_000_000.0
+        assert!(!indicator.data.contains_key(&UnixMs::new(2_400_000)));
+    }
+
+    #[test]
+    fn live_aggregate_drops_a_source_after_two_missed_minute_snapshots() {
+        let binance = source(Exchange::BinanceLinear, "BTCUSDT");
+        let bybit = source(Exchange::BybitLinear, "BTCUSDT");
+        let mut indicator = OpenInterestIndicator::new();
+        indicator.timeframe = Some(Timeframe::M1);
+        indicator.configure_open_interest(&[binance, bybit]);
+
+        let current_minute = UnixMs::now().as_u64() / 60_000 * 60_000;
+        let oi = |minutes_ago: u64, value: f64| OpenInterest {
+            time: UnixMs::new(current_minute.saturating_sub(minutes_ago * 60_000)),
+            value,
+        };
+        indicator.on_source_open_interest(
+            binance,
+            &[
+                oi(7, 7.0e9),
+                oi(6, 7.0e9),
+                oi(5, 7.0e9),
+                oi(4, 7.0e9),
+                oi(3, 7.0e9),
+            ],
         );
-        assert_eq!(indicator.data[&UnixMs::new(2_400_000)].source_count, 1);
+        indicator.on_source_open_interest(
+            bybit,
+            &[
+                oi(7, 3.0e9),
+                oi(6, 3.0e9),
+                oi(5, 3.0e9),
+                oi(4, 3.0e9),
+                oi(3, 3.0e9),
+                oi(2, 3.0e9),
+                oi(1, 3.0e9),
+                oi(0, 3.0e9),
+            ],
+        );
+
+        assert!(
+            indicator
+                .data
+                .contains_key(&UnixMs::new(current_minute - 3 * 60_000))
+        );
+        assert!(!indicator.data.contains_key(&UnixMs::new(current_minute)));
     }
 
     #[test]
@@ -741,8 +910,8 @@ mod tests {
         }
 
         for (chart, expected) in [
-            (Timeframe::M1, Timeframe::M5),
-            (Timeframe::M3, Timeframe::M5),
+            (Timeframe::M1, Timeframe::M1),
+            (Timeframe::M3, Timeframe::M3),
             (Timeframe::M5, Timeframe::M5),
             (Timeframe::H2, Timeframe::H1),
             (Timeframe::H12, Timeframe::H4),
@@ -756,6 +925,13 @@ mod tests {
         assert_eq!(
             OpenInterestIndicator::fetch_timeframe_for(Exchange::BinanceLinear, Timeframe::H12),
             Timeframe::H12
+        );
+        assert_eq!(
+            OpenInterestIndicator::native_history_timeframe_for(
+                Exchange::BinanceLinear,
+                Timeframe::M1
+            ),
+            Some(Timeframe::M5)
         );
     }
 
@@ -824,5 +1000,94 @@ mod tests {
         assert!(!OpenInterestIndicator::is_supported_exchange(
             Exchange::OkexLinear
         ));
+    }
+
+    #[test]
+    fn incremental_tail_rebuild_matches_full_reference() {
+        let sources = [
+            source(Exchange::BinanceLinear, "BTCUSDT"),
+            source(Exchange::BybitLinear, "BTCUSDT"),
+        ];
+        let series = |base: f64| {
+            (1..=6)
+                .map(|minute| OpenInterest {
+                    time: UnixMs::new(minute * 60_000),
+                    value: base + minute as f64,
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut first = series(100.0);
+        let mut second = series(200.0);
+
+        let mut incremental = OpenInterestIndicator::new();
+        incremental.timeframe = Some(Timeframe::M1);
+        incremental.configure_open_interest(&sources);
+        incremental.on_source_open_interest(sources[0], &first);
+        incremental.on_source_open_interest(sources[1], &second);
+
+        first[3].value = 150.0;
+        first.push(OpenInterest {
+            time: UnixMs::new(7 * 60_000),
+            value: 160.0,
+        });
+        second.push(OpenInterest {
+            time: UnixMs::new(7 * 60_000),
+            value: 260.0,
+        });
+        incremental.on_source_open_interest(sources[0], &[first[3], first[6]]);
+        incremental.on_source_open_interest(sources[1], &[second[6]]);
+
+        let mut reference = OpenInterestIndicator::new();
+        reference.timeframe = Some(Timeframe::M1);
+        reference.configure_open_interest(&sources);
+        reference.on_source_open_interest(sources[0], &first);
+        reference.on_source_open_interest(sources[1], &second);
+
+        assert_eq!(incremental.data, reference.data);
+    }
+
+    #[test]
+    #[ignore = "manual 90-day one-minute aggregate performance check"]
+    fn benchmark_large_one_minute_aggregate_rebuild() {
+        const POINTS_PER_SOURCE: u64 = 90 * 24 * 60;
+        let sources = [
+            source(Exchange::BinanceLinear, "BTCUSDT"),
+            source(Exchange::BybitLinear, "BTCUSDT"),
+            source(Exchange::HyperliquidLinear, "BTC"),
+        ];
+        let mut indicator = OpenInterestIndicator::new();
+        indicator.timeframe = Some(Timeframe::M1);
+        indicator.configure_open_interest(&sources);
+        let values = (0..POINTS_PER_SOURCE)
+            .map(|minute| OpenInterest {
+                time: UnixMs::new(minute * 60_000),
+                value: 1_000_000_000.0 + minute as f64,
+            })
+            .collect::<Vec<_>>();
+
+        let initial = std::time::Instant::now();
+        for source in sources {
+            indicator.on_source_open_interest(source, &values);
+        }
+        let initial_elapsed = initial.elapsed();
+        assert_eq!(indicator.data.len(), POINTS_PER_SOURCE as usize);
+
+        let incremental = std::time::Instant::now();
+        for (index, source) in sources.into_iter().enumerate() {
+            indicator.on_source_open_interest(
+                source,
+                &[OpenInterest {
+                    time: UnixMs::new(POINTS_PER_SOURCE * 60_000),
+                    value: 2_000_000_000.0 + index as f64,
+                }],
+            );
+        }
+        let incremental_elapsed = incremental.elapsed();
+        assert_eq!(indicator.data.len(), POINTS_PER_SOURCE as usize + 1);
+
+        eprintln!(
+            "OI aggregate: {} points, initial={initial_elapsed:?}, incremental={incremental_elapsed:?}",
+            POINTS_PER_SOURCE * sources.len() as u64,
+        );
     }
 }

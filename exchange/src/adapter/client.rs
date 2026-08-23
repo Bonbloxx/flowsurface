@@ -7,12 +7,26 @@ use crate::{
 };
 
 use futures::{StreamExt, stream, stream::BoxStream};
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 // Keep topics per websocket conservative across venues
 // allow up to 100 tickers per websocket stream
 pub const MAX_TRADE_TICKERS_PER_STREAM: usize = 100;
 pub const MAX_KLINE_STREAMS_PER_STREAM: usize = 100;
+const OI_FETCH_CACHE_TTL: Duration = Duration::from_secs(30);
+const OI_FETCH_CACHE_END_SLACK_MS: u64 = 30_000;
+
+#[derive(Clone)]
+struct CachedOpenInterestFetch {
+    fetched_at: Instant,
+    range: Option<(UnixMs, UnixMs)>,
+    data: Vec<OpenInterest>,
+}
 
 #[derive(Clone)]
 pub struct AdapterHandles {
@@ -21,6 +35,9 @@ pub struct AdapterHandles {
     hyperliquid: Option<hyperliquid::HyperliquidHandle>,
     okex: Option<okex::OkexHandle>,
     mexc: Option<mexc::MexcHandle>,
+    /// De-duplicates identical live-edge OI requests from several panes. The
+    /// cache is shared by every clone of the application-wide adapter handles.
+    oi_fetch_cache: Arc<Mutex<HashMap<(Ticker, Timeframe), CachedOpenInterestFetch>>>,
 }
 
 impl AdapterHandles {
@@ -63,6 +80,7 @@ impl AdapterHandles {
             hyperliquid: None,
             okex: None,
             mexc: None,
+            oi_fetch_cache: Arc::new(Mutex::new(HashMap::new())),
         };
 
         for venue in venues {
@@ -462,8 +480,33 @@ impl AdapterHandles {
         range: Option<(UnixMs, UnixMs)>,
     ) -> Result<Vec<OpenInterest>, AdapterError> {
         let exchange = ticker_info.ticker.exchange;
+        let cache_key = (ticker_info.ticker, timeframe);
+        let now = UnixMs::now();
+        let live_edge = range.is_none_or(|(_, to)| {
+            to.saturating_add(timeframe.to_milliseconds().max(60_000) * 2) >= now
+        });
+        if live_edge {
+            let cached = self
+                .oi_fetch_cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&cache_key)
+                .filter(|cached| cached.fetched_at.elapsed() <= OI_FETCH_CACHE_TTL)
+                .filter(|cached| match (cached.range, range) {
+                    (Some((cached_from, cached_to)), Some((from, to))) => {
+                        cached_from <= from
+                            && cached_to.saturating_add(OI_FETCH_CACHE_END_SLACK_MS) >= to
+                    }
+                    (None, _) => true,
+                    (_, None) => false,
+                })
+                .map(|cached| cached.data.clone());
+            if let Some(cached) = cached {
+                return Ok(cached);
+            }
+        }
 
-        match exchange {
+        let result = match exchange {
             Exchange::BinanceLinear | Exchange::BinanceInverse => {
                 let Some(handle) = self.binance.as_ref() else {
                     return Err(Self::missing_venue_error(exchange.venue()));
@@ -499,7 +542,22 @@ impl AdapterHandles {
             _ => Err(AdapterError::InvalidRequest(format!(
                 "Open interest data not available for {exchange}"
             ))),
+        };
+
+        if live_edge && let Ok(data) = &result {
+            self.oi_fetch_cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(
+                    cache_key,
+                    CachedOpenInterestFetch {
+                        fetched_at: Instant::now(),
+                        range,
+                        data: data.clone(),
+                    },
+                );
         }
+        result
     }
 
     pub async fn fetch_trades(

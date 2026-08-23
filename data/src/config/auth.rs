@@ -211,3 +211,74 @@ pub fn delete_server_token(url: &str) {
         ),
     }
 }
+
+// ── Open-interest history auth (keychain) ────────────────────────────────────────
+
+const OI_HISTORY_KEYCHAIN_SERVICE: &str = "flowsurface.oi_history";
+
+fn oi_history_entry_for(url: &str) -> Result<keyring::Entry, keyring::Error> {
+    keyring::Entry::new(OI_HISTORY_KEYCHAIN_SERVICE, url)
+}
+
+/// Load the open-interest history bearer token from the system keychain.
+pub fn load_oi_history_token(url: &str) -> Option<String> {
+    let entry = match oi_history_entry_for(url) {
+        Ok(entry) => entry,
+        Err(err) => {
+            log::warn!(
+                "Keychain entry init failed for service={OI_HISTORY_KEYCHAIN_SERVICE} key={url}: {err}"
+            );
+            return None;
+        }
+    };
+
+    match entry.get_password() {
+        Ok(token) => Some(token),
+        Err(keyring::Error::NoEntry) => None,
+        Err(err) => {
+            log::warn!(
+                "Failed to read OI history token from keychain (service={OI_HISTORY_KEYCHAIN_SERVICE} key={url}): {err}"
+            );
+            None
+        }
+    }
+}
+
+/// Save the open-interest history bearer token to the system keychain.
+pub fn save_oi_history_token(url: &str, token: &str) {
+    let entry = match oi_history_entry_for(url) {
+        Ok(entry) => entry,
+        Err(err) => {
+            log::warn!(
+                "Keychain entry init failed for service={OI_HISTORY_KEYCHAIN_SERVICE} key={url}: {err}"
+            );
+            return;
+        }
+    };
+
+    if let Err(err) = entry.set_password(token) {
+        log::warn!(
+            "Failed to store OI history token in keychain (service={OI_HISTORY_KEYCHAIN_SERVICE} key={url}): {err}"
+        );
+    }
+}
+
+/// Delete the open-interest history bearer token from the system keychain.
+pub fn delete_oi_history_token(url: &str) {
+    let entry = match oi_history_entry_for(url) {
+        Ok(entry) => entry,
+        Err(err) => {
+            log::warn!(
+                "Keychain entry init failed for service={OI_HISTORY_KEYCHAIN_SERVICE} key={url}: {err}"
+            );
+            return;
+        }
+    };
+
+    match entry.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => {}
+        Err(err) => log::warn!(
+            "Failed to delete OI history token from keychain (service={OI_HISTORY_KEYCHAIN_SERVICE} key={url}): {err}"
+        ),
+    }
+}

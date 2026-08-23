@@ -9,7 +9,10 @@ use std::path::PathBuf;
 use std::sync::RwLock;
 use uuid::Uuid;
 
-use crate::connector::client::{DataSources, ServerClient};
+use crate::connector::{
+    client::{DataSources, OiHistoryClient, ServerClient},
+    open_interest,
+};
 
 pub use data::TradeFetchMode;
 
@@ -522,6 +525,7 @@ pub fn request_fetch(
             if let Some((stream, pane_uid)) = kline_stream {
                 return oi_fetch_task(
                     handles.clone(),
+                    sources.oi_history.clone(),
                     layout_id,
                     pane_uid,
                     stream,
@@ -746,6 +750,7 @@ pub fn request_fetch_many(
 
 pub fn oi_fetch_task(
     handles: AdapterHandles,
+    oi_history: Option<OiHistoryClient>,
     layout_id: Uuid,
     pane_id: Uuid,
     stream: StreamKind,
@@ -764,9 +769,51 @@ pub fn oi_fetch_task(
             timeframe,
         } => {
             let fetch = async move {
-                handles
-                    .fetch_open_interest(ticker_info, timeframe, range)
-                    .await
+                let exchange_fetch = handles.fetch_open_interest(ticker_info, timeframe, range);
+                let remote_fetch = async {
+                    match (oi_history, range) {
+                        (Some(client), Some((from, to))) => {
+                            Some(client.fetch_open_interest(ticker_info, from, to).await)
+                        }
+                        _ => None,
+                    }
+                };
+                let (exchange_result, remote_result) =
+                    iced::futures::future::join(exchange_fetch, remote_fetch).await;
+
+                let fetched = match (exchange_result, remote_result) {
+                    (Ok(exchange), Some(Ok(remote))) => {
+                        merge_open_interest_observations(&exchange, &remote)
+                    }
+                    (Ok(exchange), Some(Err(remote_err))) => {
+                        log::warn!(
+                            "OI history service failed for {}; using venue history: {remote_err}",
+                            ticker_info.ticker
+                        );
+                        exchange
+                    }
+                    (Ok(exchange), None) => exchange,
+                    (Err(exchange_err), Some(Ok(remote))) if !remote.is_empty() => {
+                        log::warn!(
+                            "Venue OI fetch failed for {}; using {} remote observations: {exchange_err}",
+                            ticker_info.ticker,
+                            remote.len()
+                        );
+                        remote
+                    }
+                    (Err(exchange_err), Some(Err(remote_err))) => {
+                        log::warn!(
+                            "OI history service also failed for {}: {remote_err}",
+                            ticker_info.ticker
+                        );
+                        return oi_archive_fallback(ticker_info, range, exchange_err);
+                    }
+                    (Err(exchange_err), Some(Ok(_))) | (Err(exchange_err), None) => {
+                        return oi_archive_fallback(ticker_info, range, exchange_err);
+                    }
+                };
+
+                Ok(open_interest::merge_and_load(ticker_info, &fetched, range))
             };
 
             Task::perform(
@@ -796,6 +843,44 @@ pub fn oi_fetch_task(
     };
 
     update_status.chain(fetch_task)
+}
+
+fn merge_open_interest_observations(
+    exchange: &[OpenInterest],
+    remote: &[OpenInterest],
+) -> Vec<OpenInterest> {
+    const MINUTE_MS: u64 = 60_000;
+
+    let mut by_minute = std::collections::BTreeMap::<u64, OpenInterest>::new();
+    for observation in exchange.iter().chain(remote) {
+        let minute = observation.time.as_u64() / MINUTE_MS * MINUTE_MS;
+        let replace = by_minute
+            .get(&minute)
+            .is_none_or(|current| observation.time >= current.time);
+        if replace {
+            by_minute.insert(minute, *observation);
+        }
+    }
+    by_minute.into_values().collect()
+}
+
+fn oi_archive_fallback(
+    ticker_info: TickerInfo,
+    range: Option<(UnixMs, UnixMs)>,
+    network_error: AdapterError,
+) -> Result<Vec<OpenInterest>, AdapterError> {
+    let archived = open_interest::load_range(ticker_info, range);
+    if archived.is_empty() {
+        Err(network_error)
+    } else {
+        log::warn!(
+            "Open interest network fetch failed for {}; using {} archived samples: {}",
+            ticker_info.ticker,
+            archived.len(),
+            network_error
+        );
+        Ok(archived)
+    }
 }
 
 pub fn kline_fetch_task(
@@ -1527,6 +1612,50 @@ mod tests {
             chunks.iter().map(Vec::len).collect::<Vec<_>>(),
             [10_000, 10_000, 1]
         );
+    }
+
+    #[test]
+    fn newest_truthful_oi_observation_wins_each_minute() {
+        let exchange = [
+            OpenInterest {
+                time: UnixMs::new(60_000),
+                value: 100.0,
+            },
+            OpenInterest {
+                time: UnixMs::new(120_050),
+                value: 200.0,
+            },
+        ];
+        let remote = [
+            OpenInterest {
+                time: UnixMs::new(60_010),
+                value: 110.0,
+            },
+            OpenInterest {
+                time: UnixMs::new(120_000),
+                value: 190.0,
+            },
+        ];
+
+        let merged = merge_open_interest_observations(&exchange, &remote);
+
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0], remote[0]);
+        assert_eq!(merged[1], exchange[1]);
+    }
+
+    #[test]
+    fn remote_oi_wins_an_exact_timestamp_tie() {
+        let exchange = [OpenInterest {
+            time: UnixMs::new(60_000),
+            value: 100.0,
+        }];
+        let remote = [OpenInterest {
+            time: UnixMs::new(60_000),
+            value: 110.0,
+        }];
+
+        assert_eq!(merge_open_interest_observations(&exchange, &remote), remote);
     }
 
     #[test]

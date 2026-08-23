@@ -16,6 +16,8 @@ pub enum Action {
         mode: fetcher::TradeFetchMode,
         url: Option<String>,
         auth_token: Option<String>,
+        oi_url: Option<String>,
+        oi_auth_token: Option<String>,
     },
     Exit,
 }
@@ -60,6 +62,8 @@ impl NetworkEditor {
                 &network.trade_fetch_mode,
                 network.server_url.as_deref(),
                 network.server_auth_token.as_deref(),
+                network.oi_history_url.as_deref(),
+                network.oi_history_auth_token.as_deref(),
             ),
             confirm: ConfirmState::Idle,
             error: None,
@@ -97,17 +101,23 @@ impl NetworkEditor {
                     &self.effective.trade_fetch_mode,
                     self.effective.server_url.as_deref(),
                     self.effective.server_auth_token.as_deref(),
+                    self.effective.oi_history_url.as_deref(),
+                    self.effective.oi_history_auth_token.as_deref(),
                 );
                 if let Some(Action::ApplyServerConfig {
                     mode,
                     url,
                     auth_token,
+                    oi_url,
+                    oi_auth_token,
                 }) = &action
                 {
                     self.pending_apply = Some(data::Network {
                         trade_fetch_mode: mode.clone(),
                         server_url: url.clone(),
                         server_auth_token: auth_token.clone(),
+                        oi_history_url: oi_url.clone(),
+                        oi_history_auth_token: oi_auth_token.clone(),
                         ..self.effective.clone()
                     });
                 }
@@ -138,6 +148,8 @@ impl NetworkEditor {
                 &network.trade_fetch_mode,
                 network.server_url.as_deref(),
                 network.server_auth_token.as_deref(),
+                network.oi_history_url.as_deref(),
+                network.oi_history_auth_token.as_deref(),
             )
             .map(Message::Fetch);
 
@@ -502,10 +514,15 @@ impl ProxyForm {
 struct FetchForm {
     server_url_input: String,
     server_auth_token_input: String,
+    oi_history_url_input: String,
+    oi_history_auth_token_input: String,
     expanded_server: bool,
+    expanded_oi: bool,
     draft_active: bool,
+    draft_oi_active: bool,
     draft_tag: FetchModeTag,
     hide_token: bool,
+    hide_oi_token: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -519,9 +536,14 @@ pub enum FetchMsg {
     ToggleShowToken(bool),
     ServerUrlChanged(String),
     ServerAuthTokenChanged(String),
+    OiHistoryUrlChanged(String),
+    OiHistoryAuthTokenChanged(String),
     ToggleFetchTrades(bool),
+    ToggleOiHistory(bool),
     SelectFetchMode(FetchModeTag),
     ToggleServerConfig,
+    ToggleOiConfig,
+    ToggleShowOiToken(bool),
     RequestApplyFetch,
     Cancel,
     RequestClearAuth,
@@ -533,17 +555,24 @@ impl FetchForm {
         effective_mode: &fetcher::TradeFetchMode,
         effective_url: Option<&str>,
         effective_auth_token: Option<&str>,
+        effective_oi_url: Option<&str>,
+        effective_oi_auth_token: Option<&str>,
     ) -> Self {
         Self {
             server_url_input: effective_url.unwrap_or("").to_string(),
             server_auth_token_input: effective_auth_token.unwrap_or("").to_string(),
+            oi_history_url_input: effective_oi_url.unwrap_or("").to_string(),
+            oi_history_auth_token_input: effective_oi_auth_token.unwrap_or("").to_string(),
             expanded_server: false,
+            expanded_oi: false,
             draft_active: *effective_mode != fetcher::TradeFetchMode::Off,
+            draft_oi_active: effective_oi_url.is_some(),
             draft_tag: match effective_mode {
                 fetcher::TradeFetchMode::Server => FetchModeTag::Server,
                 _ => FetchModeTag::Exchange,
             },
             hide_token: true,
+            hide_oi_token: true,
         }
     }
 
@@ -575,11 +604,29 @@ impl FetchForm {
         }
     }
 
+    fn trimmed_oi_url(&self) -> Option<String> {
+        if !self.draft_oi_active {
+            return None;
+        }
+        let trimmed = self.oi_history_url_input.trim().trim_end_matches('/');
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    }
+
+    fn trimmed_oi_auth(&self) -> Option<String> {
+        if !self.draft_oi_active {
+            return None;
+        }
+        let auth = self.oi_history_auth_token_input.trim();
+        (!auth.is_empty()).then(|| auth.to_string())
+    }
+
     fn server_config_pending(
         &self,
         effective_mode: &fetcher::TradeFetchMode,
         effective_url: Option<&str>,
         effective_auth: Option<&str>,
+        effective_oi_url: Option<&str>,
+        effective_oi_auth: Option<&str>,
     ) -> bool {
         let draft_mode = self.build_mode();
         if draft_mode != *effective_mode {
@@ -588,6 +635,8 @@ impl FetchForm {
         if (draft_mode == fetcher::TradeFetchMode::Server
             && self.trimmed_url().as_deref() != effective_url)
             || self.trimmed_auth().as_deref() != effective_auth
+            || self.trimmed_oi_url().as_deref() != effective_oi_url
+            || self.trimmed_oi_auth().as_deref() != effective_oi_auth
         {
             return true;
         }
@@ -600,6 +649,8 @@ impl FetchForm {
         effective_mode: &'a fetcher::TradeFetchMode,
         effective_url: Option<&'a str>,
         effective_auth: Option<&'a str>,
+        effective_oi_url: Option<&'a str>,
+        effective_oi_auth: Option<&'a str>,
     ) -> Element<'a, FetchMsg> {
         let selected_tag = if self.draft_active {
             Some(self.draft_tag)
@@ -696,11 +747,76 @@ impl FetchForm {
             );
         }
 
+        let oi_toggle = row![
+            tooltip(
+                checkbox(self.draft_oi_active)
+                    .label("Fetch 1m OI history")
+                    .on_toggle(FetchMsg::ToggleOiHistory),
+                Some("Use an always-on OI history service when configured"),
+                iced::widget::tooltip::Position::Top,
+            ),
+            iced::widget::space::horizontal(),
+            button(icon_text(style::Icon::Cog, 11))
+                .on_press(FetchMsg::ToggleOiConfig)
+                .style(move |theme, status| {
+                    style::button::transparent(theme, status, self.expanded_oi)
+                }),
+        ]
+        .align_y(iced::Alignment::Center);
+        let oi_config = if self.expanded_oi {
+            Some(
+                column![
+                    row![
+                        iced::widget::space::horizontal(),
+                        text("URL:"),
+                        text_input("https://worker.example", &self.oi_history_url_input)
+                            .on_input(FetchMsg::OiHistoryUrlChanged)
+                            .width(180),
+                    ]
+                    .spacing(8)
+                    .align_y(iced::Alignment::Center),
+                    row![
+                        iced::widget::space::horizontal(),
+                        text("Auth:"),
+                        text_input("Bearer token", &self.oi_history_auth_token_input)
+                            .on_input(FetchMsg::OiHistoryAuthTokenChanged)
+                            .width(160)
+                            .secure(self.hide_oi_token),
+                        tooltip(
+                            checkbox(self.hide_oi_token).on_toggle(FetchMsg::ToggleShowOiToken),
+                            Some("Hide"),
+                            iced::widget::tooltip::Position::Top,
+                        ),
+                    ]
+                    .spacing(4)
+                    .align_y(iced::Alignment::Center),
+                ]
+                .align_x(iced::Alignment::End)
+                .spacing(6),
+            )
+        } else {
+            None
+        };
+        fetch_section = fetch_section.push(
+            container(column![oi_toggle, oi_config].spacing(4))
+                .style(style::modal_container)
+                .padding(iced::padding::left(8).top(4).bottom(4).right(4))
+                .width(iced::Length::Fill),
+        );
+
         // Pending = draft differs from the effective (applied) config
-        let pending = self.server_config_pending(effective_mode, effective_url, effective_auth);
+        let pending = self.server_config_pending(
+            effective_mode,
+            effective_url,
+            effective_auth,
+            effective_oi_url,
+            effective_oi_auth,
+        );
         let draft_changed = pending;
         let has_server_config = effective_auth.is_some()
-            || (*effective_mode == fetcher::TradeFetchMode::Server && effective_url.is_some());
+            || (*effective_mode == fetcher::TradeFetchMode::Server && effective_url.is_some())
+            || effective_oi_url.is_some()
+            || effective_oi_auth.is_some();
 
         let buttons: Element<'_, FetchMsg> = {
             let msg = "Restore fetch settings to default";
@@ -746,6 +862,8 @@ impl FetchForm {
         _effective_mode: &fetcher::TradeFetchMode,
         _effective_url: Option<&str>,
         _effective_auth: Option<&str>,
+        _effective_oi_url: Option<&str>,
+        _effective_oi_auth: Option<&str>,
     ) -> Option<Action> {
         match message {
             FetchMsg::ToggleShowToken(v) => {
@@ -761,9 +879,22 @@ impl FetchForm {
                 self.server_auth_token_input = v;
                 *error = None;
             }
+            FetchMsg::OiHistoryUrlChanged(v) => {
+                self.oi_history_url_input = v;
+                *error = None;
+            }
+            FetchMsg::OiHistoryAuthTokenChanged(v) => {
+                self.oi_history_auth_token_input = v;
+                *error = None;
+            }
             FetchMsg::ToggleFetchTrades(checked) => {
                 *error = None;
                 self.draft_active = checked;
+            }
+            FetchMsg::ToggleOiHistory(checked) => {
+                *error = None;
+                self.draft_oi_active = checked;
+                self.expanded_oi |= checked;
             }
             FetchMsg::SelectFetchMode(tag) => {
                 *error = None;
@@ -772,6 +903,15 @@ impl FetchForm {
             FetchMsg::ToggleServerConfig => {
                 *error = None;
                 self.expanded_server = !self.expanded_server;
+            }
+            FetchMsg::ToggleOiConfig => {
+                *error = None;
+                self.expanded_oi = !self.expanded_oi;
+            }
+            FetchMsg::ToggleShowOiToken(value) => {
+                self.hide_oi_token = value;
+                *confirm = ConfirmState::Idle;
+                *error = None;
             }
             FetchMsg::RequestApplyFetch => {
                 *error = None;
@@ -791,13 +931,35 @@ impl FetchForm {
                     }
                 }
 
+                if self.draft_oi_active {
+                    let oi_url = self.trimmed_oi_url();
+                    if oi_url.is_none() {
+                        *error = Some(
+                            "OI history URL is required when one-minute history is enabled"
+                                .to_string(),
+                        );
+                        return None;
+                    }
+                    if oi_url
+                        .as_deref()
+                        .is_some_and(|url| url::Url::parse(url).is_err())
+                    {
+                        *error = Some("OI history URL is not a valid URL".to_string());
+                        return None;
+                    }
+                }
+
                 let mode = self.build_mode();
                 let url = self.trimmed_url();
                 let auth_token = self.trimmed_auth();
+                let oi_url = self.trimmed_oi_url();
+                let oi_auth_token = self.trimmed_oi_auth();
                 return Some(Action::ApplyServerConfig {
                     mode,
                     url,
                     auth_token,
+                    oi_url,
+                    oi_auth_token,
                 });
             }
             FetchMsg::Cancel => {
@@ -812,12 +974,18 @@ impl FetchForm {
                 *error = None;
                 self.server_url_input.clear();
                 self.server_auth_token_input.clear();
+                self.oi_history_url_input.clear();
+                self.oi_history_auth_token_input.clear();
                 self.draft_active = false;
+                self.draft_oi_active = false;
                 self.expanded_server = false;
+                self.expanded_oi = false;
                 return Some(Action::ApplyServerConfig {
                     mode: fetcher::TradeFetchMode::Off,
                     url: None,
                     auth_token: None,
+                    oi_url: None,
+                    oi_auth_token: None,
                 });
             }
         }
@@ -916,4 +1084,52 @@ fn create_icon_button<'a, M: Clone + 'a>(
     }
 
     btn
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oi_history_settings_apply_independently_from_trade_history() {
+        let mode = fetcher::TradeFetchMode::Off;
+        let mut form = FetchForm::new(&mode, None, None, None, None);
+        let mut confirm = ConfirmState::Idle;
+        let mut error = None;
+        let mut update = |form: &mut FetchForm, message| {
+            form.update(
+                message,
+                &mut confirm,
+                &mut error,
+                &mode,
+                None,
+                None,
+                None,
+                None,
+            )
+        };
+
+        update(&mut form, FetchMsg::ToggleOiHistory(true));
+        update(
+            &mut form,
+            FetchMsg::OiHistoryUrlChanged("https://oi.example/".to_string()),
+        );
+        update(
+            &mut form,
+            FetchMsg::OiHistoryAuthTokenChanged("token".to_string()),
+        );
+        let action = update(&mut form, FetchMsg::RequestApplyFetch);
+
+        assert!(matches!(
+            action,
+            Some(Action::ApplyServerConfig {
+                mode: fetcher::TradeFetchMode::Off,
+                url: None,
+                auth_token: None,
+                oi_url: Some(url),
+                oi_auth_token: Some(token),
+            }) if url == "https://oi.example" && token == "token"
+        ));
+        assert_eq!(error, None);
+    }
 }

@@ -15,7 +15,7 @@ use super::{
 use crate::adapter::hub::AdapterError;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -266,6 +266,127 @@ pub(super) async fn fetch_klines(
     klines
 }
 
+fn oi_range_reaches_live_edge(
+    range: Option<(UnixMs, UnixMs)>,
+    requested_period: Timeframe,
+    now: UnixMs,
+) -> bool {
+    range.is_none_or(|(_, end)| {
+        end.saturating_add(requested_period.to_milliseconds().max(60_000) * 2) >= now
+    })
+}
+
+async fn fetch_mark_price_closes(
+    hub: &mut HttpHub<BybitLimiter>,
+    ticker_info: TickerInfo,
+    period: Timeframe,
+    range: Option<(UnixMs, UnixMs)>,
+) -> Result<BTreeMap<UnixMs, f64>, AdapterError> {
+    let (ticker_str, market) = ticker_info.ticker.to_full_symbol_and_type();
+    let category = match market {
+        MarketKind::LinearPerps => "linear",
+        MarketKind::InversePerps => "inverse",
+        MarketKind::Spot => {
+            return Err(AdapterError::InvalidRequest(
+                "Mark-price history is unavailable for Bybit spot markets".to_string(),
+            ));
+        }
+    };
+    let interval = if period == Timeframe::D1 {
+        "D".to_string()
+    } else {
+        period.to_minutes().to_string()
+    };
+    let mut url = format!(
+        "{FETCH_DOMAIN}/v5/market/mark-price-kline?category={category}&symbol={}&interval={interval}",
+        ticker_str.to_uppercase()
+    );
+    if let Some((start, end)) = range {
+        let count =
+            (end.as_u64().saturating_sub(start.as_u64()) / period.to_milliseconds()).clamp(1, 1000);
+        url.push_str(&format!(
+            "&start={}&end={}&limit={count}",
+            start.as_u64(),
+            end.as_u64()
+        ));
+    } else {
+        url.push_str("&limit=200");
+    }
+    let response: ApiResponse = hub.http_json_with_limiter(&url, 1, None, None).await?;
+    response
+        .result
+        .list
+        .iter()
+        .map(|row| {
+            let time = parse_kline_field::<u64>(row.first().and_then(Value::as_str))?;
+            let close = parse_kline_field::<f64>(row.get(4).and_then(Value::as_str))?;
+            Ok((UnixMs::new(time), close))
+        })
+        .collect()
+}
+
+async fn fetch_current_oi(
+    hub: &mut HttpHub<BybitLimiter>,
+    ticker_info: TickerInfo,
+) -> Result<OpenInterest, AdapterError> {
+    let (ticker_str, market) = ticker_info.ticker.to_full_symbol_and_type();
+    let category = match market {
+        MarketKind::LinearPerps => "linear",
+        MarketKind::InversePerps => "inverse",
+        MarketKind::Spot => {
+            return Err(AdapterError::InvalidRequest(
+                "Open interest is unavailable for Bybit spot markets".to_string(),
+            ));
+        }
+    };
+    let url = format!(
+        "{FETCH_DOMAIN}/v5/market/tickers?category={category}&symbol={}",
+        ticker_str.to_uppercase()
+    );
+    let content: Value = hub.http_json_with_limiter(&url, 1, None, None).await?;
+    let time = serde_util::value_as_f64(&content["time"])
+        .map(|value| value as u64)
+        .ok_or_else(|| AdapterError::ParseError("Missing Bybit ticker time".to_string()))?;
+    let item = content["result"]["list"]
+        .as_array()
+        .and_then(|list| list.first())
+        .ok_or_else(|| AdapterError::ParseError("Missing Bybit ticker OI".to_string()))?;
+
+    // Bybit now publishes both-side and single-side fields. Standard OI
+    // counts each outstanding contract once, so prefer the single-side value;
+    // halve the documented both-side field only as a compatibility fallback.
+    let value = current_oi_usd_value(item, market)
+        .ok_or_else(|| AdapterError::ParseError("Missing Bybit ticker OI value".to_string()))?;
+    if !value.is_finite() || value < 0.0 {
+        return Err(AdapterError::ParseError(format!(
+            "Invalid current Bybit OI for {ticker_str}: {value}"
+        )));
+    }
+    Ok(OpenInterest {
+        time: UnixMs::new(time),
+        value,
+    })
+}
+
+fn current_oi_usd_value(item: &Value, market: MarketKind) -> Option<f64> {
+    match market {
+        MarketKind::LinearPerps => serde_util::value_as_f64(&item["singleOpenInterestValue"])
+            .or_else(|| {
+                serde_util::value_as_f64(&item["openInterestValue"]).map(|value| value / 2.0)
+            })
+            .or_else(|| {
+                let base = serde_util::value_as_f64(&item["singleOpenInterest"]).or_else(|| {
+                    serde_util::value_as_f64(&item["openInterest"]).map(|value| value / 2.0)
+                })?;
+                let mark = serde_util::value_as_f64(&item["markPrice"])?;
+                Some(base * mark)
+            }),
+        MarketKind::InversePerps => serde_util::value_as_f64(&item["singleOpenInterest"])
+            .or_else(|| serde_util::value_as_f64(&item["openInterest"]).map(|value| value / 2.0)),
+        MarketKind::Spot => None,
+    }
+}
+
 pub(super) async fn fetch_historical_oi(
     hub: &mut HttpHub<BybitLimiter>,
     ticker_info: TickerInfo,
@@ -277,7 +398,11 @@ pub(super) async fn fetch_historical_oi(
         .to_full_symbol_and_type()
         .0
         .to_uppercase();
-    let period_str = match period {
+    let historical_period = match period {
+        Timeframe::M1 | Timeframe::M3 => Timeframe::M5,
+        other => other,
+    };
+    let period_str = match historical_period {
         Timeframe::M5 => "5min",
         Timeframe::M15 => "15min",
         Timeframe::M30 => "30min",
@@ -286,7 +411,7 @@ pub(super) async fn fetch_historical_oi(
         Timeframe::D1 => "1d",
         _ => {
             return Err(AdapterError::InvalidRequest(format!(
-                "Unsupported timeframe for open interest: {period}"
+                "Unsupported timeframe for open interest: {historical_period}"
             )));
         }
     };
@@ -308,7 +433,7 @@ pub(super) async fn fetch_historical_oi(
     if let Some((start, end)) = range {
         let start = start.as_u64();
         let end = end.as_u64();
-        let interval_ms = period.to_milliseconds();
+        let interval_ms = historical_period.to_milliseconds();
         let num_intervals = (end.saturating_sub(start) / interval_ms).clamp(1, 200);
 
         url.push_str(&format!(
@@ -346,15 +471,11 @@ pub(super) async fn fetch_historical_oi(
         })?;
 
     let prices = if market == MarketKind::LinearPerps {
-        fetch_klines(hub, ticker_info, period, range)
-            .await?
-            .into_iter()
-            .map(|kline| (kline.time, kline.close.to_f64()))
-            .collect::<std::collections::BTreeMap<_, _>>()
+        fetch_mark_price_closes(hub, ticker_info, historical_period, range).await?
     } else {
         std::collections::BTreeMap::new()
     };
-    let open_interest: Vec<OpenInterest> = bybit_oi
+    let mut open_interest: Vec<OpenInterest> = bybit_oi
         .into_iter()
         .filter_map(|x| {
             let time = UnixMs::from(x.timestamp);
@@ -362,7 +483,7 @@ pub(super) async fn fetch_historical_oi(
                 .single_side_value
                 .as_deref()
                 .and_then(|value| value.parse().ok())
-                .unwrap_or(x.value);
+                .unwrap_or(x.value / 2.0);
             let value = match market {
                 MarketKind::LinearPerps => prices
                     .range(..=time)
@@ -375,6 +496,28 @@ pub(super) async fn fetch_historical_oi(
             Some(OpenInterest { time, value })
         })
         .collect();
+
+    let now = UnixMs::now();
+    if oi_range_reaches_live_edge(range, period, now) {
+        match fetch_current_oi(hub, ticker_info).await {
+            Ok(snapshot) => open_interest.push(snapshot),
+            Err(err) if open_interest.is_empty() => return Err(err),
+            Err(err) => log::warn!(
+                "Failed to refresh current Bybit OI for {ticker_str}; using native history: {err}"
+            ),
+        }
+    }
+
+    let mut deduplicated = BTreeMap::new();
+    for point in open_interest {
+        if point.value.is_finite() && point.value >= 0.0 {
+            deduplicated.insert(point.time, point.value);
+        }
+    }
+    let open_interest = deduplicated
+        .into_iter()
+        .map(|(time, value)| OpenInterest { time, value })
+        .collect::<Vec<_>>();
 
     if open_interest.is_empty() {
         log::warn!(
@@ -653,4 +796,42 @@ pub(super) async fn fetch_trades(
     }
 
     Ok(Vec::new())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn current_linear_oi_prefers_single_side_usd_notional() {
+        let item = serde_json::json!({
+            "openInterest": "49185.575",
+            "openInterestValue": "3803594293.11",
+            "singleOpenInterest": "24592.788",
+            "singleOpenInterestValue": "1901797185.22",
+            "markPrice": "77329.5"
+        });
+        assert_eq!(
+            current_oi_usd_value(&item, MarketKind::LinearPerps),
+            Some(1_901_797_185.22)
+        );
+    }
+
+    #[test]
+    fn documented_both_side_value_is_halved_when_single_side_is_absent() {
+        let linear = serde_json::json!({
+            "openInterestValue": "3800000000",
+            "markPrice": "77000"
+        });
+        assert_eq!(
+            current_oi_usd_value(&linear, MarketKind::LinearPerps),
+            Some(1_900_000_000.0)
+        );
+
+        let inverse = serde_json::json!({ "openInterest": "240000000" });
+        assert_eq!(
+            current_oi_usd_value(&inverse, MarketKind::InversePerps),
+            Some(120_000_000.0)
+        );
+    }
 }

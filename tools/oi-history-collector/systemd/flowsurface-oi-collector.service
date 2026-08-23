@@ -1,0 +1,25 @@
+[Unit]
+Description=FlowSurface Binance open-interest collector
+Documentation=https://github.com/Bonbloxx/flowsurface
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/flowsurface/oi-collector
+EnvironmentFile=%h/flowsurface/oi-collector/.env
+ExecStart=/usr/bin/python3 %h/flowsurface/oi-collector/binance_oi_collector.py
+TimeoutStartSec=45
+UMask=0077
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=default.target

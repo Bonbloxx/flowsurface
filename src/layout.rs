@@ -422,6 +422,11 @@ pub fn load_saved_state() -> SavedState {
             {
                 network.server_auth_token = data::config::auth::load_server_token(url);
             }
+            if network.oi_history_auth_token.is_none()
+                && let Some(ref url) = network.oi_history_url
+            {
+                network.oi_history_auth_token = data::config::auth::load_oi_history_token(url);
+            }
             exchange::unit::qty::set_preferred_currency(state.size_in_quote_ccy);
             crate::connector::fetcher::set_trade_fetch_mode(state.network.trade_fetch_mode.clone());
 

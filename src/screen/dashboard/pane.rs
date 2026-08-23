@@ -2101,14 +2101,6 @@ impl State {
                     );
                 let is_liquidity_heatmap =
                     matches!(ind, UiIndicator::Kline(KlineIndicator::LiquidityHeatmap));
-                let is_open_interest =
-                    matches!(ind, UiIndicator::Kline(KlineIndicator::OpenInterest));
-                let enabling_open_interest = is_open_interest
-                    && matches!(
-                        &self.content,
-                        Content::Kline { indicators, .. }
-                            if !indicators.contains(&KlineIndicator::OpenInterest)
-                    );
                 let enabling_liquidity = is_liquidity_heatmap
                     && matches!(
                         &self.content,
@@ -2173,14 +2165,6 @@ impl State {
                     {
                         chart.configure_liquidity_heatmap(configured);
                     }
-                }
-
-                if enabling_open_interest
-                    && let Content::Kline {
-                        chart: Some(chart), ..
-                    } = &mut self.content
-                {
-                    chart.configure_open_interest(available_sources.clone());
                 }
 
                 self.content.toggle_indicator(ind);
@@ -2611,6 +2595,7 @@ impl State {
                                 }
                             }
                         }
+                        self.sync_footprint_history_streams();
                         self.sync_liquidity_heatmap_streams();
                     }
 
@@ -3986,6 +3971,56 @@ mod tests {
     }
 
     #[test]
+    fn open_interest_follows_direct_and_aggregated_chart_sources() {
+        let binance = ticker_info(Exchange::BinanceLinear, "BTCUSDT", 0.1);
+        let bybit = ticker_info(Exchange::BybitLinear, "BTCUSDT", 0.1);
+        let hyperliquid = ticker_info(Exchange::HyperliquidLinear, "BTC", 1.0);
+        let available = vec![binance, bybit, hyperliquid];
+
+        for source in available.iter().copied() {
+            let mut state = State::default();
+            state.set_content_and_streams(vec![source], ContentKind::CandlestickChart);
+            state.update(Event::ToggleIndicator(
+                UiIndicator::Kline(KlineIndicator::OpenInterest),
+                available.clone(),
+            ));
+            let Content::Kline {
+                chart: Some(chart), ..
+            } = &state.content
+            else {
+                panic!("direct candlestick chart initialized");
+            };
+            assert_eq!(chart.open_interest_sources(), &[source]);
+        }
+
+        let mut aggregate = State::default();
+        aggregate.set_content_and_streams(available.clone(), ContentKind::FootprintChart);
+        aggregate.update(Event::ToggleIndicator(
+            UiIndicator::Kline(KlineIndicator::OpenInterest),
+            available.clone(),
+        ));
+        let Content::Kline {
+            chart: Some(chart), ..
+        } = &aggregate.content
+        else {
+            panic!("aggregate footprint chart initialized");
+        };
+        assert_eq!(chart.open_interest_sources(), available.as_slice());
+
+        assert!(matches!(
+            aggregate.update(Event::AggregateSourceToggled(hyperliquid, false)),
+            Some(Effect::RefreshStreams)
+        ));
+        let Content::Kline {
+            chart: Some(chart), ..
+        } = &aggregate.content
+        else {
+            panic!("aggregate footprint chart rebuilt");
+        };
+        assert_eq!(chart.open_interest_sources(), &[binance, bybit]);
+    }
+
+    #[test]
     fn aggregated_footprint_applies_saved_tick_multiplier_to_the_shared_grid() {
         let binance = ticker_info(Exchange::BinanceLinear, "BTCUSDT", 0.1);
         let bybit = ticker_info(Exchange::BybitLinear, "BTCUSDT", 0.1);
@@ -4159,6 +4194,35 @@ mod tests {
         assert!(indicators.contains(&KlineIndicator::DailyDelta));
         assert!(chart.footprint_history_aggregate());
         assert_eq!(chart.footprint_history_sources().len(), 3);
+    }
+
+    #[test]
+    fn changing_candle_timeframe_keeps_cvd_live_trade_streams() {
+        let binance = ticker_info(Exchange::BinanceLinear, "BTCUSDT", 0.1);
+        let bybit = ticker_info(Exchange::BybitLinear, "BTCUSDT", 0.1);
+        let hyperliquid = ticker_info(Exchange::HyperliquidLinear, "BTC", 0.1);
+        let mut state = State::default();
+        state.set_content_and_streams(vec![binance], ContentKind::CandlestickChart);
+        state.update(Event::ToggleIndicator(
+            UiIndicator::Kline(KlineIndicator::CumulativeDelta),
+            vec![binance, bybit, hyperliquid],
+        ));
+        state.modal = Some(Modal::StreamModifier(modal::stream::Modifier::new(
+            ModifierKind::Candlestick(Basis::Time(Timeframe::M15)),
+        )));
+
+        state.update(Event::StreamModifierChanged(
+            modal::stream::Message::BasisSelected(Basis::Time(Timeframe::M30)),
+        ));
+
+        let streams = state.streams.ready_iter().expect("ready streams");
+        assert_eq!(
+            streams
+                .filter(|stream| matches!(stream, StreamKind::Trades { .. }))
+                .count(),
+            3,
+            "changing timeframe must not disconnect the live feeds backing CVD"
+        );
     }
 
     #[test]
