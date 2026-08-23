@@ -7,7 +7,7 @@ use exchange::unit::Qty;
 use exchange::unit::price::{Price, PriceStep};
 use exchange::{Kline, Trade, UnixMs, Volume};
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone)]
 pub struct TickAccumulation {
@@ -310,6 +310,70 @@ impl TickAggr {
             }
             Self::sync_tpo_kline_fields(accumulation);
         }
+    }
+
+    /// Replace complete TPO sessions from canonical bars and retained trades.
+    ///
+    /// Unlike [`Self::insert_tpo_klines`], this operation can retract rows and
+    /// correct open/close values. Callers must provide the complete canonical
+    /// kline set for every session named by `affected_sessions`, not merely the
+    /// latest page that touched it. `retained_trades` may cover a wider range;
+    /// only trades belonging to an affected session are replayed.
+    ///
+    /// Session identifiers are normalized through [`TpoConfig::profile_start`],
+    /// so either a profile start or any timestamp inside that profile is valid.
+    /// A named session absent from both canonical inputs is removed. Datapoints
+    /// outside the affected sessions are preserved unchanged.
+    pub fn replace_tpo_sessions_from_canonical(
+        &mut self,
+        affected_sessions: &[UnixMs],
+        canonical_klines: &[Kline],
+        retained_trades: &[Trade],
+    ) {
+        let Some(state) = self.tpo else {
+            return;
+        };
+        let config = state.config.normalized();
+        let affected = affected_sessions
+            .iter()
+            .map(|time| config.profile_start(*time))
+            .collect::<BTreeSet<_>>();
+        if affected.is_empty() {
+            return;
+        }
+
+        // Canonical stores have one final bar per timestamp. Defensively fold
+        // exact overlaps the same way here; when a caller supplies more than
+        // one version for a timestamp, the last supplied version is final.
+        let canonical = canonical_klines
+            .iter()
+            .filter(|kline| affected.contains(&config.profile_start(kline.time)))
+            .fold(BTreeMap::<UnixMs, Kline>::new(), |mut bars, kline| {
+                bars.insert(kline.time, *kline);
+                bars
+            })
+            .into_values()
+            .collect::<Vec<_>>();
+
+        // A venue execution ID is not retained in `Trade`, so equal-timestamp
+        // executions cannot be sequence-ordered. Use a total field order to
+        // make replacement deterministic without value-deduplicating distinct
+        // executions.
+        let mut trades = retained_trades
+            .iter()
+            .filter(|trade| affected.contains(&config.profile_start(trade.time)))
+            .copied()
+            .collect::<Vec<_>>();
+        trades.sort_by_key(|trade| (trade.time, trade.price, trade.qty, trade.is_sell));
+
+        // Build replacements off to the side, then splice them into the live
+        // vector. This makes corrected/narrower bars true replacements instead
+        // of monotonic expansions of stale brackets and rows.
+        let mut rebuilt = Self::new_tpo_seeded(config, self.tick_size, &canonical, &trades);
+        self.datapoints
+            .retain(|point| !affected.contains(&point.kline.time));
+        self.datapoints.append(&mut rebuilt.datapoints);
+        self.datapoints.sort_by_key(|point| point.kline.time);
     }
 
     pub fn change_tick_size(&mut self, tick_size: PriceStep, raw_trades: &[Trade]) {
@@ -739,6 +803,90 @@ mod tests {
         }
     }
 
+    fn ranged_kline(time: u64, open: f64, high: f64, low: f64, close: f64) -> Kline {
+        Kline {
+            time: UnixMs::new(time),
+            open: Price::from_f64(open),
+            high: Price::from_f64(high),
+            low: Price::from_f64(low),
+            close: Price::from_f64(close),
+            volume: Volume::empty_total(),
+        }
+    }
+
+    fn assert_accumulation_eq(actual: &TickAccumulation, expected: &TickAccumulation) {
+        assert_eq!(actual.tick_count, expected.tick_count);
+        assert_eq!(actual.kline.time, expected.kline.time);
+        assert_eq!(actual.kline.open, expected.kline.open);
+        assert_eq!(actual.kline.high, expected.kline.high);
+        assert_eq!(actual.kline.low, expected.kline.low);
+        assert_eq!(actual.kline.close, expected.kline.close);
+        assert_eq!(actual.kline.volume.total(), expected.kline.volume.total());
+        assert_eq!(
+            actual.kline.volume.buy_sell(),
+            expected.kline.volume.buy_sell()
+        );
+
+        let footprint = |point: &TickAccumulation| {
+            point
+                .footprint
+                .trades
+                .iter()
+                .map(|(price, group)| {
+                    (
+                        *price,
+                        (
+                            group.buy_qty,
+                            group.sell_qty,
+                            group.first_time,
+                            group.last_time,
+                            group.buy_count,
+                            group.sell_count,
+                        ),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>()
+        };
+        assert_eq!(footprint(actual), footprint(expected));
+
+        match (&actual.tpo, &expected.tpo) {
+            (Some(actual), Some(expected)) => {
+                assert_eq!(actual.start, expected.start);
+                assert_eq!(actual.end, expected.end);
+                assert_eq!(actual.poc, expected.poc);
+                assert_eq!(actual.value_area_high, expected.value_area_high);
+                assert_eq!(actual.value_area_low, expected.value_area_low);
+                assert_eq!(actual.initial_balance_high, expected.initial_balance_high);
+                assert_eq!(actual.initial_balance_low, expected.initial_balance_low);
+                assert_eq!(actual.total_tpos, expected.total_tpos);
+                assert_eq!(actual.first_time, expected.first_time);
+                assert_eq!(actual.last_time, expected.last_time);
+                assert_eq!(actual.open, expected.open);
+                assert_eq!(actual.close, expected.close);
+
+                let rows = |profile: &TpoProfile| {
+                    profile
+                        .rows
+                        .iter()
+                        .map(|(price, row)| (*price, row.blocks.clone()))
+                        .collect::<BTreeMap<_, _>>()
+                };
+                assert_eq!(rows(actual), rows(expected));
+
+                let brackets = |profile: &TpoProfile| {
+                    profile
+                        .brackets
+                        .iter()
+                        .map(|(block, range)| (*block, (range.low, range.high)))
+                        .collect::<BTreeMap<_, _>>()
+                };
+                assert_eq!(brackets(actual), brackets(expected));
+            }
+            (None, None) => {}
+            _ => panic!("TPO profile presence differs"),
+        }
+    }
+
     #[test]
     fn renko_builds_fixed_continuation_bricks_and_two_box_reversals() {
         let config = RenkoConfig {
@@ -928,6 +1076,113 @@ mod tests {
             a_profile.rows.keys().collect::<Vec<_>>(),
             b_profile.rows.keys().collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn tpo_session_replacement_retracts_stale_data_and_preserves_other_sessions() {
+        let config = TpoConfig {
+            profile_period: ProfilePeriod::Hour,
+            block_size: BlockSize::Minutes30,
+            ticks_per_row: 1,
+            ..TpoConfig::default()
+        };
+        let hour = ProfilePeriod::Hour.millis();
+        let initial_klines = [
+            ranged_kline(0, 95.0, 110.0, 90.0, 105.0),
+            ranged_kline(hour, 200.0, 202.0, 199.0, 201.0),
+        ];
+        let initial_trades = [trade(1_000, 115.0), trade(hour + 1_000, 203.0)];
+        let mut actual =
+            TickAggr::new_tpo_seeded(config, one_dollar_step(), &initial_klines, &initial_trades);
+        let outside_before = actual.datapoints[1].clone();
+
+        let canonical = [
+            ranged_kline(0, 100.0, 102.0, 100.0, 101.0),
+            ranged_kline(30 * 60_000, 101.0, 103.0, 101.0, 102.0),
+        ];
+        let retained = [trade(10 * 60_000, 104.0), trade(hour + 2_000, 250.0)];
+        let expected =
+            TickAggr::new_tpo_seeded(config, one_dollar_step(), &canonical, &retained[..1]);
+
+        // Any timestamp within the affected profile is a valid session identifier.
+        actual.replace_tpo_sessions_from_canonical(
+            &[UnixMs::new(15 * 60_000)],
+            &canonical,
+            &retained,
+        );
+
+        assert_eq!(actual.datapoints.len(), 2);
+        assert_accumulation_eq(&actual.datapoints[0], &expected.datapoints[0]);
+        assert_accumulation_eq(&actual.datapoints[1], &outside_before);
+
+        let profile = actual.datapoints[0].tpo.as_ref().expect("rebuilt TPO");
+        assert!(!profile.rows.contains_key(&Price::from_f64(90.0)));
+        assert!(!profile.rows.contains_key(&Price::from_f64(110.0)));
+        assert!(!profile.rows.contains_key(&Price::from_f64(115.0)));
+        assert!(profile.rows.contains_key(&Price::from_f64(104.0)));
+    }
+
+    #[test]
+    fn tpo_session_replacement_is_idempotent_and_input_order_deterministic() {
+        let config = TpoConfig {
+            profile_period: ProfilePeriod::Hour,
+            block_size: BlockSize::Minutes30,
+            ticks_per_row: 1,
+            ..TpoConfig::default()
+        };
+        let old = [ranged_kline(0, 90.0, 120.0, 90.0, 120.0)];
+        let first = ranged_kline(0, 100.0, 102.0, 99.0, 101.0);
+        let second = ranged_kline(30 * 60_000, 101.0, 104.0, 101.0, 103.0);
+        let with_exact_overlap = [second, first, first];
+        let canonical = [first, second];
+        let mut sell = trade(20 * 60_000, 98.0);
+        sell.is_sell = true;
+        sell.qty = Qty::from_f64(2.0);
+        let ordered_trades = [trade(10 * 60_000, 105.0), sell];
+        let reversed_trades = [sell, trade(10 * 60_000, 105.0)];
+        let mut a = TickAggr::new_tpo_seeded(config, one_dollar_step(), &old, &[]);
+        let mut b = TickAggr::new_tpo_seeded(config, one_dollar_step(), &old, &[]);
+
+        a.replace_tpo_sessions_from_canonical(
+            &[UnixMs::new(1), UnixMs::new(59 * 60_000)],
+            &with_exact_overlap,
+            &reversed_trades,
+        );
+        b.replace_tpo_sessions_from_canonical(&[UnixMs::new(0)], &canonical, &ordered_trades);
+
+        assert_eq!(a.datapoints.len(), 1);
+        assert_eq!(b.datapoints.len(), 1);
+        assert_accumulation_eq(&a.datapoints[0], &b.datapoints[0]);
+
+        let once = a.datapoints[0].clone();
+        a.replace_tpo_sessions_from_canonical(
+            &[UnixMs::new(45 * 60_000)],
+            &with_exact_overlap,
+            &reversed_trades,
+        );
+        assert_accumulation_eq(&a.datapoints[0], &once);
+    }
+
+    #[test]
+    fn tpo_session_replacement_removes_an_affected_session_with_no_canonical_data() {
+        let config = TpoConfig {
+            profile_period: ProfilePeriod::Hour,
+            block_size: BlockSize::Minutes30,
+            ticks_per_row: 1,
+            ..TpoConfig::default()
+        };
+        let hour = ProfilePeriod::Hour.millis();
+        let klines = [
+            ranged_kline(0, 100.0, 101.0, 99.0, 100.0),
+            ranged_kline(hour, 200.0, 201.0, 199.0, 200.0),
+        ];
+        let mut aggr = TickAggr::new_tpo_seeded(config, one_dollar_step(), &klines, &[]);
+        let outside_before = aggr.datapoints[1].clone();
+
+        aggr.replace_tpo_sessions_from_canonical(&[UnixMs::new(1_000)], &[], &[]);
+
+        assert_eq!(aggr.datapoints.len(), 1);
+        assert_accumulation_eq(&aggr.datapoints[0], &outside_before);
     }
 
     #[test]

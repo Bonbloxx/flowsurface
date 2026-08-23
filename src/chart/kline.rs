@@ -48,6 +48,11 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use std::time::{Duration, Instant};
 
 const RENKO_SEED_TIMEFRAME: exchange::Timeframe = exchange::Timeframe::M1;
+/// Publish losslessly-ingested live data to the expensive canvas at 20 Hz.
+/// Interaction-driven invalidation remains immediate, so this reduces render
+/// contention without making pan/zoom input wait behind market-data redraws.
+pub(crate) const LIVE_REDRAW_INTERVAL_MS: u64 = 50;
+const LIVE_REDRAW_INTERVAL: Duration = Duration::from_millis(LIVE_REDRAW_INTERVAL_MS);
 /// A month of close-based seed bars. Each REST page is one venue-sized
 /// window of 1m closes, requested one page per seed tick so a liquid
 /// symbol cannot stall the UI with a giant rebuild.
@@ -219,16 +224,10 @@ impl Chart for KlineChart {
         Some(chart.interval_range(&region))
     }
 
-    fn interval_keys(&self) -> Option<Vec<u64>> {
+    fn interval_keys(&self) -> Option<&[data::aggr::ticks::TickAccumulation]> {
         match &self.data_source {
             PlotData::TimeBased(_) => None,
-            PlotData::TickBased(tick_aggr) => Some(
-                tick_aggr
-                    .datapoints
-                    .iter()
-                    .map(|dp| dp.kline.time.as_u64())
-                    .collect(),
-            ),
+            PlotData::TickBased(tick_aggr) => Some(&tick_aggr.datapoints),
         }
     }
 
@@ -335,6 +334,10 @@ pub struct KlineChart {
     request_handler: RequestHandler,
     study_configurator: study::Configurator<FootprintStudy>,
     last_tick: Instant,
+    /// Data ingestion is immediate; only expensive canvas publication is
+    /// coalesced across venue batches.
+    last_live_redraw: Instant,
+    pending_live_redraw: bool,
     visual_config: Config,
 }
 
@@ -480,6 +483,8 @@ impl KlineChart {
                     kind: kind.clone(),
                     study_configurator: study::Configurator::new(),
                     last_tick: Instant::now(),
+                    last_live_redraw: Instant::now(),
+                    pending_live_redraw: false,
                 }
             }
             Basis::Tick(interval) => {
@@ -588,6 +593,8 @@ impl KlineChart {
                     kind: kind.clone(),
                     study_configurator: study::Configurator::new(),
                     last_tick: Instant::now(),
+                    last_live_redraw: Instant::now(),
+                    pending_live_redraw: false,
                 }
             }
         }
@@ -881,7 +888,7 @@ impl KlineChart {
     }
 
     pub fn update_latest_kline(&mut self, kline: &Kline) {
-        match self.data_source {
+        let updated = match self.data_source {
             PlotData::TimeBased(ref mut timeseries) => {
                 timeseries.insert_klines(&[*kline]);
 
@@ -897,8 +904,15 @@ impl KlineChart {
                 }
 
                 chart.last_price = Some(PriceInfoLabel::new(kline.close, kline.open));
+                true
             }
-            PlotData::TickBased(_) => {}
+            PlotData::TickBased(_) => false,
+        };
+        if updated {
+            // Periodic maintenance intentionally preserves caches. Publish the
+            // newest candle through the same bounded live-render path as trades
+            // so candle-only panes cannot retain stale geometry indefinitely.
+            self.invalidate_live_render();
         }
     }
 
@@ -941,6 +955,12 @@ impl KlineChart {
         let mut specs = Vec::new();
 
         for source in sources {
+            let source_cutoff = self
+                .live_trade_starts
+                .get(&source)
+                .map_or(cutoff, |first_live| first_live.saturating_sub(1));
+            let source_day_ranges =
+                footprint_history_day_ranges(source_cutoff, recent_lookback_days);
             let trade_history_available = trade_history_available(source, fetch_mode.clone());
             let source_fetch_active = self
                 .footprint_history
@@ -949,11 +969,11 @@ impl KlineChart {
                 .any(|request| request.source == source);
             if trade_history_available && !source_fetch_active {
                 self.for_each_trade_history(|indicator| {
-                    indicator.prepare_footprint_history(source, cutoff);
+                    indicator.prepare_footprint_history(source, source_cutoff);
                 });
                 // Keep one UTC-day backfill active per venue. Venues still fetch
                 // in parallel, while each venue fills recent profiles first.
-                for (start, end) in recent_day_ranges.iter() {
+                for (start, end) in source_day_ranges.iter() {
                     let cached_through = self.load_cached_footprint_day(source, *start);
                     let Some((fetch_start, fetch_end)) =
                         missing_day_range(*start, *end, cached_through)
@@ -1400,9 +1420,9 @@ impl KlineChart {
     ///
     /// Called from the periodic tick; cheap unless bars changed or a period
     /// boundary rolled over.
-    fn sync_previous_value_areas(&mut self) {
+    fn sync_previous_value_areas(&mut self) -> bool {
         if self.indicators[KlineIndicator::PreviousValueArea].is_none() {
-            return;
+            return false;
         }
         let config = self.visual_config.previous_value_area_tpo_config();
         let row_step = config.row_step(self.chart.tick_size);
@@ -1410,8 +1430,9 @@ impl KlineChart {
         let dirty = std::mem::take(&mut self.pva_dirty);
         let bars = dirty.then(|| self.pva_klines.composite_klines());
         if let Some(indicator) = self.indicators[KlineIndicator::PreviousValueArea].as_mut() {
-            indicator.sync_value_areas(bars.as_deref(), config, row_step, now);
+            return indicator.sync_value_areas(bars.as_deref(), config, row_step, now);
         }
+        false
     }
 
     pub fn reset_request_handler(&mut self) {
@@ -1504,6 +1525,9 @@ impl KlineChart {
     /// Finish a successful trade-history fetch that did not already finalize
     /// via an `is_batches_done` data page (footprint gap fills often end this way).
     pub fn finalize_trade_fetch(&mut self, req_id: uuid::Uuid) {
+        self.for_each_trade_history(|indicator| {
+            indicator.commit_staged_source_trades(req_id);
+        });
         if let Some(request) = self.footprint_history.trade_requests.remove(&req_id) {
             self.persist_cached_footprint_day(request);
             self.request_handler.mark_completed(req_id);
@@ -1523,6 +1547,9 @@ impl KlineChart {
 
     /// Mark a fetch request as failed to unblock re-fetches of the same range.
     pub fn mark_fetch_failed(&mut self, req_id: uuid::Uuid) {
+        self.for_each_trade_history(|indicator| {
+            indicator.discard_staged_source_trades(req_id);
+        });
         self.footprint_history.trade_requests.remove(&req_id);
         self.footprint_history.oi_requests.remove(&req_id);
         // Retry after the handler's cooldown instead of pretending the
@@ -1537,6 +1564,9 @@ impl KlineChart {
     /// Mark a fetch request as having no data. The source confirmed the
     /// range is empty and it should never be retried.
     pub fn mark_fetch_no_data(&mut self, req_id: uuid::Uuid) {
+        self.for_each_trade_history(|indicator| {
+            indicator.discard_staged_source_trades(req_id);
+        });
         self.footprint_history.trade_requests.remove(&req_id);
         self.footprint_history.oi_requests.remove(&req_id);
         self.request_handler.mark_no_data(req_id);
@@ -1585,6 +1615,11 @@ impl KlineChart {
     /// resolve, instead of the ranges being suppressed as pending overlaps.
     pub fn release_undispatched_requests(&mut self, ids: &[uuid::Uuid]) {
         for id in ids {
+            self.for_each_trade_history(|indicator| {
+                indicator.discard_staged_source_trades(*id);
+            });
+            self.footprint_history.trade_requests.remove(id);
+            self.footprint_history.oi_requests.remove(id);
             self.request_handler.remove(*id);
             self.finish_trade_fetch(*id);
         }
@@ -1933,20 +1968,23 @@ impl KlineChart {
     }
 
     pub fn insert_trades(&mut self, source: TickerInfo, buffer: &[Trade]) {
+        let history_overlay_updated = self.uses_trade_history();
+        if let Some(first_live) = buffer.iter().map(|trade| trade.time).min() {
+            self.live_trade_starts
+                .entry(source)
+                .and_modify(|current| *current = (*current).min(first_live))
+                .or_insert(first_live);
+        }
         self.for_each_trade_history(|indicator| {
             indicator.on_source_trades(source, buffer, false);
         });
 
         let main_uses_trades = self.wants_bucketed_trades();
         if !main_uses_trades || !self.accepts_main_trade_source(source) {
+            if history_overlay_updated {
+                self.invalidate_live_render();
+            }
             return;
-        }
-
-        if let Some(first_live) = buffer.iter().map(|trade| trade.time).min() {
-            self.live_trade_starts
-                .entry(source)
-                .and_modify(|current| *current = (*current).min(first_live))
-                .or_insert(first_live);
         }
 
         // Live stream can run for hours — keep a hard ceiling so TPO/Renko
@@ -1975,7 +2013,7 @@ impl KlineChart {
                     .filter_map(Option::as_mut)
                     .for_each(|indi| indi.on_insert_trades(buffer, old_dp_len, &self.data_source));
 
-                self.invalidate(None);
+                self.invalidate_live_render();
             }
             PlotData::TimeBased(ref mut timeseries) => {
                 if matches!(self.kind, KlineChartKind::Footprint { .. }) {
@@ -1993,7 +2031,7 @@ impl KlineChart {
                     .filter_map(Option::as_mut)
                     .for_each(|indi| indi.on_insert_trades(buffer, 0, &self.data_source));
 
-                self.invalidate(None);
+                self.invalidate_live_render();
             }
         }
     }
@@ -2024,15 +2062,17 @@ impl KlineChart {
         req_id: Option<uuid::Uuid>,
     ) {
         if req_id.is_some_and(|id| self.footprint_history.trade_requests.contains_key(&id)) {
-            self.for_each_trade_history(|indicator| {
-                indicator.on_source_trades(source, &raw_trades, true);
-            });
-            // Full `invalidate` also re-runs autoscale and is far too expensive
-            // to do on every 10k-trade page. Refresh the canvas a few times a
-            // second so overlays populate without freezing the UI.
-            self.refresh_history_overlay(is_batches_done);
-            if is_batches_done && let Some(req_id) = req_id {
-                self.request_handler.mark_completed(req_id);
+            if let Some(req_id) = req_id {
+                self.for_each_trade_history(|indicator| {
+                    indicator.stage_source_trades(req_id, source, &raw_trades);
+                });
+                if is_batches_done {
+                    self.for_each_trade_history(|indicator| {
+                        indicator.commit_staged_source_trades(req_id);
+                    });
+                    self.refresh_history_overlay(true);
+                    self.request_handler.mark_completed(req_id);
+                }
             }
             return;
         }
@@ -2258,14 +2298,31 @@ impl KlineChart {
                     .map(|kline| kline.time)
                     .max()
                     .expect("non-empty TPO history page");
-                let composite_page = self
+                let KlineChartKind::Tpo { config } = &self.kind else {
+                    unreachable!("TPO branch must retain TPO config");
+                };
+                let first_session = config.profile_start(page_start);
+                let last_session = config.profile_start(page_end);
+                let session_end = last_session
+                    .saturating_add(config.normalized().profile_period.millis())
+                    .saturating_sub(1);
+                let canonical_sessions = self
                     .tpo_klines
-                    .composite_klines_in_range(page_start, page_end);
+                    .composite_klines_in_range(first_session, session_end);
+                let affected_sessions = klines_raw
+                    .iter()
+                    .map(|kline| config.profile_start(kline.time))
+                    .collect::<Vec<_>>();
 
-                // Each source can only expand the composite high/low envelope,
-                // so applying the returned page is equivalent to rebuilding all
-                // accumulated bars while keeping the UI work bounded per page.
-                tick_aggr.insert_tpo_klines(&composite_page);
+                // Re-materialize only the touched complete sessions from the
+                // canonical source-aware bar store. This can retract corrected
+                // rows and makes venue page arrival order irrelevant while
+                // preserving all profiles outside the page's sessions.
+                tick_aggr.replace_tpo_sessions_from_canonical(
+                    &affected_sessions,
+                    &canonical_sessions,
+                    &self.raw_trades,
+                );
                 self.chart.last_price = tick_aggr
                     .datapoints
                     .last()
@@ -2375,7 +2432,73 @@ impl KlineChart {
         self.last_tick
     }
 
+    pub fn has_pending_live_redraw(&self) -> bool {
+        self.pending_live_redraw
+    }
+
+    fn invalidate_live_render(&mut self) {
+        self.invalidate_live_render_at(Instant::now());
+    }
+
+    fn invalidate_live_render_at(&mut self, now: Instant) {
+        if now.saturating_duration_since(self.last_live_redraw) >= LIVE_REDRAW_INTERVAL {
+            self.flush_live_render(now);
+        } else {
+            self.pending_live_redraw = true;
+        }
+    }
+
+    fn flush_live_render(&mut self, now: Instant) {
+        // Every indicator data hook invalidates its own geometry. Clearing all
+        // subplot caches here rebuilt unchanged indicators (notably OI) on
+        // every trade batch, so live publication only clears the shared main
+        // chart canvas. Full viewport/config/history invalidation still clears
+        // every indicator through `invalidate`.
+        self.invalidate_render(None, false);
+        self.last_live_redraw = now;
+    }
+
+    /// Run periodic fetch/overlay maintenance without discarding chart and
+    /// indicator geometry when neither data nor the viewport changed.
+    pub fn maintain(&mut self, now: Instant) -> Option<Action> {
+        if self.pending_live_redraw
+            && now.saturating_duration_since(self.last_live_redraw) >= LIVE_REDRAW_INTERVAL
+        {
+            self.flush_live_render(now);
+        }
+        self.last_tick = now;
+
+        if self.sync_previous_value_areas() {
+            // Previous Value Areas are painted on the main canvas. Their
+            // source/config revision changed, but axes and subplot caches did
+            // not.
+            self.chart.cache.main.clear();
+        }
+
+        let overlay_action = if self.indicators[KlineIndicator::LiquidityHeatmap].is_some() {
+            self.footprint_history
+                .liquidity
+                .as_mut()
+                .and_then(|runtime| runtime.heatmap.sync_overlay(&self.chart, now))
+        } else {
+            self.footprint_history.liquidity = None;
+            None
+        };
+
+        // A newly-enabled GPU overlay has no palette until the dashboard
+        // services RequestPalette. Give that one-time request priority.
+        overlay_action.or_else(|| self.fetch_missing_data())
+    }
+
     pub fn invalidate(&mut self, now: Option<Instant>) -> Option<Action> {
+        self.invalidate_render(now, true)
+    }
+
+    fn invalidate_render(
+        &mut self,
+        now: Option<Instant>,
+        clear_indicator_caches: bool,
+    ) -> Option<Action> {
         let chart = &mut self.chart;
 
         if let Some(autoscale) = chart.layout.autoscale {
@@ -2521,9 +2644,13 @@ impl KlineChart {
         }
 
         chart.cache.clear_all();
-        for indi in self.indicators.values_mut().filter_map(Option::as_mut) {
-            indi.clear_all_caches();
+        if clear_indicator_caches {
+            for indi in self.indicators.values_mut().filter_map(Option::as_mut) {
+                indi.clear_all_caches();
+            }
         }
+        self.pending_live_redraw = false;
+        self.last_live_redraw = Instant::now();
 
         let overlay_action = if self.indicators[KlineIndicator::LiquidityHeatmap].is_some() {
             self.footprint_history
@@ -2583,6 +2710,17 @@ impl KlineChart {
                 // backfill. Forget their ownership records as well; otherwise
                 // `fetch_footprint_history` keeps those venues permanently
                 // marked active and never retries them for the new indicator.
+                let stale_requests = self
+                    .footprint_history
+                    .trade_requests
+                    .keys()
+                    .copied()
+                    .collect::<Vec<_>>();
+                self.for_each_trade_history(|existing| {
+                    for req_id in &stale_requests {
+                        existing.discard_staged_source_trades(*req_id);
+                    }
+                });
                 self.footprint_history.trade_requests.clear();
                 self.footprint_history.oi_requests.clear();
                 self.footprint_history.fetch_handles.clear();
@@ -2718,6 +2856,7 @@ impl canvas::Program<Message> for KlineChart {
                     );
 
                     let qty_is_quote = self.footprint_qty_is_quote();
+                    let (visible_high, visible_low) = chart.price_range(&region);
                     render_data_source(
                         &self.data_source,
                         frame,
@@ -2752,6 +2891,8 @@ impl canvas::Program<Message> for KlineChart {
                                 imbalance,
                                 kline,
                                 &grouped,
+                                visible_high,
+                                visible_low,
                             );
                         },
                     );
@@ -2998,20 +3139,19 @@ fn draw_tpo_profiles(
         return;
     }
 
-    // Cap how many profiles we paint in one frame (safety under extreme zoom-out).
     let start_idx = earliest as usize;
     let end_idx = latest as usize;
-    const MAX_PROFILES_PER_FRAME: usize = TpoConfig::MAX_HISTORY_PROFILES as usize;
-
-    let visible_profiles = tick_aggr
-        .datapoints
-        .iter()
-        .rev()
-        .enumerate()
-        .filter(|(index, _)| *index >= start_idx && *index <= end_idx)
-        .take(MAX_PROFILES_PER_FRAME)
-        .filter_map(|(index, datapoint)| datapoint.tpo.as_ref().map(|profile| (index, profile)))
-        .collect::<Vec<_>>();
+    let visible_profiles = prepare_tpo_render(
+        &tick_aggr.datapoints,
+        start_idx,
+        end_idx,
+        config,
+        cell_width,
+        scaling,
+        row_step,
+        visible_high,
+        visible_low,
+    );
 
     // Paint extensions first so every profile and its labels remain legible on
     // top. Tick-chart indices are offsets from the newest profile, while the
@@ -3026,34 +3166,14 @@ fn draw_tpo_profiles(
         let extension_fill = palette.warning.base.color.scale_alpha(0.14);
         let extension_line = palette.warning.base.color.scale_alpha(0.42);
 
-        for (index, profile) in &visible_profiles {
-            let profile_right = interval_to_x(*index as u64)
-                + tpo_profile_half_width(profile, config, cell_width, scaling);
+        for prepared in &visible_profiles {
+            let profile_right = interval_to_x(prepared.offset as u64) + prepared.half_width;
 
-            for price in profile
-                .rows
-                .keys()
-                .copied()
-                .filter(|&price| profile.is_single_print(price))
-            {
-                let tag_x = first_future_tpo_tag_offset(&tick_aggr.datapoints, *index, price)
-                    .and_then(|tag_index| {
-                        tick_aggr
-                            .datapoints
-                            .iter()
-                            .rev()
-                            .nth(tag_index)
-                            .and_then(|datapoint| datapoint.tpo.as_ref())
-                            .map(|tag_profile| {
-                                interval_to_x(tag_index as u64)
-                                    - tpo_profile_half_width(
-                                        tag_profile,
-                                        config,
-                                        cell_width,
-                                        scaling,
-                                    )
-                            })
-                    })
+            for extension in &prepared.extensions {
+                let price = extension.price;
+                let tag_x = extension
+                    .tag
+                    .map(|tag| interval_to_x(tag.offset as u64) - tag.half_width)
                     .unwrap_or(visible_right)
                     .min(visible_right);
                 let width = tag_x - profile_right;
@@ -3084,17 +3204,20 @@ fn draw_tpo_profiles(
         }
     }
 
-    for (index, profile) in visible_profiles {
+    for prepared in visible_profiles {
         draw_tpo_profile(
             frame,
             &price_to_y,
-            interval_to_x(index as u64),
+            interval_to_x(prepared.offset as u64),
             cell_width,
             cell_height,
             scaling,
             palette,
             config,
-            profile,
+            prepared.profile,
+            prepared.max_row_count,
+            prepared.half_width * 2.0,
+            prepared.single_print_bounds,
             row_step,
             visible_high,
             visible_low,
@@ -3102,8 +3225,128 @@ fn draw_tpo_profiles(
     }
 }
 
-/// Return the first later profile that trades `price`, expressed as the same
-/// offset-from-newest index used by tick-chart rendering.
+#[derive(Clone, Copy)]
+struct TpoFutureTag {
+    offset: usize,
+    half_width: f32,
+}
+
+#[derive(Clone, Copy)]
+struct TpoSinglePrintExtension {
+    price: Price,
+    tag: Option<TpoFutureTag>,
+}
+
+struct PreparedTpoProfile<'a> {
+    offset: usize,
+    profile: &'a TpoProfile,
+    max_row_count: usize,
+    half_width: f32,
+    single_print_bounds: Option<(Price, Price)>,
+    extensions: Vec<TpoSinglePrintExtension>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_tpo_render<'a>(
+    datapoints: &'a [data::aggr::ticks::TickAccumulation],
+    start_idx: usize,
+    end_idx: usize,
+    config: TpoConfig,
+    cell_width: f32,
+    scaling: f32,
+    row_step: PriceStep,
+    visible_high: Price,
+    visible_low: Price,
+) -> Vec<PreparedTpoProfile<'a>> {
+    if end_idx < start_idx {
+        return Vec::new();
+    }
+
+    // Match the old paint cap exactly: it counted offset slots before dropping
+    // non-TPO datapoints. Profiles newer than the visible range still need to be
+    // visited because they can terminate an older profile's extension rail.
+    const MAX_PROFILES_PER_FRAME: usize = TpoConfig::MAX_HISTORY_PROFILES as usize;
+    let paint_end = end_idx.min(start_idx.saturating_add(MAX_PROFILES_PER_FRAME - 1));
+    let low = visible_low.min(visible_high);
+    let high = visible_low.max(visible_high);
+    let row_pad = row_step.units.max(0);
+    let extension_low = Price::from_units(low.units.saturating_sub(row_pad));
+    let extension_high = Price::from_units(high.units.saturating_add(row_pad));
+
+    // While walking newest-to-oldest, the latest value stored for a price is
+    // exactly the nearest later profile that tags it. This replaces one future
+    // profile scan per single-print row with one pass over all relevant rows.
+    let mut nearest_future: FxHashMap<Price, TpoFutureTag> = FxHashMap::default();
+    let mut prepared = Vec::new();
+
+    for (offset, datapoint) in datapoints.iter().rev().enumerate() {
+        if offset > paint_end {
+            break;
+        }
+        let Some(profile) = datapoint.tpo.as_ref() else {
+            continue;
+        };
+        let max_row_count = tpo_profile_max_row_count(profile);
+        let half_width = 0.5 * tpo_profile_width(config, max_row_count, cell_width, scaling);
+
+        if offset >= start_idx {
+            let single_print_bounds = if config.show_single_prints {
+                profile.single_print_bounds()
+            } else {
+                None
+            };
+            let extensions = if let Some((single_low, single_high)) = single_print_bounds {
+                profile
+                    .rows
+                    .iter()
+                    .filter(|(price, row)| {
+                        row.count() == 1
+                            && **price > single_low
+                            && **price < single_high
+                            && **price >= extension_low
+                            && **price <= extension_high
+                    })
+                    .map(|(price, _)| TpoSinglePrintExtension {
+                        price: *price,
+                        tag: nearest_future.get(price).copied(),
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            prepared.push(PreparedTpoProfile {
+                offset,
+                profile,
+                max_row_count,
+                half_width,
+                single_print_bounds,
+                extensions,
+            });
+        }
+
+        if config.show_single_prints {
+            let tag = TpoFutureTag { offset, half_width };
+            for price in profile.rows.keys() {
+                nearest_future.insert(*price, tag);
+            }
+        }
+    }
+
+    prepared
+}
+
+fn tpo_profile_max_row_count(profile: &TpoProfile) -> usize {
+    profile
+        .rows
+        .values()
+        .map(|row| row.count())
+        .max()
+        .unwrap_or(1)
+        .max(1)
+}
+
+/// Reference lookup retained only for equivalence tests.
+#[cfg(test)]
 fn first_future_tpo_tag_offset(
     datapoints: &[data::aggr::ticks::TickAccumulation],
     current_offset: usize,
@@ -3124,25 +3367,6 @@ fn first_future_tpo_tag_offset(
         })?;
     let tag_raw = future_start.checked_add(future_position)?;
     datapoints.len().checked_sub(tag_raw.checked_add(1)?)
-}
-
-fn tpo_profile_half_width(
-    profile: &TpoProfile,
-    config: TpoConfig,
-    cell_width: f32,
-    scaling: f32,
-) -> f32 {
-    0.5 * tpo_profile_width(
-        config,
-        profile
-            .rows
-            .values()
-            .map(|row| row.count())
-            .max()
-            .unwrap_or(1),
-        cell_width,
-        scaling,
-    )
 }
 
 /// Full on-screen width of a TPO profile silhouette. Shared by the profile
@@ -3179,6 +3403,9 @@ fn draw_tpo_profile(
     palette: &Extended,
     config: TpoConfig,
     profile: &TpoProfile,
+    max_row_count: usize,
+    profile_width: f32,
+    single_print_bounds: Option<(Price, Price)>,
     row_step: PriceStep,
     visible_high: Price,
     visible_low: Price,
@@ -3187,20 +3414,16 @@ fn draw_tpo_profile(
         return;
     }
 
-    let max_row_count = profile
-        .rows
-        .values()
-        .map(|row| row.count())
-        .max()
-        .unwrap_or(1)
-        .max(1);
+    let max_row_count = max_row_count.max(1);
 
     // Profile width always follows the period column. Never cap letter width by
     // row height — FitToVisible / large price ranges make cell_height tiny, and
     // that used to collapse the whole silhouette into a hairline.
     let scale = scaling.max(0.1);
     let min_chart_px = 1.0 / scale;
-    let profile_width = tpo_profile_width(config, max_row_count, cell_width, scaling);
+    if !profile_width.is_finite() || profile_width <= 0.0 {
+        return;
+    }
     let block_width = (profile_width / max_row_count as f32).max(min_chart_px * 0.5);
     if !block_width.is_finite() || block_width <= 0.0 {
         return;
@@ -3262,7 +3485,9 @@ fn draw_tpo_profile(
 
         let in_value_area = *price >= profile.value_area_low && *price <= profile.value_area_high;
         let is_poc = *price == profile.poc;
-        let is_single = config.show_single_prints && profile.is_single_print(*price);
+        let is_single = config.show_single_prints
+            && row.count() == 1
+            && single_print_bounds.is_some_and(|(low, high)| *price > low && *price < high);
 
         if config.show_poc && is_poc {
             frame.fill_rectangle(
@@ -3792,6 +4017,8 @@ fn draw_clusters(
     imbalance: Option<(usize, Option<usize>, bool)>,
     kline: &Kline,
     footprint: &KlineTrades,
+    visible_high: Price,
+    visible_low: Price,
 ) {
     let text_color = layout.pal.background.weakest.text;
     let max_cluster_qty = max_cluster_qty.max(1.0);
@@ -3804,6 +4031,11 @@ fn draw_clusters(
     let content_right = x_position + (layout.cell_w / 2.0) - inset;
 
     let mut table_layout: Option<TableLayout> = None;
+    // Retain one adjacent row because cell geometry and diagonal imbalance
+    // markers can overlap the viewport edge. Candle summaries and POC remain
+    // derived from the complete footprint below.
+    let draw_high = visible_high.add_steps(1, step);
+    let draw_low = visible_low.add_steps(-1, step);
 
     match layout.cluster {
         ClusterKind::VolumeProfile | ClusterKind::DeltaProfile => {
@@ -3818,6 +4050,9 @@ fn draw_clusters(
             let bar_alpha = if text_size.is_some() { 0.25 } else { 1.0 };
 
             for (price, group) in &footprint.trades {
+                if *price < draw_low || *price > draw_high {
+                    continue;
+                }
                 let buy_base = group.buy_qty.to_f64();
                 let sell_base = group.sell_qty.to_f64();
                 let buy_qty = usd_notional(*price, buy_base, qty_is_quote);
@@ -3938,6 +4173,9 @@ fn draw_clusters(
             let text_size =
                 cluster_label_size(half_width - 4.0 / scaling.max(0.1), layout.cell_h, scaling);
             for (price, group) in &footprint.trades {
+                if *price < draw_low || *price > draw_high {
+                    continue;
+                }
                 let buy_base = group.buy_qty.to_f64();
                 let sell_base = group.sell_qty.to_f64();
                 let buy_qty = usd_notional(*price, buy_base, qty_is_quote);
@@ -4082,6 +4320,9 @@ fn draw_clusters(
             let bar_alpha = if text_size.is_some() { 0.25 } else { 1.0 };
 
             for (price, group) in &footprint.trades {
+                if *price < draw_low || *price > draw_high {
+                    continue;
+                }
                 let buy_base = group.buy_qty.to_f64();
                 let sell_base = group.sell_qty.to_f64();
                 let buy_qty = usd_notional(*price, buy_base, qty_is_quote);
@@ -4896,9 +5137,43 @@ fn price_padding_from_pixels(cell_height: f32, tick_size: f32) -> f32 {
 mod tests {
     use super::*;
     use exchange::{Ticker, Trade, Volume, adapter::Exchange, unit::Qty};
+    use std::cell::Cell;
+    use std::rc::Rc;
     use std::sync::Mutex;
 
     static TRADE_FETCH_MODE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    struct CacheClearProbe {
+        clear_count: Rc<Cell<usize>>,
+        insert_count: Rc<Cell<usize>>,
+    }
+
+    impl KlineIndicatorImpl for CacheClearProbe {
+        fn clear_all_caches(&mut self) {
+            self.clear_count.set(self.clear_count.get() + 1);
+        }
+
+        fn clear_crosshair_caches(&mut self) {}
+
+        fn element<'a>(
+            &'a self,
+            _chart: &'a ViewState,
+            _data_labels_always_visible: bool,
+            _visible_range: std::ops::RangeInclusive<u64>,
+        ) -> Element<'a, Message> {
+            iced::widget::row![].into()
+        }
+
+        fn on_insert_trades(
+            &mut self,
+            trades: &[Trade],
+            _old_dp_len: usize,
+            _source: &PlotData<KlineDataPoint>,
+        ) {
+            self.insert_count
+                .set(self.insert_count.get() + trades.len());
+        }
+    }
 
     fn test_trade(price: f64, qty: f64, is_sell: bool) -> Trade {
         Trade {
@@ -4919,6 +5194,31 @@ mod tests {
             close: open,
             volume: Volume::TotalOnly(Qty::ZERO),
         }
+    }
+
+    fn tpo_single_print_fixture(config: TpoConfig, days: u64) -> (PriceStep, TickAggr) {
+        let step = PriceStep {
+            units: Price::from_f64(1.0).units,
+        };
+        let mut bars = Vec::new();
+        for day in 0..days {
+            let day_start = day * 86_400_000;
+            let shift = (day % 20) as f64;
+            for (block, low, high) in [(0_u64, 100.0, 500.0), (1, 100.0, 220.0), (2, 280.0, 500.0)]
+            {
+                let open = Price::from_f64(low + shift);
+                bars.push(Kline {
+                    time: UnixMs::new(day_start + block * 30 * 60_000),
+                    open,
+                    high: Price::from_f64(high + shift),
+                    low: Price::from_f64(low + shift),
+                    close: Price::from_f64(high + shift),
+                    volume: Volume::TotalOnly(Qty::ZERO),
+                });
+            }
+        }
+
+        (step, TickAggr::new_tpo_seeded(config, step, &bars, &[]))
     }
 
     #[test]
@@ -4965,6 +5265,156 @@ mod tests {
     }
 
     #[test]
+    fn prepared_tpo_extensions_match_reference_lookup() {
+        let config = TpoConfig {
+            ticks_per_row: 1,
+            profiles_to_load: 8,
+            ..TpoConfig::default()
+        };
+        let (step, tick_aggr) = tpo_single_print_fixture(config, 8);
+        let prepared = prepare_tpo_render(
+            &tick_aggr.datapoints,
+            0,
+            tick_aggr.datapoints.len() - 1,
+            config,
+            44.0,
+            1.0,
+            step,
+            Price::from_f64(1_000.0),
+            Price::from_f64(0.0),
+        );
+
+        let mut extension_count = 0usize;
+        for prepared_profile in prepared {
+            let actual = prepared_profile
+                .extensions
+                .iter()
+                .map(|extension| (extension.price, extension.tag.map(|tag| tag.offset)))
+                .collect::<Vec<_>>();
+            let expected = prepared_profile
+                .profile
+                .single_print_prices()
+                .map(|price| {
+                    (
+                        price,
+                        first_future_tpo_tag_offset(
+                            &tick_aggr.datapoints,
+                            prepared_profile.offset,
+                            price,
+                        ),
+                    )
+                })
+                .collect::<Vec<_>>();
+            extension_count += actual.len();
+            assert_eq!(actual, expected, "offset={}", prepared_profile.offset);
+        }
+        assert!(extension_count > 0);
+    }
+
+    #[test]
+    fn prepared_tpo_extensions_are_culled_to_visible_rows_with_padding() {
+        let config = TpoConfig {
+            ticks_per_row: 1,
+            profiles_to_load: 4,
+            ..TpoConfig::default()
+        };
+        let (step, tick_aggr) = tpo_single_print_fixture(config, 4);
+        let prepared = prepare_tpo_render(
+            &tick_aggr.datapoints,
+            0,
+            tick_aggr.datapoints.len() - 1,
+            config,
+            44.0,
+            1.0,
+            step,
+            Price::from_f64(241.0),
+            Price::from_f64(240.0),
+        );
+        let padded_low = Price::from_units(Price::from_f64(240.0).units - step.units);
+        let padded_high = Price::from_units(Price::from_f64(241.0).units + step.units);
+        let extension_count = prepared
+            .iter()
+            .flat_map(|profile| &profile.extensions)
+            .inspect(|extension| {
+                assert!(extension.price >= padded_low);
+                assert!(extension.price <= padded_high);
+            })
+            .count();
+
+        assert!(extension_count > 0);
+        assert!(extension_count < 4 * 59);
+    }
+
+    /// Manual release-mode benchmark for the work performed when a TPO canvas
+    /// cache is rebuilt after zooming or panning. Kept ignored so ordinary test
+    /// runs stay deterministic and fast.
+    #[test]
+    #[ignore = "manual TPO render-preparation benchmark"]
+    fn benchmark_tpo_single_print_extension_lookup() {
+        let config = TpoConfig {
+            ticks_per_row: 1,
+            profiles_to_load: TpoConfig::MAX_HISTORY_PROFILES,
+            ..TpoConfig::default()
+        };
+        let (step, tick_aggr) =
+            tpo_single_print_fixture(config, u64::from(TpoConfig::MAX_HISTORY_PROFILES));
+        assert_eq!(
+            tick_aggr.datapoints.len(),
+            usize::from(TpoConfig::MAX_HISTORY_PROFILES)
+        );
+
+        let mut samples = Vec::new();
+        let mut final_checksum = 0usize;
+        for _ in 0..7 {
+            let started = std::time::Instant::now();
+            let prepared = prepare_tpo_render(
+                &tick_aggr.datapoints,
+                0,
+                tick_aggr.datapoints.len() - 1,
+                config,
+                44.0,
+                1.0,
+                step,
+                Price::from_f64(1_000_000.0),
+                Price::from_f64(-1_000_000.0),
+            );
+            let checksum = prepared
+                .iter()
+                .flat_map(|profile| &profile.extensions)
+                .fold(0usize, |checksum, extension| {
+                    checksum.wrapping_add(
+                        extension
+                            .tag
+                            .map_or(usize::MAX, |future_tag| future_tag.offset),
+                    )
+                });
+            std::hint::black_box(&prepared);
+            std::hint::black_box(checksum);
+            final_checksum = checksum;
+            samples.push(started.elapsed());
+        }
+        assert_eq!(
+            final_checksum, 1_677_960,
+            "render-preparation truth changed"
+        );
+        samples.sort_unstable();
+        let median = samples[samples.len() / 2];
+        println!(
+            "TPO render preparation optimized: profiles={} rows={} median_ms={:.3} checksum={final_checksum}",
+            tick_aggr.datapoints.len(),
+            tick_aggr
+                .datapoints
+                .iter()
+                .map(|datapoint| datapoint
+                    .tpo
+                    .as_ref()
+                    .map_or(0, |profile| profile.rows.len()))
+                .sum::<usize>(),
+            median.as_secs_f64() * 1_000.0,
+        );
+    }
+
+    #[test]
     fn tpo_history_boundary_aligns_to_the_profile_session() {
         let config = TpoConfig {
             session_start_minutes_utc: 8 * 60 + 30,
@@ -4983,7 +5433,7 @@ mod tests {
     }
 
     #[test]
-    fn incremental_aggregate_tpo_pages_match_a_full_rebuild() {
+    fn incremental_aggregate_tpo_pages_match_a_full_rebuild_for_any_source_order() {
         let primary = TickerInfo::new(
             Ticker::new("BTCUSDT", Exchange::BinanceLinear),
             1.0,
@@ -5016,44 +5466,81 @@ mod tests {
             tpo_seed_bar(3, 101.0, 105.0),
         ];
 
-        let mut aggregator = KlineAggregator::new(&feed);
-        let mut incremental = TickAggr::new_tpo_seeded(config, step, &[], &[]);
-        for (source, page) in [
-            (primary, primary_first.as_slice()),
-            (primary, primary_second.as_slice()),
-            (secondary, secondary_page.as_slice()),
+        for pages in [
+            [
+                (primary, primary_first.as_slice()),
+                (primary, primary_second.as_slice()),
+                (secondary, secondary_page.as_slice()),
+            ],
+            [
+                (secondary, secondary_page.as_slice()),
+                (primary, primary_second.as_slice()),
+                (primary, primary_first.as_slice()),
+            ],
         ] {
-            aggregator.insert(source, page);
-            let start = page.iter().map(|bar| bar.time).min().unwrap();
-            let end = page.iter().map(|bar| bar.time).max().unwrap();
-            incremental.insert_tpo_klines(&aggregator.composite_klines_in_range(start, end));
-        }
+            let mut aggregator = KlineAggregator::new(&feed);
+            let mut incremental = TickAggr::new_tpo_seeded(config, step, &[], &[]);
+            for (source, page) in pages {
+                aggregator.insert(source, page);
+                let affected = page
+                    .iter()
+                    .map(|bar| config.profile_start(bar.time))
+                    .collect::<Vec<_>>();
+                let start = *affected.iter().min().unwrap();
+                let end = affected
+                    .iter()
+                    .max()
+                    .unwrap()
+                    .saturating_add(config.profile_period.millis())
+                    .saturating_sub(1);
+                incremental.replace_tpo_sessions_from_canonical(
+                    &affected,
+                    &aggregator.composite_klines_in_range(start, end),
+                    &[],
+                );
+            }
 
-        let rebuilt = TickAggr::new_tpo_seeded(config, step, &aggregator.composite_klines(), &[]);
-        assert_eq!(incremental.datapoints.len(), rebuilt.datapoints.len());
-        for (actual, expected) in incremental.datapoints.iter().zip(&rebuilt.datapoints) {
-            assert_eq!(actual.kline.open, expected.kline.open);
-            assert_eq!(actual.kline.high, expected.kline.high);
-            assert_eq!(actual.kline.low, expected.kline.low);
-            assert_eq!(actual.kline.close, expected.kline.close);
-            let actual = actual.tpo.as_ref().unwrap();
-            let expected = expected.tpo.as_ref().unwrap();
-            assert_eq!(actual.poc, expected.poc);
-            assert_eq!(actual.value_area_high, expected.value_area_high);
-            assert_eq!(actual.value_area_low, expected.value_area_low);
-            assert_eq!(actual.total_tpos, expected.total_tpos);
-            assert_eq!(
-                actual
-                    .rows
-                    .iter()
-                    .map(|(price, row)| (*price, row.blocks.clone()))
-                    .collect::<Vec<_>>(),
-                expected
-                    .rows
-                    .iter()
-                    .map(|(price, row)| (*price, row.blocks.clone()))
-                    .collect::<Vec<_>>()
-            );
+            let rebuilt =
+                TickAggr::new_tpo_seeded(config, step, &aggregator.composite_klines(), &[]);
+            assert_eq!(incremental.datapoints.len(), rebuilt.datapoints.len());
+            for (actual, expected) in incremental.datapoints.iter().zip(&rebuilt.datapoints) {
+                assert_eq!(actual.kline.open, expected.kline.open);
+                assert_eq!(actual.kline.high, expected.kline.high);
+                assert_eq!(actual.kline.low, expected.kline.low);
+                assert_eq!(actual.kline.close, expected.kline.close);
+                let actual = actual.tpo.as_ref().unwrap();
+                let expected = expected.tpo.as_ref().unwrap();
+                assert_eq!(actual.start, expected.start);
+                assert_eq!(actual.end, expected.end);
+                assert_eq!(actual.brackets.len(), expected.brackets.len());
+                for (block, actual_range) in &actual.brackets {
+                    let expected_range = &expected.brackets[block];
+                    assert_eq!(actual_range.low, expected_range.low);
+                    assert_eq!(actual_range.high, expected_range.high);
+                }
+                assert_eq!(actual.poc, expected.poc);
+                assert_eq!(actual.value_area_high, expected.value_area_high);
+                assert_eq!(actual.value_area_low, expected.value_area_low);
+                assert_eq!(actual.initial_balance_high, expected.initial_balance_high);
+                assert_eq!(actual.initial_balance_low, expected.initial_balance_low);
+                assert_eq!(actual.total_tpos, expected.total_tpos);
+                assert_eq!(actual.first_time, expected.first_time);
+                assert_eq!(actual.last_time, expected.last_time);
+                assert_eq!(actual.open, expected.open);
+                assert_eq!(actual.close, expected.close);
+                assert_eq!(
+                    actual
+                        .rows
+                        .iter()
+                        .map(|(price, row)| (*price, row.blocks.clone()))
+                        .collect::<Vec<_>>(),
+                    expected
+                        .rows
+                        .iter()
+                        .map(|(price, row)| (*price, row.blocks.clone()))
+                        .collect::<Vec<_>>()
+                );
+            }
         }
     }
 
@@ -5082,6 +5569,7 @@ mod tests {
         );
         chart.set_feed(ResolvedFeed::direct(source));
         assert!(chart.is_empty());
+        chart.invalidate(None);
 
         let mut trade = test_trade(67_000.0, 0.01, false);
         trade.time = UnixMs::now();
@@ -5089,6 +5577,149 @@ mod tests {
 
         assert!(!chart.is_empty());
         assert!(chart.chart.latest_x > 0);
+        assert_eq!(chart.raw_trades.len(), 1);
+        assert_eq!(chart.raw_trades[0].time, trade.time);
+        assert_eq!(chart.raw_trades[0].price, trade.price);
+        assert_eq!(chart.raw_trades[0].qty, trade.qty);
+        assert_eq!(chart.raw_trades[0].is_sell, trade.is_sell);
+        assert!(chart.has_pending_live_redraw());
+        let _ = chart.maintain(Instant::now() + LIVE_REDRAW_INTERVAL + Duration::from_millis(1));
+        assert!(!chart.has_pending_live_redraw());
+        assert_eq!(chart.raw_trades.len(), 1);
+    }
+
+    #[test]
+    fn live_publication_keeps_unchanged_indicator_geometry_cached() {
+        let source = TickerInfo::new(
+            Ticker::new("BTCUSDT", Exchange::BinanceLinear),
+            0.1,
+            0.001,
+            None,
+        );
+        let mut chart = KlineChart::new(
+            ViewConfig::default(),
+            Basis::Time(Timeframe::M5),
+            PriceStep::from(source.min_ticksize),
+            &[],
+            Vec::new(),
+            &[],
+            source,
+            &KlineChartKind::Footprint {
+                clusters: ClusterKind::Table,
+                scaling: ClusterScaling::default(),
+                studies: vec![],
+            },
+            None,
+        );
+        chart.set_feed(ResolvedFeed::direct(source));
+
+        let clear_count = Rc::new(Cell::new(0));
+        let insert_count = Rc::new(Cell::new(0));
+        chart.indicators[KlineIndicator::OpenInterest] = Some(Box::new(CacheClearProbe {
+            clear_count: Rc::clone(&clear_count),
+            insert_count: Rc::clone(&insert_count),
+        }));
+        chart.last_live_redraw = Instant::now() - LIVE_REDRAW_INTERVAL;
+
+        let mut trade = test_trade(67_000.0, 0.01, false);
+        trade.time = UnixMs::now();
+        chart.insert_trades(source, &[trade]);
+
+        assert_eq!(
+            insert_count.get(),
+            1,
+            "the market event must still be applied"
+        );
+        assert_eq!(chart.raw_trades.len(), 1);
+        assert_eq!(chart.raw_trades[0].time, trade.time);
+        assert_eq!(chart.raw_trades[0].price, trade.price);
+        assert_eq!(chart.raw_trades[0].qty, trade.qty);
+        assert_eq!(chart.raw_trades[0].is_sell, trade.is_sell);
+        assert_eq!(
+            clear_count.get(),
+            0,
+            "live publication must retain an unchanged indicator canvas"
+        );
+
+        chart.invalidate(None);
+        assert_eq!(
+            clear_count.get(),
+            1,
+            "full viewport/config invalidation still clears every indicator"
+        );
+    }
+
+    #[test]
+    fn live_render_coalescing_caps_publication_at_twenty_hz() {
+        let source = TickerInfo::new(
+            Ticker::new("BTCUSDT", Exchange::BinanceLinear),
+            0.1,
+            0.001,
+            None,
+        );
+        let mut chart = KlineChart::new(
+            ViewConfig::default(),
+            Basis::Time(Timeframe::M5),
+            PriceStep::from(source.min_ticksize),
+            &[],
+            Vec::new(),
+            &[],
+            source,
+            &KlineChartKind::Candles,
+            None,
+        );
+        let started = Instant::now();
+        chart.last_live_redraw = started;
+
+        let mut publications = 0usize;
+        for elapsed_ms in (10..=1_000).step_by(10) {
+            let previous = chart.last_live_redraw;
+            chart.invalidate_live_render_at(started + Duration::from_millis(elapsed_ms));
+            publications += usize::from(chart.last_live_redraw != previous);
+        }
+
+        assert_eq!(publications, 20);
+        assert!(!chart.has_pending_live_redraw());
+        assert_eq!(
+            chart.last_live_redraw,
+            started + Duration::from_millis(1_000)
+        );
+    }
+
+    #[test]
+    fn streamed_kline_truth_updates_before_its_deferred_render() {
+        let source = TickerInfo::new(
+            Ticker::new("BTCUSDT", Exchange::BinanceLinear),
+            0.1,
+            0.001,
+            None,
+        );
+        let mut chart = KlineChart::new(
+            ViewConfig::default(),
+            Basis::Time(Timeframe::M5),
+            PriceStep::from(source.min_ticksize),
+            &[],
+            Vec::new(),
+            &[],
+            source,
+            &KlineChartKind::Candles,
+            None,
+        );
+        chart.last_live_redraw = Instant::now();
+        let kline = seed_kline(UnixMs::new(1_800_000_000_000), 67_123.5);
+
+        chart.update_latest_kline(&kline);
+
+        let PlotData::TimeBased(series) = &chart.data_source else {
+            panic!("candlestick chart must remain time based");
+        };
+        let stored = &series.datapoints[&kline.time].kline;
+        assert_eq!(stored.time, kline.time);
+        assert_eq!(stored.open, kline.open);
+        assert_eq!(stored.high, kline.high);
+        assert_eq!(stored.low, kline.low);
+        assert_eq!(stored.close, kline.close);
+        assert!(chart.has_pending_live_redraw());
     }
 
     #[test]

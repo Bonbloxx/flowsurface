@@ -134,14 +134,17 @@ pub fn open_url(url: &str) -> Result<(), InternalError> {
 
 pub fn data_path(path_name: Option<&str>) -> PathBuf {
     if let Ok(path) = std::env::var("FLOWSURFACE_DATA_PATH") {
-        PathBuf::from(path)
+        resolve_data_path(PathBuf::from(path), path_name)
     } else {
         let data_dir = dirs_next::data_dir().unwrap_or_else(|| PathBuf::from("."));
-        if let Some(path_name) = path_name {
-            data_dir.join("flowsurface").join(path_name)
-        } else {
-            data_dir.join("flowsurface")
-        }
+        resolve_data_path(data_dir.join("flowsurface"), path_name)
+    }
+}
+
+fn resolve_data_path(root: PathBuf, path_name: Option<&str>) -> PathBuf {
+    match path_name {
+        Some(path_name) => root.join(path_name),
+        None => root,
     }
 }
 
@@ -251,4 +254,29 @@ pub fn cleanup_legacy_footprint_caches(current_schema_version: u16) -> usize {
         }
     }
     removed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_data_path;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn data_directory_override_keeps_state_logs_and_caches_separate() {
+        let root = PathBuf::from("isolated-flowsurface-data");
+
+        assert_eq!(resolve_data_path(root.clone(), None), root);
+        assert_eq!(
+            resolve_data_path(root.clone(), Some("saved-state.json")),
+            root.join("saved-state.json")
+        );
+        assert_eq!(
+            resolve_data_path(root.clone(), Some("flowsurface-current.log")),
+            root.join("flowsurface-current.log")
+        );
+        assert_eq!(
+            resolve_data_path(root.clone(), Some("market_data/footprint-days")),
+            root.join(Path::new("market_data/footprint-days"))
+        );
+    }
 }

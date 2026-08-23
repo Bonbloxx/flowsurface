@@ -101,7 +101,11 @@ impl VisibleRangeProfileIndicator {
 
 impl KlineIndicatorImpl for VisibleRangeProfileIndicator {
     fn clear_all_caches(&mut self) {
-        self.cache.borrow_mut().take();
+        // View changes invalidate the main chart canvas, not this authoritative
+        // aggregate snapshot. `sync_cache` keys it by source revision, group
+        // step, quantity unit and included candle span, while data hooks mark
+        // the precise history boundary that changed. Retaining it is what
+        // makes pan/zoom shifts and forming-bar replacement incremental.
         self.hover.borrow_mut().clear();
     }
 
@@ -385,6 +389,12 @@ impl VisibleRangeProfileIndicator {
         match kind {
             SyncKind::Rebuild => self.rebuild_cache(data_source, span, step_units, qty_is_quote),
             SyncKind::Shift { from } => {
+                // The previous rightmost candle may have received live prints
+                // since its snapshot was cached. Reconcile that exact delta
+                // before removing/retaining bars for the new span; otherwise
+                // subtracting the current footprint can consume volume owned
+                // by other candles at the same price.
+                self.refresh_live_bar(data_source, from.last, step_units, qty_is_quote);
                 self.shift_cache(data_source, from, span, step_units, qty_is_quote);
             }
             SyncKind::LiveOnly => {}
@@ -722,7 +732,7 @@ fn profile_metrics(levels: &FxHashMap<i64, LevelAcc>) -> (f64, f64, Option<i64>)
     let mut poc = None;
     for (price, level) in levels {
         let total = level.total();
-        if total > max_total {
+        if total > max_total || (total == max_total && poc.is_none_or(|current| *price < current)) {
             max_total = total;
             poc = Some(*price);
         }
@@ -875,6 +885,29 @@ mod tests {
     }
 
     #[test]
+    fn reconciling_live_snapshot_before_shift_preserves_other_candles() {
+        let step = Price::from_f64(0.1).units;
+        let stable = footprint(&[trade(100.0, 2.0, false)]);
+        let old_live = footprint(&[trade(100.0, 1.0, false)]);
+        let current_live = footprint(&[trade(100.0, 5.0, false)]);
+        let mut levels = FxHashMap::default();
+        add_footprint(&mut levels, &stable, step, false);
+        add_footprint(&mut levels, &old_live, step, false);
+
+        // What refresh_live_bar does before shift_cache removes the former
+        // live candle from the visible span.
+        let old_snapshot = footprint_snapshot(Some(&old_live), step, false);
+        sub_snapshot(&mut levels, &old_snapshot);
+        let current_snapshot = footprint_snapshot(Some(&current_live), step, false);
+        add_snapshot(&mut levels, &current_snapshot);
+        sub_footprint(&mut levels, &current_live, step, false);
+
+        let remaining = levels[&Price::from_f64(100.0).units];
+        assert!((remaining.buy - 200.0).abs() < 1e-6);
+        assert!(remaining.sell.abs() < 1e-6);
+    }
+
+    #[test]
     fn subtracting_a_bar_undoes_its_contribution() {
         let step = Price::from_f64(0.1).units;
         let left = footprint(&[trade(100.0, 2.0, false), trade(100.0, 1.0, true)]);
@@ -906,6 +939,30 @@ mod tests {
         assert!((max_total - 804.0).abs() < 1e-6);
         assert!((max_abs_delta - 804.0).abs() < 1e-6);
         assert_eq!(poc, Some(Price::from_f64(100.5).units));
+    }
+
+    #[test]
+    fn poc_ties_choose_the_lowest_price_deterministically() {
+        let mut levels = FxHashMap::default();
+        levels.insert(
+            Price::from_f64(101.0).units,
+            LevelAcc {
+                buy: 100.0,
+                sell: 0.0,
+            },
+        );
+        levels.insert(
+            Price::from_f64(100.0).units,
+            LevelAcc {
+                buy: 50.0,
+                sell: 50.0,
+            },
+        );
+
+        assert_eq!(
+            profile_metrics(&levels).2,
+            Some(Price::from_f64(100.0).units)
+        );
     }
 
     #[test]

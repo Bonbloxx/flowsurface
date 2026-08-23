@@ -12,8 +12,8 @@ use data::aggr::ticks::TickAggr;
 use data::aggr::time::TimeSeries;
 use data::chart::PlotData;
 use data::chart::kline::{KlineDataPoint, KlineTrades};
-use exchange::unit::{Price, PriceStep};
-use exchange::{Trade, UnixMs};
+use exchange::unit::{Price, PriceStep, qty::volume_size_unit};
+use exchange::{SizeUnit, Trade, UnixMs, adapter::MarketKind};
 use iced::theme::palette::Extended;
 use iced::widget::canvas::{self, Path, Stroke};
 use iced::{Alignment, Color, Element, Point, Rectangle, Size};
@@ -100,9 +100,10 @@ impl DailyDeltaIndicator {
         data_source: &PlotData<KlineDataPoint>,
         day_ts: u64,
         group_step: PriceStep,
+        qty_is_quote: bool,
     ) -> CachedDayProfile {
         let mut day = self.inner.display_day_at(day_ts);
-        apply_kline_day(&mut day, data_source, day_ts, group_step);
+        apply_kline_day(&mut day, data_source, day_ts, group_step, qty_is_quote);
         CachedDayProfile {
             day_ts,
             ..build_cached_profile(&day.stats, group_step)
@@ -182,6 +183,24 @@ impl KlineIndicatorImpl for DailyDeltaIndicator {
         }
     }
 
+    fn stage_source_trades(
+        &mut self,
+        req_id: uuid::Uuid,
+        source: exchange::TickerInfo,
+        trades: &[exchange::Trade],
+    ) {
+        self.inner.stage_source_trades(req_id, source, trades);
+    }
+
+    fn commit_staged_source_trades(&mut self, req_id: uuid::Uuid) {
+        self.inner.commit_staged_source_trades(req_id);
+        self.mark_all_changed();
+    }
+
+    fn discard_staged_source_trades(&mut self, req_id: uuid::Uuid) {
+        self.inner.discard_staged_source_trades(req_id);
+    }
+
     fn on_insert_klines(&mut self, klines: &[exchange::Kline], _source: &PlotData<KlineDataPoint>) {
         if let Some(earliest) = klines.iter().map(|kline| kline.time.as_u64()).min() {
             self.mark_days_dirty(earliest);
@@ -242,6 +261,8 @@ impl KlineIndicatorImpl for DailyDeltaIndicator {
         let (buy, sell) = delta_history_colors(palette);
         let axis = palette.background.strong.color.scale_alpha(0.75);
         let label = palette.background.base.text;
+        let qty_is_quote = volume_size_unit() == SizeUnit::Quote
+            || chart.ticker_info.market_type() == MarketKind::InversePerps;
 
         // Rebuild aggregated profiles only when inputs actually changed.
         // Panning and zooming reuse the cache instead of re-absorbing every
@@ -260,7 +281,9 @@ impl KlineIndicatorImpl for DailyDeltaIndicator {
             if needs_full_rebuild {
                 let days = display_day_starts(now, self.lookback_days)
                     .into_iter()
-                    .map(|day_ts| self.build_day_profile(data_source, day_ts, group_step))
+                    .map(|day_ts| {
+                        self.build_day_profile(data_source, day_ts, group_step, qty_is_quote)
+                    })
                     .collect::<Vec<_>>();
                 *self.cache.borrow_mut() = Some(OverlayCache {
                     full_rev: self.full_rev,
@@ -276,8 +299,12 @@ impl KlineIndicatorImpl for DailyDeltaIndicator {
                     let dirty_from = cache.dirty_from_day.take();
                     for profile in &mut cache.days {
                         if dirty_from.is_some_and(|from| profile.day_ts >= from) {
-                            *profile =
-                                self.build_day_profile(data_source, profile.day_ts, group_step);
+                            *profile = self.build_day_profile(
+                                data_source,
+                                profile.day_ts,
+                                group_step,
+                                qty_is_quote,
+                            );
                         }
                     }
                 }
@@ -416,6 +443,7 @@ fn apply_kline_day(
     data_source: &PlotData<KlineDataPoint>,
     day_ts: u64,
     step: PriceStep,
+    qty_is_quote: bool,
 ) {
     let day_end = day_ts.saturating_add(DAY_MS);
     // The shared history book already receives the same live and historical
@@ -432,6 +460,7 @@ fn apply_kline_day(
                 day_end,
                 step,
                 include_footprint,
+                qty_is_quote,
             );
         }
         PlotData::TickBased(tick_aggr) => {
@@ -440,7 +469,7 @@ fn apply_kline_day(
                 if time >= day_ts && time < day_end {
                     absorb_ohlc(&mut day.stats, dp.kline.high, dp.kline.low);
                     if include_footprint {
-                        absorb_footprint(&mut day.stats, &dp.footprint, step);
+                        absorb_footprint(&mut day.stats, &dp.footprint, step, qty_is_quote);
                     }
                 }
             }
@@ -455,13 +484,14 @@ fn absorb_time_series(
     day_end: u64,
     step: PriceStep,
     include_footprint: bool,
+    qty_is_quote: bool,
 ) {
     let start = UnixMs::new(day_ts);
     let end = UnixMs::new(day_end);
     for (_, dp) in series.datapoints.range(start..end) {
         absorb_ohlc(stats, dp.kline.high, dp.kline.low);
         if include_footprint {
-            absorb_footprint(stats, &dp.footprint, step);
+            absorb_footprint(stats, &dp.footprint, step, qty_is_quote);
         }
     }
 }
@@ -473,16 +503,27 @@ fn absorb_ohlc(stats: &mut DayStats, high: Price, low: Price) {
     stats.low = Some(stats.low.map_or(low, |value| value.min(low)));
 }
 
-fn absorb_footprint(stats: &mut DayStats, footprint: &KlineTrades, step: PriceStep) {
+fn absorb_footprint(
+    stats: &mut DayStats,
+    footprint: &KlineTrades,
+    step: PriceStep,
+    qty_is_quote: bool,
+) {
     if step.units <= 0 {
         return;
     }
     for (price, group) in &footprint.trades {
         let bucket = price.units.div_euclid(step.units) * step.units;
-        let px = price.to_f64();
+        let notional = |qty: f64| {
+            if qty_is_quote {
+                qty
+            } else {
+                price.to_f64() * qty
+            }
+        };
         let level = stats.levels.entry(bucket).or_default();
-        level.add_notional(false, px * group.buy_qty.to_f64());
-        level.add_notional(true, px * group.sell_qty.to_f64());
+        level.add_notional(false, notional(group.buy_qty.to_f64()));
+        level.add_notional(true, notional(group.sell_qty.to_f64()));
     }
 }
 
@@ -780,9 +821,27 @@ mod tests {
             .add_notional(false, 67_000.0);
         let before = display.stats.levels[&price.units].volume();
 
-        apply_kline_day(&mut display, &PlotData::TimeBased(series), day, step);
+        apply_kline_day(&mut display, &PlotData::TimeBased(series), day, step, false);
 
         assert_eq!(display.stats.levels[&price.units].volume(), before);
         assert_eq!(display.stats.levels.len(), 1);
+    }
+
+    #[test]
+    fn footprint_fallback_normalizes_base_and_quote_quantity_once() {
+        let step = PriceStep::from(source().min_ticksize);
+        let price = Price::from_f64(100.0);
+        let mut base = KlineTrades::new();
+        base.add_trade_to_nearest_bin(&trade(1, 100.0, 2.0, false), step);
+        let mut quote = KlineTrades::new();
+        quote.add_trade_to_nearest_bin(&trade(1, 100.0, 200.0, false), step);
+        let mut base_stats = DayStats::default();
+        let mut quote_stats = DayStats::default();
+
+        absorb_footprint(&mut base_stats, &base, step, false);
+        absorb_footprint(&mut quote_stats, &quote, step, true);
+
+        assert_eq!(base_stats.levels[&price.units].volume(), 200.0);
+        assert_eq!(quote_stats.levels[&price.units].volume(), 200.0);
     }
 }

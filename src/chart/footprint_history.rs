@@ -22,6 +22,7 @@ pub struct FootprintHistory {
     aggregate: bool,
     block_step: PriceStep,
     cutoff: Option<UnixMs>,
+    live_trade_starts: FxHashMap<TickerInfo, UnixMs>,
     trade_requests: FxHashMap<uuid::Uuid, FootprintTradeRequest>,
     oi_requests: FxHashSet<uuid::Uuid>,
     request_handler: RequestHandler,
@@ -46,6 +47,7 @@ impl FootprintHistory {
             aggregate,
             block_step,
             cutoff: None,
+            live_trade_starts: FxHashMap::default(),
             trade_requests: FxHashMap::default(),
             oi_requests: FxHashSet::default(),
             request_handler: RequestHandler::default(),
@@ -100,6 +102,12 @@ impl FootprintHistory {
     }
 
     pub fn insert_live_trades(&mut self, source: TickerInfo, trades: &[Trade]) {
+        if let Some(first_live) = trades.iter().map(|trade| trade.time).min() {
+            self.live_trade_starts
+                .entry(source)
+                .and_modify(|current| *current = (*current).min(first_live))
+                .or_insert(first_live);
+        }
         self.indicator.on_source_trades(source, trades, false);
     }
 
@@ -113,8 +121,9 @@ impl FootprintHistory {
         let Some(req_id) = req_id.filter(|id| self.trade_requests.contains_key(id)) else {
             return false;
         };
-        self.indicator.on_source_trades(source, trades, true);
+        self.indicator.stage_source_trades(req_id, source, trades);
         if batches_done {
+            self.indicator.commit_staged_source_trades(req_id);
             if let Some(request) = self.trade_requests.remove(&req_id) {
                 self.indicator.persist_cached_footprint_day(
                     request.source,
@@ -154,6 +163,7 @@ impl FootprintHistory {
     /// resolve, instead of the ranges being suppressed as pending overlaps.
     pub fn release_undispatched_requests(&mut self, ids: &[uuid::Uuid]) {
         for id in ids {
+            self.indicator.discard_staged_source_trades(*id);
             self.trade_requests.remove(id);
             self.oi_requests.remove(id);
             self.request_handler.remove(*id);
@@ -161,6 +171,7 @@ impl FootprintHistory {
     }
 
     pub fn finalize_fetch(&mut self, req_id: uuid::Uuid) {
+        self.indicator.commit_staged_source_trades(req_id);
         if let Some(request) = self.trade_requests.remove(&req_id) {
             self.indicator.persist_cached_footprint_day(
                 request.source,
@@ -173,6 +184,7 @@ impl FootprintHistory {
     }
 
     pub fn mark_fetch_failed(&mut self, req_id: uuid::Uuid) {
+        self.indicator.discard_staged_source_trades(req_id);
         self.trade_requests.remove(&req_id);
         self.oi_requests.remove(&req_id);
         // Retry via the handler's cooldown instead of pretending the day
@@ -184,6 +196,7 @@ impl FootprintHistory {
     }
 
     pub fn mark_fetch_no_data(&mut self, req_id: uuid::Uuid) {
+        self.indicator.discard_staged_source_trades(req_id);
         self.trade_requests.remove(&req_id);
         self.oi_requests.remove(&req_id);
         self.request_handler.mark_no_data(req_id);
@@ -196,10 +209,14 @@ impl FootprintHistory {
         self.last_invalidation
     }
 
+    pub fn has_pending_display_refresh(&self) -> bool {
+        self.indicator.has_pending_display_refresh()
+    }
+
     pub fn invalidate(&mut self, now: Option<Instant>) -> Option<Action> {
-        self.indicator.clear_all_caches();
         let now = now?;
         self.last_invalidation = now;
+        self.indicator.flush_display_if_due(false);
         self.fetch_missing_data()
     }
 
@@ -210,6 +227,10 @@ impl FootprintHistory {
         let mut specs = Vec::new();
 
         for source in self.active_sources().to_vec() {
+            let source_cutoff = self
+                .live_trade_starts
+                .get(&source)
+                .map_or(cutoff, |first_live| first_live.saturating_sub(1));
             let trade_history_available = match fetch_mode {
                 TradeFetchMode::Off => false,
                 TradeFetchMode::Exchange => {
@@ -219,8 +240,9 @@ impl FootprintHistory {
             };
 
             if trade_history_available {
-                self.indicator.prepare_footprint_history(source, cutoff);
-                for (start, end) in utc_day_ranges(cutoff, DAYS as u64) {
+                self.indicator
+                    .prepare_footprint_history(source, source_cutoff);
+                for (start, end) in utc_day_ranges(source_cutoff, DAYS as u64) {
                     let range = FetchRange::FootprintHistoryTrades(start, end);
                     let stream = StreamKind::Trades {
                         ticker_info: source,

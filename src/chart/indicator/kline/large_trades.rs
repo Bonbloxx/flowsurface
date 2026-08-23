@@ -387,6 +387,23 @@ impl KlineIndicatorImpl for LargeTradesIndicator {
         self.inner.on_source_trades(source, trades, historical);
     }
 
+    fn stage_source_trades(
+        &mut self,
+        req_id: uuid::Uuid,
+        source: exchange::TickerInfo,
+        trades: &[exchange::Trade],
+    ) {
+        self.inner.stage_source_trades(req_id, source, trades);
+    }
+
+    fn commit_staged_source_trades(&mut self, req_id: uuid::Uuid) {
+        self.inner.commit_staged_source_trades(req_id);
+    }
+
+    fn discard_staged_source_trades(&mut self, req_id: uuid::Uuid) {
+        self.inner.discard_staged_source_trades(req_id);
+    }
+
     fn set_large_trades_threshold(&mut self, min_notional_usd: f32) {
         self.set_threshold(min_notional_usd);
     }

@@ -20,6 +20,8 @@ use tokio_rustls::{
 };
 use url::Url;
 
+#[cfg(not(feature = "unbounded-channel"))]
+use futures::SinkExt;
 use futures::StreamExt;
 #[cfg(not(feature = "unbounded-channel"))]
 use futures::channel::mpsc::Sender;
@@ -63,11 +65,11 @@ enum AnySender<T> {
 }
 
 impl<T> AnySender<T> {
-    fn send(&mut self, item: T) -> Result<(), futures::channel::mpsc::TrySendError<T>> {
+    async fn send(&mut self, item: T) -> bool {
         match self {
             #[cfg(not(feature = "unbounded-channel"))]
-            AnySender::Bounded(tx) => tx.try_send(item),
-            AnySender::Unbounded(tx) => tx.unbounded_send(item),
+            AnySender::Bounded(tx) => tx.send(item).await.is_ok(),
+            AnySender::Unbounded(tx) => tx.unbounded_send(item).is_ok(),
         }
     }
 }
@@ -180,7 +182,8 @@ pub(super) trait WsAdapter {
     ///
     /// Adapters parse incoming data and return resulting `Event`s.
     /// The session loop sends them to the output channel.
-    /// If the output channel is full, events are silently dropped
+    /// A full bounded output channel applies backpressure so parsed market
+    /// events are never silently discarded.
     ///
     /// **Flush model**: non-trade adapters return events here directly.
     /// Trade adapters only buffer into [`TradeBuffer`] here and return
@@ -223,10 +226,12 @@ impl WsSession {
 
         let task = tokio::spawn(async move {
             if streams.is_empty() {
-                let _ = event_tx.send(Event::Disconnected(
-                    streams,
-                    "Empty stream payload".to_string(),
-                ));
+                let _ = event_tx
+                    .send(Event::Disconnected(
+                        streams,
+                        "Empty stream payload".to_string(),
+                    ))
+                    .await;
                 return;
             }
 
@@ -236,7 +241,9 @@ impl WsSession {
                 let transport = match adapter.connect().await {
                     Ok(t) => t,
                     Err(reason) => {
-                        let _ = event_tx.send(Event::Disconnected(Arc::clone(&streams), reason));
+                        let _ = event_tx
+                            .send(Event::Disconnected(Arc::clone(&streams), reason))
+                            .await;
                         tokio::time::sleep(backoff.delay()).await;
                         backoff.record_failure();
                         continue;
@@ -250,9 +257,9 @@ impl WsSession {
                 let io_handle = tokio::spawn(transport.read_frame(ping_payload, frame_tx));
 
                 for event in adapter.on_connected().await {
-                    let _ = event_tx.send(event);
+                    let _ = event_tx.send(event).await;
                 }
-                let _ = event_tx.send(Event::Connected(Arc::clone(&streams)));
+                let _ = event_tx.send(Event::Connected(Arc::clone(&streams))).await;
 
                 let tick_interval = adapter.tick_interval();
                 let tick_sleep = tokio::time::sleep(tick_interval);
@@ -271,8 +278,8 @@ impl WsSession {
                                     if !payload.is_empty() {
                                         match adapter.on_text(&payload).await {
                                             Ok(events) => {
-                                                for event in events {
-                                                    let _ = event_tx.send(event);
+                                                    for event in events {
+                                                        let _ = event_tx.send(event).await;
                                                 }
                                             }
                                             Err(reason) => {
@@ -291,7 +298,7 @@ impl WsSession {
                                                     match adapter.on_text(&payload).await {
                                                         Ok(events) => {
                                                             for event in events {
-                                                                let _ = event_tx.send(event);
+                                                                let _ = event_tx.send(event).await;
                                                             }
                                                         }
                                                         Err(reason) => {
@@ -324,7 +331,7 @@ impl WsSession {
                         }
                         _ = &mut tick_sleep => {
                             for event in adapter.on_tick().await {
-                                let _ = event_tx.send(event);
+                                let _ = event_tx.send(event).await;
                             }
                             tick_sleep
                                 .as_mut()
@@ -343,9 +350,11 @@ impl WsSession {
 
                 if let Some(reason) = disconnect_reason {
                     for event in adapter.on_disconnected(&reason).await {
-                        let _ = event_tx.send(event);
+                        let _ = event_tx.send(event).await;
                     }
-                    let _ = event_tx.send(Event::Disconnected(Arc::clone(&streams), reason));
+                    let _ = event_tx
+                        .send(Event::Disconnected(Arc::clone(&streams), reason))
+                        .await;
                 }
 
                 tokio::time::sleep(backoff.delay()).await;
@@ -384,36 +393,41 @@ impl WsTransport {
                     match msg.opcode {
                         OpCode::Text => {
                             let payload = Vec::from(&msg.payload[..]);
-                            if frame_tx.send(Ok(payload)).is_err() {
+                            if !frame_tx.send(Ok(payload)).await {
                                 break;
                             }
                         }
                         OpCode::Ping => {
                             let payload = Vec::from(msg.payload);
                             let _ = self.reply_pong(Payload::Owned(payload)).await;
-                            let _ = frame_tx.send(Ok(Vec::new()));
+                            let _ = frame_tx.send(Ok(Vec::new())).await;
                         }
                         OpCode::Close => {
-                            let _ = frame_tx.send(Err("Connection closed".into()));
+                            let _ = frame_tx.send(Err("Connection closed".into())).await;
                             break;
                         }
                         _ => {}
                     }
                 }
                 Ok(Err(e)) => {
-                    let _ = frame_tx.send(Err(format!("Error reading frame: {e}")));
+                    let _ = frame_tx
+                        .send(Err(format!("Error reading frame: {e}")))
+                        .await;
                     break;
                 }
                 Err(_elapsed) => {
                     if heartbeat.timed_out() {
-                        let _ =
-                            frame_tx.send(Err("Heartbeat timeout (no websocket activity)".into()));
+                        let _ = frame_tx
+                            .send(Err("Heartbeat timeout (no websocket activity)".into()))
+                            .await;
                         break;
                     }
 
                     if heartbeat.should_send_ping() {
                         if self.send_heartbeat_ping(ping_payload).await.is_err() {
-                            let _ = frame_tx.send(Err(HEARTBEAT_SEND_FAILED_REASON.into()));
+                            let _ = frame_tx
+                                .send(Err(HEARTBEAT_SEND_FAILED_REASON.into()))
+                                .await;
                             break;
                         }
                         heartbeat.record_ping_sent();

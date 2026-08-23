@@ -91,7 +91,7 @@ impl Chart for HeatmapChart {
         ))
     }
 
-    fn interval_keys(&self) -> Option<Vec<u64>> {
+    fn interval_keys(&self) -> Option<&[data::aggr::ticks::TickAccumulation]> {
         None
     }
 

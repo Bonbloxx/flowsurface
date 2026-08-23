@@ -4,6 +4,7 @@ pub mod timeseries;
 use crate::{chart::TEXT_SIZE, style::AZERET_MONO};
 
 use super::{Basis, Interaction, Message};
+use data::aggr::ticks::TickAccumulation;
 use data::chart::Autoscale;
 use data::config::timezone::TimeLabelKind;
 use data::util::round_to_tick;
@@ -233,7 +234,7 @@ pub struct AxisLabelsX<'a> {
     pub cell_width: f32,
     pub timezone: data::UserTimezone,
     pub chart_bounds: Rectangle,
-    pub interval_keys: Option<Vec<u64>>,
+    pub interval_keys: Option<&'a [TickAccumulation]>,
     pub autoscaling: Option<Autoscale>,
 }
 
@@ -285,9 +286,9 @@ impl AxisLabelsX<'_> {
 
                 let array_index = last_index - offset;
 
-                if let Some(timestamp) = interval_keys.get(array_index) {
+                if let Some(datapoint) = interval_keys.get(array_index) {
                     let label_content = self.timezone.format_with_kind(
-                        *timestamp as i64,
+                        datapoint.kline.time.as_u64() as i64,
                         TimeLabelKind::Crosshair { show_millis: true },
                     );
 
@@ -475,10 +476,10 @@ impl canvas::Program<Message> for AxisLabelsX<'_> {
 
             match self.basis {
                 Basis::Tick(_) => {
-                    if let Some(interval_keys) = &self.interval_keys {
+                    if let Some(interval_keys) = self.interval_keys {
                         let last_idx = interval_keys.len() - 1;
                         let mut last_x: Option<f32> = None;
-                        for (i, timestamp) in interval_keys.iter().enumerate() {
+                        for (i, datapoint) in interval_keys.iter().enumerate() {
                             let cell_index = -(last_idx as i32) + i as i32;
                             let x_position = cell_index as f32 * self.cell_width;
 
@@ -493,7 +494,7 @@ impl canvas::Program<Message> for AxisLabelsX<'_> {
 
                             if last_x.is_none_or(|lx| (snap_x - lx).abs() >= target_spacing) {
                                 let label_content = self.timezone.format_with_kind(
-                                    *timestamp as i64,
+                                    datapoint.kline.time.as_u64() as i64,
                                     TimeLabelKind::Axis {
                                         timeframe: exchange::Timeframe::MS100,
                                     },

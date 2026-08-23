@@ -107,7 +107,7 @@ struct Flowsurface {
 #[derive(Debug, Clone)]
 enum Message {
     Sidebar(dashboard::sidebar::Message),
-    MarketWsEvent(exchange::Event),
+    MarketWsEvents(Vec<exchange::Event>),
     Dashboard {
         /// If `None`, the active layout is used for the event.
         layout_id: Option<uuid::Uuid>,
@@ -215,48 +215,12 @@ impl Flowsurface {
 
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::MarketWsEvent(event) => {
-                let main_window_id = self.main_window.id;
-                let dashboard = self.active_dashboard_mut();
-
-                match event {
-                    exchange::Event::Connected(_streams) => {}
-                    exchange::Event::Disconnected(_streams, reason) => {
-                        log::info!("a stream disconnected from WS: {reason:?}");
-                    }
-                    exchange::Event::DepthReceived(stream, update_t, depth) => {
-                        let task = dashboard
-                            .ingest_depth(&stream, update_t, &depth, main_window_id)
-                            .map(move |msg| Message::Dashboard {
-                                layout_id: None,
-                                event: msg,
-                            });
-
-                        return task;
-                    }
-                    exchange::Event::TradesReceived(stream, update_t, buffer) => {
-                        let task = dashboard
-                            .ingest_trades(&stream, &buffer, update_t, main_window_id)
-                            .map(move |msg| Message::Dashboard {
-                                layout_id: None,
-                                event: msg,
-                            });
-
-                        if let Some(msg) = self.audio_stream.try_play_sound(&stream, &buffer) {
-                            self.notifications.push(Toast::error(msg));
-                        }
-
-                        return task;
-                    }
-                    exchange::Event::KlineReceived(stream, kline) => {
-                        return dashboard
-                            .update_latest_klines(&stream, &kline, main_window_id)
-                            .map(move |msg| Message::Dashboard {
-                                layout_id: None,
-                                event: msg,
-                            });
-                    }
-                }
+            Message::MarketWsEvents(events) => {
+                return Task::batch(
+                    events
+                        .into_iter()
+                        .map(|event| self.update_market_event(event)),
+                );
             }
             Message::Tick(now) => {
                 let main_window_id = self.main_window.id;
@@ -787,6 +751,47 @@ impl Flowsurface {
         Task::none()
     }
 
+    fn update_market_event(&mut self, event: exchange::Event) -> Task<Message> {
+        let main_window_id = self.main_window.id;
+
+        match event {
+            exchange::Event::Connected(_streams) => Task::none(),
+            exchange::Event::Disconnected(_streams, reason) => {
+                log::info!("a stream disconnected from WS: {reason:?}");
+                Task::none()
+            }
+            exchange::Event::DepthReceived(stream, update_t, depth) => self
+                .active_dashboard_mut()
+                .ingest_depth(&stream, update_t, &depth, main_window_id)
+                .map(move |msg| Message::Dashboard {
+                    layout_id: None,
+                    event: msg,
+                }),
+            exchange::Event::TradesReceived(stream, update_t, buffer) => {
+                let task = self
+                    .active_dashboard_mut()
+                    .ingest_trades(&stream, &buffer, update_t, main_window_id)
+                    .map(move |msg| Message::Dashboard {
+                        layout_id: None,
+                        event: msg,
+                    });
+
+                if let Some(msg) = self.audio_stream.try_play_sound(&stream, &buffer) {
+                    self.notifications.push(Toast::error(msg));
+                }
+
+                task
+            }
+            exchange::Event::KlineReceived(stream, kline) => self
+                .active_dashboard_mut()
+                .update_latest_klines(&stream, &kline, main_window_id)
+                .map(move |msg| Message::Dashboard {
+                    layout_id: None,
+                    event: msg,
+                }),
+        }
+    }
+
     fn view(&self, id: window::Id) -> Element<'_, Message> {
         let dashboard = self.active_dashboard();
         let sidebar_pos = self.sidebar.position();
@@ -891,7 +896,7 @@ impl Flowsurface {
         let exchange_streams = self
             .active_dashboard()
             .market_subscriptions(&self.data_sources.exchange)
-            .map(Message::MarketWsEvent);
+            .map(Message::MarketWsEvents);
 
         // Drive invalidation only as quickly as the visible panes require. The
         // shader heatmap uses a 60 Hz timer; ordinary panes stay event-driven

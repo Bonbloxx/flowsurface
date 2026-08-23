@@ -280,6 +280,20 @@ impl KlineIndicatorImpl for CumulativeDeltaIndicator {
             self.refresh_merged();
         }
     }
+
+    fn stage_source_trades(&mut self, req_id: uuid::Uuid, source: TickerInfo, trades: &[Trade]) {
+        self.inner.stage_source_trades(req_id, source, trades);
+    }
+
+    fn commit_staged_source_trades(&mut self, req_id: uuid::Uuid) {
+        self.inner.commit_staged_source_trades(req_id);
+        self.merged.invalidate_all();
+        self.refresh_merged();
+    }
+
+    fn discard_staged_source_trades(&mut self, req_id: uuid::Uuid) {
+        self.inner.discard_staged_source_trades(req_id);
+    }
 }
 
 struct MergedDay {

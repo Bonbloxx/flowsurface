@@ -131,12 +131,7 @@ impl<'a> canvas::Program<Message> for AxisXLabelCanvas<'a> {
             }
             iced::Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
                 let cursor_rel_pos = cursor.position_in(bounds)?;
-                let scroll_amount = match delta {
-                    mouse::ScrollDelta::Lines { y, .. } => *y * 0.1,
-                    mouse::ScrollDelta::Pixels { y, .. } => *y * 0.01,
-                };
-
-                let factor = (1.0 + scroll_amount).clamp(0.01, 100.0);
+                let factor = crate::widget::chart::wheel_zoom_factor(*delta);
 
                 Some(canvas::Action::publish(Message::ScrolledAxisX {
                     factor,

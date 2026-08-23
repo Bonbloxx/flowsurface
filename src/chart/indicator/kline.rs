@@ -174,6 +174,24 @@ pub trait KlineIndicatorImpl {
     ) {
     }
 
+    /// Accumulate a streamed historical request without exposing a partial
+    /// prefix to the canonical day books. Implementations commit the staged
+    /// delta only after the fetcher's terminal completion signal.
+    fn stage_source_trades(
+        &mut self,
+        _req_id: uuid::Uuid,
+        source: exchange::TickerInfo,
+        trades: &[Trade],
+    ) {
+        self.on_source_trades(source, trades, true);
+    }
+
+    /// Atomically publish every staged page owned by `req_id`.
+    fn commit_staged_source_trades(&mut self, _req_id: uuid::Uuid) {}
+
+    /// Discard every staged page owned by a failed, cancelled or stale fetch.
+    fn discard_staged_source_trades(&mut self, _req_id: uuid::Uuid) {}
+
     /// Source-aware open interest used only by Footprint History.
     fn on_source_open_interest(
         &mut self,
@@ -195,7 +213,8 @@ pub trait KlineIndicatorImpl {
         _config: data::chart::tpo::Config,
         _row_step: PriceStep,
         _now: UnixMs,
-    ) {
+    ) -> bool {
+        false
     }
 
     /// Drop cached UTC-day books so the next backfill is not merged on top.

@@ -9,6 +9,7 @@ use crate::connector::fetcher::{FetchRange, FetchSpec, ReqError, RequestHandler}
 use crate::style;
 use crate::widget::multi_split::{DRAG_SIZE, MultiSplit};
 use crate::widget::tooltip;
+use data::aggr::ticks::TickAccumulation;
 use data::chart::{Autoscale, Basis, PlotData, ViewConfig, indicator::Indicator};
 use exchange::unit::{Price, PriceStep};
 use exchange::{TickerInfo, UnixMs};
@@ -23,19 +24,10 @@ use iced::{
 };
 
 const ZOOM_SENSITIVITY: f32 = 30.0;
-const PX_PER_NOTCH: f32 = 120.0;
-const ZOOM_BASE_PER_NOTCH: f32 = 1.08;
-const MAX_ABS_NOTCHES_PER_EVENT: f32 = 6.0;
 const TEXT_SIZE: f32 = crate::style::text_size::BODY;
 
 pub(crate) fn wheel_zoom_delta(delta: mouse::ScrollDelta) -> f32 {
-    let notches = match delta {
-        mouse::ScrollDelta::Lines { y, .. } => y,
-        mouse::ScrollDelta::Pixels { y, .. } => y / PX_PER_NOTCH,
-    }
-    .clamp(-MAX_ABS_NOTCHES_PER_EVENT, MAX_ABS_NOTCHES_PER_EVENT);
-
-    let factor = ZOOM_BASE_PER_NOTCH.powf(notches);
+    let factor = crate::widget::chart::wheel_zoom_factor(delta);
     ZOOM_SENSITIVITY * (factor - 1.0)
 }
 
@@ -89,7 +81,7 @@ pub trait Chart: PlotConstants + canvas::Program<Message> {
 
     fn visible_timerange(&self) -> Option<(u64, u64)>;
 
-    fn interval_keys(&self) -> Option<Vec<u64>>;
+    fn interval_keys(&self) -> Option<&[TickAccumulation]>;
 
     fn autoscaled_coords(&self) -> Vector;
 

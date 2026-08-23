@@ -2933,6 +2933,17 @@ impl State {
         }
     }
 
+    /// Service periodic work while preserving render caches for chart panes
+    /// whose market data and viewport have not changed.
+    pub fn maintain(&mut self, now: Instant) -> Option<Action> {
+        match &mut self.content {
+            Content::Kline { chart, .. } => chart
+                .as_mut()
+                .and_then(|chart| chart.maintain(now).map(Action::Chart)),
+            _ => self.invalidate(now),
+        }
+    }
+
     pub fn park_for_inactive_layout(&mut self) {
         if let Content::ShaderHeatmap { chart, .. } = &mut self.content {
             *chart = None;
@@ -2944,7 +2955,15 @@ impl State {
         match &self.content {
             Content::Kline {
                 chart: Some(chart), ..
+            } if chart.has_pending_live_redraw() => {
+                Some(crate::chart::kline::LIVE_REDRAW_INTERVAL_MS)
+            }
+            Content::Kline {
+                chart: Some(chart), ..
             } if chart.needs_seed_backfill() => Some(100),
+            Content::FootprintHistory(Some(history)) if history.has_pending_display_refresh() => {
+                Some(100)
+            }
             Content::Kline { .. } | Content::FootprintHistory(_) | Content::Comparison(_) => {
                 Some(1000)
             }
@@ -2998,17 +3017,17 @@ impl State {
                 if interval_ms > 0 {
                     let interval_duration = std::time::Duration::from_millis(interval_ms);
                     if now.duration_since(previous_tick_time) >= interval_duration {
-                        return self.invalidate(now);
+                        return self.maintain(now);
                     }
                 }
             }
             (Some(interval_ms), None) => {
                 if interval_ms > 0 {
-                    return self.invalidate(now);
+                    return self.maintain(now);
                 }
             }
             (None, _) => {
-                return self.invalidate(now);
+                return self.maintain(now);
             }
         }
 

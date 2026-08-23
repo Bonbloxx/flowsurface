@@ -618,19 +618,39 @@ impl Profile {
     /// (a buying/selling tail), not an interior single print. A developing
     /// one-letter profile therefore does not paint every row as a single.
     pub fn is_single_print(&self, price: Price) -> bool {
-        if self.rows.get(&price).is_none_or(|row| row.count() != 1) {
-            return false;
-        }
+        self.rows.get(&price).is_some_and(|row| row.count() == 1)
+            && self
+                .single_print_bounds()
+                .is_some_and(|(low, high)| price > low && price < high)
+    }
 
-        let prices: Vec<Price> = self.rows.keys().copied().collect();
-        let Ok(index) = prices.binary_search(&price) else {
-            return false;
-        };
-        let is_single = |idx: usize| self.rows[&prices[idx]].count() == 1;
+    /// Outermost multi-TPO rows that bound every possible interior single print.
+    ///
+    /// A one-TPO row below the first structural row or above the last structural
+    /// row is an excess tail. Once these two boundaries are known, testing every
+    /// row is O(1) and rendering the complete single-print set is O(rows), rather
+    /// than rebuilding and rescanning a row vector for every price.
+    pub fn single_print_bounds(&self) -> Option<(Price, Price)> {
+        let low = self
+            .rows
+            .iter()
+            .find_map(|(price, row)| (row.count() != 1).then_some(*price))?;
+        let high = self
+            .rows
+            .iter()
+            .rev()
+            .find_map(|(price, row)| (row.count() != 1).then_some(*price))?;
 
-        let connected_to_high = (index..prices.len()).all(is_single);
-        let connected_to_low = (0..=index).all(is_single);
-        !connected_to_high && !connected_to_low
+        (low < high).then_some((low, high))
+    }
+
+    /// Iterate the exact interior single-print set in ascending price order.
+    pub fn single_print_prices(&self) -> impl Iterator<Item = Price> + '_ {
+        let bounds = self.single_print_bounds();
+        self.rows.iter().filter_map(move |(price, row)| {
+            (row.count() == 1 && bounds.is_some_and(|(low, high)| *price > low && *price < high))
+                .then_some(*price)
+        })
     }
 }
 
@@ -1026,5 +1046,72 @@ mod tests {
                 .keys()
                 .all(|price| !profile.is_single_print(*price))
         );
+    }
+
+    #[test]
+    fn optimized_single_print_set_matches_reference_for_all_short_row_patterns() {
+        fn reference(profile: &Profile, price: Price) -> bool {
+            if profile.rows.get(&price).is_none_or(|row| row.count() != 1) {
+                return false;
+            }
+
+            let prices = profile.rows.keys().copied().collect::<Vec<_>>();
+            let Ok(index) = prices.binary_search(&price) else {
+                return false;
+            };
+            let is_single = |idx: usize| profile.rows[&prices[idx]].count() == 1;
+            let connected_to_high = (index..prices.len()).all(is_single);
+            let connected_to_low = (0..=index).all(is_single);
+            !connected_to_high && !connected_to_low
+        }
+
+        for len in 0..=9usize {
+            for pattern in 0..(1usize << len) {
+                let rows = (0..len)
+                    .map(|index| {
+                        let blocks: &[u16] = if pattern & (1 << index) == 0 {
+                            &[0]
+                        } else {
+                            &[0, 1]
+                        };
+                        (Price::from_units(index as i64), row(blocks))
+                    })
+                    .collect();
+                let profile = Profile {
+                    start: UnixMs::new(0),
+                    end: UnixMs::new(1),
+                    rows,
+                    brackets: BTreeMap::new(),
+                    poc: Price::from_units(0),
+                    value_area_high: Price::from_units(0),
+                    value_area_low: Price::from_units(0),
+                    initial_balance_high: Price::from_units(0),
+                    initial_balance_low: Price::from_units(0),
+                    total_tpos: 0,
+                    first_time: UnixMs::new(0),
+                    last_time: UnixMs::new(0),
+                    open: Price::from_units(0),
+                    close: Price::from_units(0),
+                };
+
+                let expected = profile
+                    .rows
+                    .keys()
+                    .copied()
+                    .filter(|price| reference(&profile, *price))
+                    .collect::<Vec<_>>();
+                let actual = profile.single_print_prices().collect::<Vec<_>>();
+                assert_eq!(actual, expected, "len={len}, pattern={pattern:#b}");
+                for price in profile.rows.keys().copied() {
+                    assert_eq!(
+                        profile.is_single_print(price),
+                        reference(&profile, price),
+                        "len={len}, pattern={pattern:#b}, price={}",
+                        price.units
+                    );
+                }
+                assert!(!profile.is_single_print(Price::from_units(len as i64 + 1)));
+            }
+        }
     }
 }

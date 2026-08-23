@@ -3,6 +3,24 @@ pub mod heatmap;
 
 use chrono::{TimeZone, Utc};
 use exchange::TickerInfo;
+use iced::mouse;
+
+const WHEEL_SCROLL_PIXELS_PER_NOTCH: f32 = 120.0;
+const WHEEL_ZOOM_BASE_PER_NOTCH: f32 = 1.16;
+const MAX_ABS_WHEEL_NOTCHES_PER_EVENT: f32 = 4.0;
+
+pub(crate) fn wheel_zoom_factor(delta: mouse::ScrollDelta) -> f32 {
+    let notches = match delta {
+        mouse::ScrollDelta::Lines { y, .. } => y,
+        mouse::ScrollDelta::Pixels { y, .. } => y / WHEEL_SCROLL_PIXELS_PER_NOTCH,
+    }
+    .clamp(
+        -MAX_ABS_WHEEL_NOTCHES_PER_EVENT,
+        MAX_ABS_WHEEL_NOTCHES_PER_EVENT,
+    );
+
+    WHEEL_ZOOM_BASE_PER_NOTCH.powf(notches)
+}
 
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
 pub struct Zoom(pub usize);
@@ -222,6 +240,43 @@ fn time_ticks(min_x: u64, max_x: u64, px_per_ms: f32, min_px: f32) -> (Vec<u64>,
         }
     }
     (out, step)
+}
+
+#[cfg(test)]
+mod wheel_zoom_tests {
+    use super::*;
+
+    fn assert_close(actual: f32, expected: f32) {
+        assert!(
+            (actual - expected).abs() < 1.0e-6,
+            "expected {expected}, got {actual}"
+        );
+    }
+
+    #[test]
+    fn one_notch_uses_the_stronger_scale_step_in_both_directions() {
+        let zoom_in = wheel_zoom_factor(mouse::ScrollDelta::Lines { x: 0.0, y: 1.0 });
+        let zoom_out = wheel_zoom_factor(mouse::ScrollDelta::Lines { x: 0.0, y: -1.0 });
+
+        assert_close(zoom_in, 1.16);
+        assert_close(zoom_in * zoom_out, 1.0);
+    }
+
+    #[test]
+    fn pixel_and_line_wheel_events_have_the_same_notch_scale() {
+        let line = wheel_zoom_factor(mouse::ScrollDelta::Lines { x: 0.0, y: 1.0 });
+        let pixels = wheel_zoom_factor(mouse::ScrollDelta::Pixels { x: 0.0, y: 120.0 });
+
+        assert_close(line, pixels);
+    }
+
+    #[test]
+    fn unusually_large_wheel_events_are_bounded() {
+        let bounded = wheel_zoom_factor(mouse::ScrollDelta::Lines { x: 0.0, y: 4.0 });
+        let noisy = wheel_zoom_factor(mouse::ScrollDelta::Lines { x: 0.0, y: 100.0 });
+
+        assert_close(noisy, bounded);
+    }
 }
 
 pub mod domain {

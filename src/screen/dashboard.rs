@@ -34,12 +34,99 @@ use exchange::{
 
 use iced::{
     Element, Length, Subscription, Task, Vector,
+    futures::{StreamExt, stream, stream::BoxStream},
     widget::{
         PaneGrid, center, container,
         pane_grid::{self, Configuration},
     },
 };
-use std::{collections::HashMap, time::Instant, vec};
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+    vec,
+};
+
+/// Losslessly apply live market data at a frame-sized cadence. User input is a
+/// separate iced event path and remains immediate.
+const MARKET_BATCH_INTERVAL: Duration = Duration::from_micros(33_333);
+
+#[derive(Clone, Hash)]
+enum MarketStreamPlan {
+    Depth(StreamConfig<TickerInfo>),
+    Trades(StreamConfig<Vec<TickerInfo>>),
+    Kline(StreamConfig<Vec<(TickerInfo, exchange::Timeframe)>>),
+}
+
+impl MarketStreamPlan {
+    fn connect(&self, handles: &AdapterHandles) -> BoxStream<'static, exchange::Event> {
+        match self {
+            Self::Depth(config) => handles.depth_stream(config),
+            Self::Trades(config) => handles.trade_stream(config),
+            Self::Kline(config) => handles.kline_stream(config),
+        }
+    }
+}
+
+#[derive(Clone, Hash)]
+struct MarketPlan {
+    handles: AdapterHandles,
+    streams: Vec<MarketStreamPlan>,
+}
+
+enum MarketBatchInput {
+    Event(exchange::Event),
+    Flush,
+}
+
+fn market_batch_ticks() -> BoxStream<'static, MarketBatchInput> {
+    let start = tokio::time::Instant::now() + MARKET_BATCH_INTERVAL;
+    let mut interval = tokio::time::interval_at(start, MARKET_BATCH_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    stream::unfold(interval, |mut interval| async move {
+        interval.tick().await;
+        Some((MarketBatchInput::Flush, interval))
+    })
+    .boxed()
+}
+
+fn ordered_market_batches(
+    inputs: BoxStream<'static, MarketBatchInput>,
+) -> BoxStream<'static, Vec<exchange::Event>> {
+    stream::unfold(
+        (inputs, Vec::<exchange::Event>::new()),
+        |(mut inputs, mut pending)| async move {
+            loop {
+                match inputs.next().await {
+                    Some(MarketBatchInput::Event(event)) => pending.push(event),
+                    Some(MarketBatchInput::Flush) if !pending.is_empty() => {
+                        let batch = std::mem::take(&mut pending);
+                        return Some((batch, (inputs, pending)));
+                    }
+                    Some(MarketBatchInput::Flush) => {}
+                    None if pending.is_empty() => return None,
+                    None => {
+                        let batch = std::mem::take(&mut pending);
+                        return Some((batch, (inputs, pending)));
+                    }
+                }
+            }
+        },
+    )
+    .boxed()
+}
+
+fn connect_market_plan(plan: &MarketPlan) -> BoxStream<'static, Vec<exchange::Event>> {
+    let streams = plan
+        .streams
+        .iter()
+        .map(|stream| stream.connect(&plan.handles))
+        .collect::<Vec<_>>();
+    let events = stream::select_all(streams).map(MarketBatchInput::Event);
+    let inputs = stream::select(events, market_batch_ticks());
+
+    ordered_market_batches(inputs.boxed())
+}
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -465,7 +552,7 @@ impl Dashboard {
                     return (Task::none(), None);
                 };
                 let Some(pane::Action::Chart(chart::Action::RequestFetch(reqs))) =
-                    state.invalidate(Instant::now())
+                    state.maintain(Instant::now())
                 else {
                     return (Task::none(), None);
                 };
@@ -1442,89 +1529,73 @@ impl Dashboard {
         }
     }
 
-    pub fn market_subscriptions(&self, handles: &AdapterHandles) -> Subscription<exchange::Event> {
-        let unique_streams = self
+    pub fn market_subscriptions(
+        &self,
+        handles: &AdapterHandles,
+    ) -> Subscription<Vec<exchange::Event>> {
+        let streams = self
             .streams
             .combined_used()
             .flat_map(|(exchange, specs)| {
-                let mut subs = vec![];
+                let mut streams = vec![];
 
                 if !specs.depth.is_empty() {
-                    let depth_subs = specs
-                        .depth
-                        .iter()
-                        .map(|(ticker, aggr, push_freq)| {
-                            let tick_mltp = match aggr {
-                                StreamTicksize::Client => None,
-                                StreamTicksize::ServerSide(tick_mltp) => Some(*tick_mltp),
-                            };
+                    streams.extend(specs.depth.iter().map(|(ticker, aggr, push_freq)| {
+                        let tick_mltp = match aggr {
+                            StreamTicksize::Client => None,
+                            StreamTicksize::ServerSide(tick_mltp) => Some(*tick_mltp),
+                        };
 
-                            let config = StreamConfig::new(
-                                *ticker,
-                                ticker.exchange(),
-                                tick_mltp,
-                                *push_freq,
-                            );
-
-                            let data = (handles.clone(), config);
-                            Subscription::run_with(data, |data| data.0.depth_stream(&data.1))
-                        })
-                        .collect::<Vec<_>>();
-
-                    if !depth_subs.is_empty() {
-                        subs.push(Subscription::batch(depth_subs));
-                    }
+                        MarketStreamPlan::Depth(StreamConfig::new(
+                            *ticker,
+                            ticker.exchange(),
+                            tick_mltp,
+                            *push_freq,
+                        ))
+                    }));
                 }
 
                 if !specs.trade.is_empty() {
-                    let trade_subs = specs
-                        .trade
-                        .chunks(MAX_TRADE_TICKERS_PER_STREAM)
-                        .map(|tickers| {
-                            let config = StreamConfig::new(
+                    streams.extend(specs.trade.chunks(MAX_TRADE_TICKERS_PER_STREAM).map(
+                        |tickers| {
+                            MarketStreamPlan::Trades(StreamConfig::new(
                                 tickers.to_vec(),
                                 exchange,
                                 None,
                                 PushFrequency::ServerDefault,
-                            );
-
-                            let data = (handles.clone(), config);
-                            Subscription::run_with(data, |data| data.0.trade_stream(&data.1))
-                        })
-                        .collect::<Vec<_>>();
-
-                    if !trade_subs.is_empty() {
-                        subs.push(Subscription::batch(trade_subs));
-                    }
+                            ))
+                        },
+                    ));
                 }
 
                 if !specs.kline.is_empty() {
-                    let kline_subs = specs
-                        .kline
-                        .chunks(MAX_KLINE_STREAMS_PER_STREAM)
-                        .map(|streams| {
-                            let config = StreamConfig::new(
-                                streams.to_vec(),
+                    streams.extend(specs.kline.chunks(MAX_KLINE_STREAMS_PER_STREAM).map(
+                        |stream_specs| {
+                            MarketStreamPlan::Kline(StreamConfig::new(
+                                stream_specs.to_vec(),
                                 exchange,
                                 None,
                                 PushFrequency::ServerDefault,
-                            );
-
-                            let data = (handles.clone(), config);
-                            Subscription::run_with(data, |data| data.0.kline_stream(&data.1))
-                        })
-                        .collect::<Vec<_>>();
-
-                    if !kline_subs.is_empty() {
-                        subs.push(Subscription::batch(kline_subs));
-                    }
+                            ))
+                        },
+                    ));
                 }
 
-                subs
+                streams
             })
-            .collect::<Vec<Subscription<exchange::Event>>>();
+            .collect::<Vec<_>>();
 
-        Subscription::batch(unique_streams)
+        if streams.is_empty() {
+            Subscription::none()
+        } else {
+            Subscription::run_with(
+                MarketPlan {
+                    handles: handles.clone(),
+                    streams,
+                },
+                connect_market_plan,
+            )
+        }
     }
 
     pub fn theme_updated(&mut self, main_window: window::Id, theme: &iced_core::Theme) {
@@ -1596,5 +1667,232 @@ impl From<fetcher::FetchUpdate> for Message {
                 req_id,
             } => Message::ErrorOccurred(Some(pane_id), DashboardError::Fetch(error, req_id)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use exchange::{
+        Ticker, Timeframe, Volume,
+        adapter::Exchange,
+        unit::{Price, Qty},
+    };
+    use iced::futures::{StreamExt, executor::block_on};
+    use std::sync::Arc;
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum VolumeSnapshot {
+        Total(i64),
+        BuySell(i64, i64),
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum EventSnapshot {
+        Connected(Vec<StreamKind>),
+        Disconnected(Vec<StreamKind>, String),
+        Depth {
+            stream: StreamKind,
+            update_t: u64,
+            bids: Vec<(i64, i64)>,
+            asks: Vec<(i64, i64)>,
+        },
+        Trades {
+            stream: StreamKind,
+            update_t: u64,
+            trades: Vec<(u64, bool, i64, i64)>,
+        },
+        Kline {
+            stream: StreamKind,
+            time: u64,
+            prices: [i64; 4],
+            volume: VolumeSnapshot,
+        },
+    }
+
+    fn snapshot(event: &exchange::Event) -> EventSnapshot {
+        match event {
+            exchange::Event::Connected(streams) => EventSnapshot::Connected(streams.to_vec()),
+            exchange::Event::Disconnected(streams, reason) => {
+                EventSnapshot::Disconnected(streams.to_vec(), reason.clone())
+            }
+            exchange::Event::DepthReceived(stream, update_t, depth) => EventSnapshot::Depth {
+                stream: *stream,
+                update_t: update_t.as_u64(),
+                bids: depth
+                    .bids
+                    .iter()
+                    .map(|(price, qty)| (price.units, qty.units))
+                    .collect(),
+                asks: depth
+                    .asks
+                    .iter()
+                    .map(|(price, qty)| (price.units, qty.units))
+                    .collect(),
+            },
+            exchange::Event::TradesReceived(stream, update_t, trades) => EventSnapshot::Trades {
+                stream: *stream,
+                update_t: update_t.as_u64(),
+                trades: trades
+                    .iter()
+                    .map(|trade| {
+                        (
+                            trade.time.as_u64(),
+                            trade.is_sell,
+                            trade.price.units,
+                            trade.qty.units,
+                        )
+                    })
+                    .collect(),
+            },
+            exchange::Event::KlineReceived(stream, kline) => EventSnapshot::Kline {
+                stream: *stream,
+                time: kline.time.as_u64(),
+                prices: [
+                    kline.open.units,
+                    kline.high.units,
+                    kline.low.units,
+                    kline.close.units,
+                ],
+                volume: match kline.volume {
+                    Volume::TotalOnly(total) => VolumeSnapshot::Total(total.units),
+                    Volume::BuySell(buy, sell) => VolumeSnapshot::BuySell(buy.units, sell.units),
+                },
+            },
+        }
+    }
+
+    fn source() -> TickerInfo {
+        TickerInfo::new(
+            Ticker::new("BTCUSDT", Exchange::BinanceLinear),
+            0.1,
+            0.001,
+            None,
+        )
+    }
+
+    #[test]
+    fn ordered_batches_preserve_every_event_field_and_trade_order() {
+        let source = source();
+        let trades_stream = StreamKind::Trades {
+            ticker_info: source,
+        };
+        let kline_stream = StreamKind::Kline {
+            ticker_info: source,
+            timeframe: Timeframe::M1,
+        };
+        let scope: Arc<[StreamKind]> = Arc::from(vec![trades_stream, kline_stream]);
+        let first_trades = vec![
+            Trade {
+                time: UnixMs::new(1_001),
+                is_sell: false,
+                price: Price::from_f64(67_000.1),
+                qty: Qty::from_f64(0.25),
+            },
+            Trade {
+                time: UnixMs::new(1_002),
+                is_sell: true,
+                price: Price::from_f64(67_000.0),
+                qty: Qty::from_f64(0.5),
+            },
+        ];
+        let mut depth = Depth::default();
+        depth
+            .bids
+            .insert(Price::from_f64(66_999.9), Qty::from_f64(3.0));
+        depth
+            .asks
+            .insert(Price::from_f64(67_000.2), Qty::from_f64(4.0));
+
+        let original = [
+            exchange::Event::Connected(Arc::clone(&scope)),
+            exchange::Event::TradesReceived(
+                trades_stream,
+                UnixMs::new(990),
+                first_trades.into_boxed_slice(),
+            ),
+            exchange::Event::DepthReceived(
+                StreamKind::Depth {
+                    ticker_info: source,
+                    depth_aggr: StreamTicksize::Client,
+                    push_freq: PushFrequency::ServerDefault,
+                },
+                UnixMs::new(1_010),
+                Arc::new(depth),
+            ),
+            exchange::Event::KlineReceived(
+                kline_stream,
+                Kline::new(
+                    UnixMs::new(60_000),
+                    67_000.0,
+                    67_100.0,
+                    66_900.0,
+                    67_050.0,
+                    Volume::BuySell(Qty::from_f64(12.0), Qty::from_f64(8.0)),
+                    source.min_ticksize,
+                ),
+            ),
+            exchange::Event::TradesReceived(
+                trades_stream,
+                UnixMs::new(1_023),
+                vec![Trade {
+                    time: UnixMs::new(1_024),
+                    is_sell: false,
+                    price: Price::from_f64(67_000.3),
+                    qty: Qty::from_f64(0.75),
+                }]
+                .into_boxed_slice(),
+            ),
+            exchange::Event::Disconnected(Arc::clone(&scope), "test disconnect".to_string()),
+        ];
+        let inputs = vec![
+            MarketBatchInput::Event(original[0].clone()),
+            MarketBatchInput::Event(original[1].clone()),
+            MarketBatchInput::Flush,
+            MarketBatchInput::Flush,
+            MarketBatchInput::Event(original[2].clone()),
+            MarketBatchInput::Event(original[3].clone()),
+            MarketBatchInput::Flush,
+            MarketBatchInput::Event(original[4].clone()),
+            MarketBatchInput::Event(original[5].clone()),
+        ];
+
+        let batches =
+            block_on(ordered_market_batches(stream::iter(inputs).boxed()).collect::<Vec<_>>());
+        assert_eq!(batches.iter().map(Vec::len).collect::<Vec<_>>(), [2, 2, 2]);
+
+        let expected = original.iter().map(snapshot).collect::<Vec<_>>();
+        let actual = batches.iter().flatten().map(snapshot).collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn ordered_batches_skip_empty_flushes_and_publish_the_final_tail() {
+        let trade_stream = StreamKind::Trades {
+            ticker_info: source(),
+        };
+        let tail = exchange::Event::TradesReceived(
+            trade_stream,
+            UnixMs::new(33),
+            vec![Trade {
+                time: UnixMs::new(34),
+                is_sell: true,
+                price: Price::from_f64(1.25),
+                qty: Qty::from_f64(2.5),
+            }]
+            .into_boxed_slice(),
+        );
+        let expected = snapshot(&tail);
+        let inputs = vec![
+            MarketBatchInput::Flush,
+            MarketBatchInput::Flush,
+            MarketBatchInput::Event(tail),
+        ];
+
+        let batches =
+            block_on(ordered_market_batches(stream::iter(inputs).boxed()).collect::<Vec<_>>());
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].len(), 1);
+        assert_eq!(snapshot(&batches[0][0]), expected);
     }
 }

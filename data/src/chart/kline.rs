@@ -142,7 +142,8 @@ impl GroupedTrades {
             self.buy_qty += trade.qty;
             self.buy_count += 1;
         }
-        self.last_time = trade.time;
+        self.first_time = self.first_time.min(trade.time);
+        self.last_time = self.last_time.max(trade.time);
     }
 
     fn merge(&mut self, other: &Self) {
@@ -943,6 +944,22 @@ mod footprint_rebin_tests {
         });
         let actual = footprint.max_cluster_qty_grouped(ClusterKind::Table, highest, lowest, step);
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn grouped_trade_time_bounds_ignore_insertion_order() {
+        let fine: PriceStep = MinTicksize::new(-1).into();
+        let mut footprint = KlineTrades::new();
+        let mut later = trade(77_500.0, 1.0, false);
+        later.time = UnixMs::new(3_000);
+        let mut earlier = trade(77_500.0, 1.0, true);
+        earlier.time = UnixMs::new(1_000);
+        footprint.add_trade_to_nearest_bin(&later, fine);
+        footprint.add_trade_to_nearest_bin(&earlier, fine);
+
+        let group = footprint.trades.values().next().expect("price group");
+        assert_eq!(group.first_time, UnixMs::new(1_000));
+        assert_eq!(group.last_time, UnixMs::new(3_000));
     }
 }
 

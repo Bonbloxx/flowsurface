@@ -100,7 +100,7 @@ impl KlineIndicatorImpl for PreviousValueAreaIndicator {
         config: TpoConfig,
         row_step: PriceStep,
         now: UnixMs,
-    ) {
+    ) -> bool {
         // `Some` means the letter-timeframe store changed. Rebuild even when
         // config and period bounds are unchanged — a first empty tick after
         // restore would otherwise cache `built_with` and ignore later pages.
@@ -128,7 +128,7 @@ impl KlineIndicatorImpl for PreviousValueAreaIndicator {
         self.range_key = range_key;
 
         if !needs_rebuild {
-            return;
+            return false;
         }
         self.areas = ranges
             .iter()
@@ -136,6 +136,7 @@ impl KlineIndicatorImpl for PreviousValueAreaIndicator {
                 profile_value_area(&self.bars, period, config, row_step).map(|area| (*period, area))
             })
             .collect();
+        true
     }
 
     fn draw_overlay(

@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 pub(crate) const DAY_MS: u64 = 24 * 60 * 60 * 1_000;
 const FIVE_MIN_MS: u64 = 5 * 60 * 1_000;
@@ -451,6 +452,12 @@ struct SourceHistory {
     oi: BTreeMap<u64, OiDay>,
 }
 
+#[derive(Debug)]
+struct HistoricalTradeStage {
+    source: Ticker,
+    days: BTreeMap<u64, DayStats>,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 struct CachedDayStats {
     schema_version: u16,
@@ -478,6 +485,9 @@ pub struct FootprintHistoryIndicator {
     histories: FxHashMap<Ticker, SourceHistory>,
     history_cutoffs: FxHashMap<Ticker, UnixMs>,
     historical_days_started: FxHashSet<(Ticker, u64)>,
+    /// Request-owned historical deltas. Pages are not visible and cannot be
+    /// persisted until their fetch reaches terminal completion.
+    historical_staging: FxHashMap<uuid::Uuid, HistoricalTradeStage>,
     /// Days whose book holds live trades captured after the backfill cutoff.
     /// Their first historical batch merges instead of rebuilding so the live
     /// seam is never destroyed (historical ranges never exceed the cutoff).
@@ -490,6 +500,8 @@ pub struct FootprintHistoryIndicator {
     track_display: bool,
     display: Box<[DisplayDay; DAYS]>,
     display_today: u64,
+    display_dirty: bool,
+    last_display_refresh: Option<Instant>,
 }
 
 impl FootprintHistoryIndicator {
@@ -502,6 +514,7 @@ impl FootprintHistoryIndicator {
             histories: FxHashMap::default(),
             history_cutoffs: FxHashMap::default(),
             historical_days_started: FxHashSet::default(),
+            historical_staging: FxHashMap::default(),
             live_seam_days: FxHashSet::default(),
             completed_days: FxHashSet::default(),
             cache_checkpoints: FxHashMap::default(),
@@ -509,6 +522,8 @@ impl FootprintHistoryIndicator {
             track_display: false,
             display: Box::default(),
             display_today: 0,
+            display_dirty: false,
+            last_display_refresh: None,
         }
     }
 
@@ -532,6 +547,39 @@ impl FootprintHistoryIndicator {
         self.display_today = day_start(now);
         let days = self.display_day_list(now, DAYS);
         *self.display = std::array::from_fn(|index| days.get(index).cloned().unwrap_or_default());
+        self.display_dirty = false;
+        self.last_display_refresh = Some(Instant::now());
+    }
+
+    pub(crate) fn has_pending_display_refresh(&self) -> bool {
+        self.track_display && self.display_dirty
+    }
+
+    /// Publish the derived venue-merged display at most ten times per second.
+    /// Source day books are updated immediately; only canvas publication is
+    /// bounded, so no execution is discarded or approximated.
+    pub(crate) fn flush_display_if_due(&mut self, force: bool) -> bool {
+        const DISPLAY_REFRESH_INTERVAL: Duration = Duration::from_millis(100);
+        if !self.track_display {
+            return false;
+        }
+        if day_start(UnixMs::now()) != self.display_today {
+            self.display_dirty = true;
+        }
+        if !self.display_dirty {
+            return false;
+        }
+        let now = Instant::now();
+        let due = force
+            || self
+                .last_display_refresh
+                .is_none_or(|previous| now.duration_since(previous) >= DISPLAY_REFRESH_INTERVAL);
+        if !due {
+            return false;
+        }
+        self.rebuild_display();
+        self.cache.clear_all();
+        true
     }
 
     pub(crate) fn set_lookback_days(&mut self, days: u16) {
@@ -703,11 +751,18 @@ impl FootprintHistoryIndicator {
         if !self.retain.large_trades && Self::day_is_complete(UnixMs::new(day), covered_through) {
             stats.large_trades.clear();
         }
-        self.histories
-            .entry(source.ticker)
-            .or_default()
-            .days
-            .insert(day, stats);
+        let history = self.histories.entry(source.ticker).or_default();
+        if self.live_seam_days.contains(&(source.ticker, day)) {
+            // Live prints can arrive before the first cache lookup. The cache
+            // covers only through the frozen backfill checkpoint, so merge it
+            // underneath the protected post-cutoff live layer instead of
+            // replacing the in-memory day.
+            let target = history.days.entry(day).or_default();
+            target.merge(&stats);
+            target.merge_large_trades_from(&stats);
+        } else {
+            history.days.insert(day, stats);
+        }
         self.cache_checkpoints
             .insert((source.ticker, day), Some(covered_through));
         if covered_through.as_u64() >= day.saturating_add(DAY_MS).saturating_sub(1) {
@@ -1107,6 +1162,7 @@ impl KlineIndicatorImpl for FootprintHistoryIndicator {
 
     fn reset_trade_history_backfill(&mut self) {
         self.historical_days_started.clear();
+        self.historical_staging.clear();
         self.live_seam_days.clear();
         self.completed_days.clear();
         self.cache_checkpoints.clear();
@@ -1126,7 +1182,9 @@ impl KlineIndicatorImpl for FootprintHistoryIndicator {
     }
 
     fn prepare_footprint_history(&mut self, source: TickerInfo, cutoff: UnixMs) {
-        self.history_cutoffs.insert(source.ticker, cutoff);
+        // A live print may already have established the seam before the first
+        // history-planner tick. Never move that boundary forward.
+        self.history_cutoffs.entry(source.ticker).or_insert(cutoff);
     }
 
     fn load_cached_footprint_day(
@@ -1167,6 +1225,15 @@ impl KlineIndicatorImpl for FootprintHistoryIndicator {
             .find(|candidate| candidate.ticker.same_market(&source.ticker))
             .map_or(source.ticker, |candidate| candidate.ticker);
 
+        if !historical && let Some(first_live) = trades.iter().map(|trade| trade.time).min() {
+            // Stop history immediately before the first accepted live print.
+            // This protects pre-hydration live data without replay overlap.
+            self.history_cutoffs
+                .entry(source_key)
+                .or_insert_with(|| first_live.saturating_sub(1));
+        }
+        let cutoff = self.history_cutoffs.get(&source_key).copied();
+
         if historical {
             let touched_days = trades
                 .iter()
@@ -1175,6 +1242,11 @@ impl KlineIndicatorImpl for FootprintHistoryIndicator {
             let history = self.histories.entry(source_key).or_default();
             for day in touched_days {
                 if self.historical_days_started.insert((source_key, day)) {
+                    let overlaps_live_seam = cutoff.is_some_and(|boundary| {
+                        trades
+                            .iter()
+                            .any(|trade| day_start(trade.time) == day && trade.time > boundary)
+                    });
                     // Authoritative history replaces whatever the day held,
                     // unless the book already captured live trades from after
                     // the backfill cutoff. Historical fetch ranges are clipped
@@ -1183,14 +1255,12 @@ impl KlineIndicatorImpl for FootprintHistoryIndicator {
                     // day at a time over the whole lookback, so today's batch
                     // can arrive hours into a session and wiping here would
                     // silently delete every large print seen in between.
-                    if !self.live_seam_days.remove(&(source_key, day)) {
+                    if !self.live_seam_days.remove(&(source_key, day)) || overlaps_live_seam {
                         history.days.remove(&day);
                     }
                 }
             }
         }
-
-        let cutoff = self.history_cutoffs.get(&source_key).copied();
         let retain = self.retain;
         let qty_is_quote = volume_size_unit() == SizeUnit::Quote
             || source.market_type() == MarketKind::InversePerps;
@@ -1216,8 +1286,72 @@ impl KlineIndicatorImpl for FootprintHistoryIndicator {
             }
             history.days.retain(|day, _| *day >= oldest);
         }
+        if self.track_display {
+            self.display_dirty = true;
+            self.flush_display_if_due(false);
+        } else {
+            self.clear_all_caches();
+        }
+    }
+
+    fn stage_source_trades(&mut self, req_id: uuid::Uuid, source: TickerInfo, trades: &[Trade]) {
+        let oldest = self.retain_oldest(UnixMs::now());
+        let source_key = self
+            .sources
+            .iter()
+            .find(|candidate| candidate.ticker.same_market(&source.ticker))
+            .map_or(source.ticker, |candidate| candidate.ticker);
+        let retain = self.retain;
+        let qty_is_quote = volume_size_unit() == SizeUnit::Quote
+            || source.market_type() == MarketKind::InversePerps;
+        let cutoff = self.history_cutoffs.get(&source_key).copied();
+        let stage = self
+            .historical_staging
+            .entry(req_id)
+            .or_insert_with(|| HistoricalTradeStage {
+                source: source_key,
+                days: BTreeMap::new(),
+            });
+        if !stage.source.same_market(&source_key) {
+            // A request id has exactly one source owner. Ignore a mismatched
+            // late page instead of allowing it to contaminate another venue.
+            return;
+        }
+        for trade in trades {
+            if trade.time.as_u64() < oldest || cutoff.is_some_and(|boundary| trade.time > boundary)
+            {
+                continue;
+            }
+            stage
+                .days
+                .entry(day_start(trade.time))
+                .or_default()
+                .insert_trade_with_unit(*trade, retain, qty_is_quote);
+        }
+    }
+
+    fn commit_staged_source_trades(&mut self, req_id: uuid::Uuid) {
+        let Some(stage) = self.historical_staging.remove(&req_id) else {
+            return;
+        };
+        let oldest = self.retain_oldest(UnixMs::now());
+        let history = self.histories.entry(stage.source).or_default();
+        for (day, stats) in stage.days {
+            if day < oldest {
+                continue;
+            }
+            let target = history.days.entry(day).or_default();
+            target.merge(&stats);
+            target.merge_large_trades_from(&stats);
+            self.historical_days_started.insert((stage.source, day));
+        }
+        history.days.retain(|day, _| *day >= oldest);
         self.rebuild_display();
         self.clear_all_caches();
+    }
+
+    fn discard_staged_source_trades(&mut self, req_id: uuid::Uuid) {
+        self.historical_staging.remove(&req_id);
     }
 
     fn on_source_open_interest(&mut self, source: TickerInfo, values: &[OpenInterest]) {
@@ -2090,6 +2224,68 @@ mod tests {
     }
 
     #[test]
+    fn bounded_display_refresh_keeps_authoritative_live_books_exact() {
+        let source = TickerInfo::new(
+            Ticker::new("BTCUSDT", Exchange::BinanceLinear),
+            0.1,
+            0.001,
+            None,
+        );
+        let now = UnixMs::now();
+        let mut indicator = FootprintHistoryIndicator::new_display();
+        indicator.configure_footprint_history(&[source], true);
+        indicator.on_source_trades(
+            source,
+            &[
+                trade(now.as_u64(), 100.0, 2.0, false),
+                trade(now.as_u64().saturating_add(1), 100.0, 1.0, true),
+            ],
+            false,
+        );
+
+        assert_eq!(
+            indicator.display_day_at(day_start(now)).stats.volume(),
+            300.0
+        );
+        assert!(indicator.has_pending_display_refresh());
+        assert!(indicator.flush_display_if_due(true));
+        assert!(!indicator.has_pending_display_refresh());
+        assert_eq!(indicator.display[0].stats.volume(), 300.0);
+    }
+
+    #[test]
+    fn failed_streamed_request_retry_commits_each_trade_once() {
+        let source = TickerInfo::new(
+            Ticker::new("BTCUSDT", Exchange::BinanceLinear),
+            0.1,
+            0.001,
+            None,
+        );
+        let day = day_start(UnixMs::now());
+        let first = trade(day + 1_000, 100.0, 2.0, false);
+        let second = trade(day + 2_000, 90.0, 1.0, true);
+        let failed_id = uuid::Uuid::new_v4();
+        let retry_id = uuid::Uuid::new_v4();
+
+        let mut actual = FootprintHistoryIndicator::new();
+        actual.configure_footprint_history(&[source], true);
+        actual.stage_source_trades(failed_id, source, &[first]);
+        actual.discard_staged_source_trades(failed_id);
+        assert_eq!(actual.display_day_at(day).stats, DayStats::default());
+        actual.stage_source_trades(retry_id, source, &[first]);
+        actual.stage_source_trades(retry_id, source, &[second]);
+        actual.commit_staged_source_trades(retry_id);
+
+        let mut expected = FootprintHistoryIndicator::new();
+        expected.configure_footprint_history(&[source], true);
+        expected.on_source_trades(source, &[first, second], true);
+        assert_eq!(
+            actual.display_day_at(day).stats,
+            expected.display_day_at(day).stats
+        );
+    }
+
+    #[test]
     fn source_toggles_recompose_cached_history_without_recalculation() {
         let binance = TickerInfo::new(
             Ticker::new("BTCUSDT", Exchange::BinanceLinear),
@@ -2222,6 +2418,43 @@ mod tests {
         assert_eq!(
             indicator.load_day_cache_from_path(source, day, &path),
             Some(covered_through)
+        );
+        assert_eq!(indicator.display_day_at(day).stats.volume(), 503.0);
+
+        std::fs::remove_file(&path).expect("remove cache file");
+        std::fs::remove_dir(&root).expect("remove cache directory");
+    }
+
+    #[test]
+    fn first_cache_hydration_preserves_preexisting_post_cutoff_live_trade() {
+        let source = TickerInfo::new(
+            Ticker::new("BTCUSDT", Exchange::BinanceLinear),
+            0.1,
+            0.001,
+            None,
+        );
+        let day = day_start(UnixMs::now());
+        let cutoff = UnixMs::new(day + 10_000);
+        let mut cached = DayStats::default();
+        cached.insert_trade(trade(day + 1_000, 100.0, 2.0, false));
+        let root = std::env::temp_dir().join(format!(
+            "flowsurface-footprint-first-hydration-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let path = root.join("day.fpbin");
+        FootprintHistoryIndicator::write_cached_day(&path, source, day, cutoff, &cached)
+            .expect("write cache");
+
+        let mut indicator = FootprintHistoryIndicator::new();
+        indicator.configure_footprint_history(&[source], true);
+        indicator.on_source_trades(source, &[trade(day + 11_000, 101.0, 3.0, false)], false);
+        assert_eq!(
+            indicator.history_cutoffs.get(&source.ticker),
+            Some(&UnixMs::new(day + 10_999))
+        );
+        assert_eq!(
+            indicator.load_day_cache_from_path(source, day, &path),
+            Some(cutoff)
         );
         assert_eq!(indicator.display_day_at(day).stats.volume(), 503.0);
 

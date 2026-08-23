@@ -23,8 +23,6 @@ const X_AXIS_HEIGHT: f32 = 24.0;
 const MIN_X_TICK_PX: f32 = 80.0;
 const TEXT_SIZE: f32 = style::text_size::BODY;
 
-const ZOOM_STEP_PCT: f32 = 0.05; // 5% per scroll "line"
-
 /// Gap breaker to avoid drawing across missing data
 const GAP_BREAK_MULTIPLIER: f32 = 3.0;
 
@@ -163,7 +161,7 @@ where
         Zoom::points(n)
     }
 
-    fn step_zoom_percent(&self, current: Zoom, zoom_in: bool) -> Zoom {
+    fn zoom_by_factor(&self, current: Zoom, factor: f32) -> Zoom {
         let len = self.max_points_available().max(MIN_ZOOM_POINTS);
         let base_n = if current.is_all() {
             len
@@ -171,13 +169,9 @@ where
             current.0.clamp(MIN_ZOOM_POINTS, MAX_ZOOM_POINTS)
         };
 
-        let step = ((base_n as f32) * ZOOM_STEP_PCT).ceil().max(1.0) as usize;
-
-        let new_n = if zoom_in {
-            base_n.saturating_sub(step).max(MIN_ZOOM_POINTS)
-        } else {
-            base_n.saturating_add(step).min(MAX_ZOOM_POINTS)
-        };
+        let new_n = ((base_n as f32) / factor)
+            .round()
+            .clamp(MIN_ZOOM_POINTS as f32, MAX_ZOOM_POINTS as f32) as usize;
 
         Zoom::points(new_n)
     }
@@ -804,15 +798,13 @@ where
                 let zone = regions.hit_test(cursor_pos);
 
                 match mouse_event {
-                    mouse::Event::WheelScrolled {
-                        delta: mouse::ScrollDelta::Lines { y, .. },
-                    } => {
+                    mouse::Event::WheelScrolled { delta } => {
                         if !matches!(zone, HitZone::Plot) {
                             return;
                         }
 
-                        let zoom_in = *y > 0.0;
-                        let new_zoom = self.step_zoom_percent(self.zoom, zoom_in);
+                        let factor = super::wheel_zoom_factor(*delta);
+                        let new_zoom = self.zoom_by_factor(self.zoom, factor);
 
                         if new_zoom != self.zoom {
                             shell.publish(M::from(LineComparisonEvent::ZoomChanged(
