@@ -116,7 +116,29 @@ impl From<&pane::State> for data::Pane {
         let streams = if pane.content.kind().supports_aggregate_feed() {
             pane.settings.aggregate_feed.map_or_else(
                 || pane.streams.clone().into_waiting(),
-                |feed| vec![data::stream::PersistStreamKind::AggregateTrades { feed }],
+                |feed| {
+                    let mut streams =
+                        vec![data::stream::PersistStreamKind::AggregateTrades { feed }];
+                    if pane.content.kind() == data::layout::pane::ContentKind::FootprintChart
+                        && let Some(data::chart::Basis::Time(timeframe)) =
+                            pane.settings.selected_basis
+                    {
+                        let ticker = pane
+                            .streams
+                            .find_ready_map(|stream| match stream {
+                                exchange::adapter::StreamKind::Kline { ticker_info, .. } => {
+                                    Some(ticker_info.ticker)
+                                }
+                                _ => None,
+                            })
+                            .or_else(|| feed.source_tickers().next());
+                        if let Some(ticker) = ticker {
+                            streams
+                                .push(data::stream::PersistStreamKind::Kline { ticker, timeframe });
+                        }
+                    }
+                    streams
+                },
             )
         } else {
             pane.streams.clone().into_waiting()

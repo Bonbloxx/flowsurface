@@ -418,16 +418,30 @@ fn apply_kline_day(
     step: PriceStep,
 ) {
     let day_end = day_ts.saturating_add(DAY_MS);
+    // The shared history book already receives the same live and historical
+    // prints as the main chart. Re-absorbing a populated candle footprint
+    // doubles every level. The chart footprint is only a fallback for the
+    // initial raw-trade buffer that predates the indicator's live book.
+    let include_footprint = day.stats.levels.is_empty();
     match data_source {
         PlotData::TimeBased(series) => {
-            absorb_time_series(&mut day.stats, series, day_ts, day_end, step);
+            absorb_time_series(
+                &mut day.stats,
+                series,
+                day_ts,
+                day_end,
+                step,
+                include_footprint,
+            );
         }
         PlotData::TickBased(tick_aggr) => {
             for dp in &tick_aggr.datapoints {
                 let time = dp.kline.time.as_u64();
                 if time >= day_ts && time < day_end {
                     absorb_ohlc(&mut day.stats, dp.kline.high, dp.kline.low);
-                    absorb_footprint(&mut day.stats, &dp.footprint, step);
+                    if include_footprint {
+                        absorb_footprint(&mut day.stats, &dp.footprint, step);
+                    }
                 }
             }
         }
@@ -440,12 +454,15 @@ fn absorb_time_series(
     day_ts: u64,
     day_end: u64,
     step: PriceStep,
+    include_footprint: bool,
 ) {
     let start = UnixMs::new(day_ts);
     let end = UnixMs::new(day_end);
     for (_, dp) in series.datapoints.range(start..end) {
         absorb_ohlc(stats, dp.kline.high, dp.kline.low);
-        absorb_footprint(stats, &dp.footprint, step);
+        if include_footprint {
+            absorb_footprint(stats, &dp.footprint, step);
+        }
     }
 }
 
@@ -644,7 +661,7 @@ fn trim_decimals(value: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use exchange::{TickerInfo, Trade, adapter::Exchange, unit::Qty};
+    use exchange::{Kline, TickerInfo, Timeframe, Trade, Volume, adapter::Exchange, unit::Qty};
 
     fn trade(time: u64, price: f64, qty: f64, is_sell: bool) -> Trade {
         Trade {
@@ -736,5 +753,36 @@ mod tests {
         );
         assert_eq!(stats.low, Some(62_484.2));
         assert_eq!(stats.high, Some(63_595.1));
+    }
+
+    #[test]
+    fn populated_history_book_does_not_double_count_the_chart_footprint() {
+        let day = day_start(UnixMs::now());
+        let price = Price::from_f64(67_000.0);
+        let trade = trade(day + 60_000, 67_000.0, 1.0, false);
+        let step = PriceStep::from(source().min_ticksize);
+        let kline = Kline {
+            time: UnixMs::new(day),
+            open: price,
+            high: price,
+            low: price,
+            close: price,
+            volume: Volume::empty_buy_sell(),
+        };
+        let series =
+            TimeSeries::<KlineDataPoint>::new(Timeframe::M5, step, &[kline]).with_trades(&[trade]);
+        let mut display = DisplayDay::default();
+        display
+            .stats
+            .levels
+            .entry(price.units)
+            .or_default()
+            .add_notional(false, 67_000.0);
+        let before = display.stats.levels[&price.units].volume();
+
+        apply_kline_day(&mut display, &PlotData::TimeBased(series), day, step);
+
+        assert_eq!(display.stats.levels[&price.units].volume(), before);
+        assert_eq!(display.stats.levels.len(), 1);
     }
 }

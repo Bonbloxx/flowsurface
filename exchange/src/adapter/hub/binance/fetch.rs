@@ -809,9 +809,9 @@ async fn fetch_intraday_trades_parallel(
     }
 
     merged.sort_by_key(|trade| trade.time);
-    // Slice boundaries are disjoint, but guard against an exchange returning
-    // records outside its requested window.
-    merged.dedup_by(|a, b| a.time == b.time && a.price == b.price && a.qty == b.qty);
+    // Slice boundaries are disjoint and fromId continuation starts after the
+    // last aggregate-trade ID. Do not value-deduplicate here: two legitimate
+    // executions can share the same millisecond, price, quantity, and side.
     Ok(merged)
 }
 

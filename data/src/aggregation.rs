@@ -255,6 +255,48 @@ impl ResolvedFeed {
         }
     }
 
+    /// Combine equivalent venues that are not in the static catalog, for
+    /// example ETH linear perps on Binance, Bybit, and Hyperliquid.
+    pub fn from_sources_selected(
+        primary: TickerInfo,
+        candidates: &[TickerInfo],
+        selected: Option<&[Ticker]>,
+    ) -> Self {
+        let mut available_sources = if candidates.is_empty() {
+            vec![primary]
+        } else {
+            candidates.to_vec()
+        };
+        if !available_sources
+            .iter()
+            .any(|source| source.ticker.same_market(&primary.ticker))
+        {
+            available_sources.insert(0, primary);
+        }
+
+        let mut sources = available_sources
+            .iter()
+            .copied()
+            .filter(|source| {
+                selected.is_none_or(|wanted| {
+                    wanted
+                        .iter()
+                        .any(|ticker| ticker.same_market(&source.ticker))
+                })
+            })
+            .collect::<Vec<_>>();
+
+        if sources.is_empty() {
+            sources.push(primary);
+        }
+
+        Self {
+            id: AggregateFeedId::for_seed_ticker(primary.ticker),
+            available_sources,
+            sources,
+        }
+    }
+
     pub fn id(&self) -> Option<AggregateFeedId> {
         self.id
     }
@@ -518,21 +560,57 @@ impl KlineAggregator {
             };
 
             for (time, incoming) in source_bars {
-                match composite.entry(*time) {
-                    std::collections::btree_map::Entry::Vacant(entry) => {
-                        entry.insert(*incoming);
-                    }
-                    std::collections::btree_map::Entry::Occupied(mut entry) => {
-                        let current = entry.get_mut();
-                        current.high = current.high.max(incoming.high);
-                        current.low = current.low.min(incoming.low);
-                        current.volume = merge_volume(current.volume, incoming.volume);
-                    }
-                }
+                merge_composite_kline(&mut composite, *time, *incoming);
             }
         }
 
         composite.into_values().collect()
+    }
+
+    /// Build a composite only for the requested inclusive time range.
+    ///
+    /// Historical TPO paging uses this to apply one returned page to the
+    /// existing profiles. Rebuilding the full multi-month composite after
+    /// every venue page otherwise blocks the UI thread as history grows.
+    pub fn composite_klines_in_range(
+        &self,
+        start: exchange::UnixMs,
+        end: exchange::UnixMs,
+    ) -> Vec<Kline> {
+        if end < start {
+            return Vec::new();
+        }
+
+        let mut composite = BTreeMap::<exchange::UnixMs, Kline>::new();
+        for source in &self.sources {
+            let Some(source_bars) = self.bars.get(source) else {
+                continue;
+            };
+
+            for (time, incoming) in source_bars.range(start..=end) {
+                merge_composite_kline(&mut composite, *time, *incoming);
+            }
+        }
+
+        composite.into_values().collect()
+    }
+}
+
+fn merge_composite_kline(
+    composite: &mut BTreeMap<exchange::UnixMs, Kline>,
+    time: exchange::UnixMs,
+    incoming: Kline,
+) {
+    match composite.entry(time) {
+        std::collections::btree_map::Entry::Vacant(entry) => {
+            entry.insert(incoming);
+        }
+        std::collections::btree_map::Entry::Occupied(mut entry) => {
+            let current = entry.get_mut();
+            current.high = current.high.max(incoming.high);
+            current.low = current.low.min(incoming.low);
+            current.volume = merge_volume(current.volume, incoming.volume);
+        }
     }
 }
 
@@ -850,6 +928,26 @@ mod tests {
     }
 
     #[test]
+    fn equivalent_venues_combine_without_a_catalog_id() {
+        let binance = ticker_info(Exchange::BinanceLinear, "ETHUSDT");
+        let bybit = ticker_info(Exchange::BybitLinear, "ETHUSDT");
+        let hyperliquid = ticker_info(Exchange::HyperliquidLinear, "ETH");
+        let candidates = [binance, bybit, hyperliquid];
+
+        let feed = ResolvedFeed::from_sources_selected(bybit, &candidates, None);
+        assert_eq!(feed.id(), None);
+        assert_eq!(feed.sources(), &[binance, bybit, hyperliquid]);
+        assert_eq!(feed.trade_streams().len(), 3);
+
+        let bybit_hl = ResolvedFeed::from_sources_selected(
+            bybit,
+            &candidates,
+            Some(&[bybit.ticker, hyperliquid.ticker]),
+        );
+        assert_eq!(bybit_hl.sources(), &[bybit, hyperliquid]);
+    }
+
+    #[test]
     fn source_toggles_keep_at_least_one_source_enabled() {
         let binance = ticker_info(Exchange::BinanceLinear, "BTCUSDT");
         let bybit = ticker_info(Exchange::BybitLinear, "BTCUSDT");
@@ -890,5 +988,42 @@ mod tests {
         assert_eq!(merged[0].high, Price::from_f64(107.0));
         assert_eq!(merged[0].low, Price::from_f64(98.0));
         assert_eq!(merged[0].volume.total(), Qty::from_f64(14.0));
+    }
+
+    #[test]
+    fn composite_range_only_merges_the_requested_history_page() {
+        let primary = ticker_info(Exchange::BinanceLinear, "BTCUSDT");
+        let secondary = ticker_info(Exchange::BybitLinear, "BTCUSDT");
+        let feed = ResolvedFeed {
+            id: Some(AggregateFeedId::BtcUsdtPerpetual),
+            available_sources: vec![primary, secondary],
+            sources: vec![primary, secondary],
+        };
+        let mut aggregator = KlineAggregator::new(&feed);
+        let primary_bars = [
+            kline(1_000, 100.0, 105.0, 99.0, 103.0, 10.0),
+            kline(2_000, 103.0, 108.0, 102.0, 106.0, 11.0),
+            kline(3_000, 106.0, 110.0, 104.0, 109.0, 12.0),
+        ];
+        aggregator.insert(primary, &primary_bars);
+        aggregator.insert(
+            secondary,
+            &[
+                kline(1_000, 101.0, 107.0, 98.0, 106.0, 4.0),
+                kline(2_000, 104.0, 109.0, 101.0, 108.0, 5.0),
+                kline(3_000, 107.0, 111.0, 103.0, 110.0, 6.0),
+            ],
+        );
+
+        let merged = aggregator
+            .composite_klines_in_range(exchange::UnixMs::new(2_000), exchange::UnixMs::new(3_000));
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].time, exchange::UnixMs::new(2_000));
+        assert_eq!(merged[0].open, Price::from_f64(103.0));
+        assert_eq!(merged[0].close, Price::from_f64(106.0));
+        assert_eq!(merged[0].high, Price::from_f64(109.0));
+        assert_eq!(merged[0].low, Price::from_f64(101.0));
+        assert_eq!(merged[0].volume.total(), Qty::from_f64(16.0));
+        assert_eq!(merged[1].time, exchange::UnixMs::new(3_000));
     }
 }

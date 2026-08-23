@@ -862,6 +862,7 @@ mod tests {
             previous_value_area_value_area_percent: 70,
             liquidity_heatmap_order_size_filter: 125_000.0,
             large_trades_min_usd: 1_000_000.0,
+            vpvr_ticks: 10,
         };
 
         let kind_json = serde_json::to_string(&kind).expect("serialize Renko settings");

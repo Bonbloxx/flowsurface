@@ -1270,7 +1270,7 @@ fn request_fetch_with_stream(
     }
 }
 
-fn draw_volume_bar(
+pub(crate) fn draw_volume_bar(
     frame: &mut canvas::Frame,
     start_x: f32,
     start_y: f32,
@@ -1289,7 +1289,7 @@ fn draw_volume_bar(
         return;
     }
 
-    let total_bar_length = (total_qty / max_qty) as f32 * bar_length;
+    let total_bar_length = ((total_qty / max_qty) as f32 * bar_length).min(bar_length.abs());
 
     let buy_proportion = (buy_qty / total_qty) as f32;
     let sell_proportion = (sell_qty / total_qty) as f32;

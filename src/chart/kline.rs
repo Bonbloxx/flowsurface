@@ -61,6 +61,10 @@ fn renko_seed_page_bars(source: TickerInfo) -> u64 {
     }
 }
 
+fn tpo_history_earliest(config: TpoConfig, now: UnixMs) -> UnixMs {
+    config.profile_start(now.saturating_sub(config.history_range_ms()))
+}
+
 fn shared_history_price_step(sources: &[TickerInfo], fallback: PriceStep) -> PriceStep {
     sources
         .first()
@@ -86,6 +90,16 @@ fn previous_value_area_price_step(
         .min_by_key(|step| step.units)
         .unwrap_or(fallback);
     TickMultiplier(ticks.max(1)).multiply_step(min_tick)
+}
+
+fn trade_history_available(source: TickerInfo, fetch_mode: TradeFetchMode) -> bool {
+    match fetch_mode {
+        TradeFetchMode::Off => false,
+        TradeFetchMode::Exchange => {
+            matches!(source.exchange().venue(), Venue::Binance | Venue::Bybit)
+        }
+        TradeFetchMode::Server => true,
+    }
 }
 
 type DayRange = (UnixMs, UnixMs);
@@ -237,6 +251,7 @@ impl Chart for KlineChart {
     }
 
     fn plot_background(&self) -> Option<Element<'_, Message>> {
+        self.indicators[KlineIndicator::LiquidityHeatmap].as_ref()?;
         self.footprint_history
             .liquidity
             .as_ref()
@@ -301,7 +316,19 @@ pub struct KlineChart {
     indicators: Box<EnumMap<KlineIndicator, Option<Box<dyn KlineIndicatorImpl>>>>,
     open_interest_sources: Vec<TickerInfo>,
     footprint_history: Box<FootprintHistoryRuntime>,
-    fetching_trades: (bool, Option<Handle>),
+    /// First live print accepted from each source during this chart session.
+    ///
+    /// A non-empty candle is not proof that its beginning was backfilled: the
+    /// WebSocket can populate the candle before the history planner runs. Keep
+    /// the source-specific boundary so each venue can fetch only the missing
+    /// prefix without overlapping (and therefore duplicating) live prints.
+    live_trade_starts: FxHashMap<TickerInfo, UnixMs>,
+    /// Every source in an aggregate visible-history request owns an abort
+    /// handle. Keeping only the most recent handle cancels the earlier venue
+    /// tasks as soon as the next one is registered.
+    fetching_trades: bool,
+    trade_fetch_handles: Vec<Handle>,
+    active_trade_fetches: Box<FxHashSet<uuid::Uuid>>,
     /// Renko/TPO historical seed completed.
     trade_history_loaded: bool,
     pub(crate) kind: KlineChartKind,
@@ -365,7 +392,7 @@ impl KlineChart {
                     .max(1) as f32;
 
                 let cell_width = match &kind {
-                    KlineChartKind::Footprint { .. } => 80.0,
+                    KlineChartKind::Footprint { .. } => kind.default_cell_width(),
                     KlineChartKind::Tpo { .. } => kind.default_cell_width(),
                     KlineChartKind::Candles => 4.0,
                     KlineChartKind::Renko { .. } => kind.default_cell_width(),
@@ -444,7 +471,10 @@ impl KlineChart {
                     indicators: Box::new(indicators),
                     open_interest_sources: vec![ticker_info],
                     footprint_history: Box::new(FootprintHistoryRuntime::new(ticker_info)),
-                    fetching_trades: (false, None),
+                    live_trade_starts: FxHashMap::default(),
+                    fetching_trades: false,
+                    trade_fetch_handles: Vec::new(),
+                    active_trade_fetches: Box::default(),
                     trade_history_loaded: false,
                     request_handler: RequestHandler::default(),
                     kind: kind.clone(),
@@ -454,7 +484,7 @@ impl KlineChart {
             }
             Basis::Tick(interval) => {
                 let cell_width = match &kind {
-                    KlineChartKind::Footprint { .. } => 80.0,
+                    KlineChartKind::Footprint { .. } => kind.default_cell_width(),
                     KlineChartKind::Tpo { .. } => kind.default_cell_width(),
                     KlineChartKind::Candles => 4.0,
                     KlineChartKind::Renko { .. } => kind.default_cell_width(),
@@ -549,7 +579,10 @@ impl KlineChart {
                     indicators: Box::new(indicators),
                     open_interest_sources: vec![ticker_info],
                     footprint_history: Box::new(FootprintHistoryRuntime::new(ticker_info)),
-                    fetching_trades: (false, None),
+                    live_trade_starts: FxHashMap::default(),
+                    fetching_trades: false,
+                    trade_fetch_handles: Vec::new(),
+                    active_trade_fetches: Box::default(),
                     trade_history_loaded: false,
                     request_handler: RequestHandler::default(),
                     kind: kind.clone(),
@@ -569,6 +602,11 @@ impl KlineChart {
         let existing_pva = self.pva_klines.composite_klines();
         let mut pva_klines = KlineAggregator::new(&feed);
         pva_klines.insert(feed.primary(), &existing_pva);
+        self.live_trade_starts.retain(|source, _| {
+            feed.sources()
+                .iter()
+                .any(|candidate| candidate.ticker.same_market(&source.ticker))
+        });
         self.chart.ticker_info = feed.primary();
         *self.feed = feed;
         *self.tpo_klines = tpo_klines;
@@ -718,6 +756,53 @@ impl KlineChart {
             || self.indicators[KlineIndicator::LargeTrades].is_some()
     }
 
+    fn wants_visible_range_profile(&self) -> bool {
+        self.indicators[KlineIndicator::VisibleRangeProfile].is_some()
+    }
+
+    /// Live trades (and history fills) should land in each candle's footprint.
+    fn wants_bucketed_trades(&self) -> bool {
+        matches!(
+            self.kind,
+            KlineChartKind::Footprint { .. }
+                | KlineChartKind::Renko { .. }
+                | KlineChartKind::Tpo { .. }
+        ) || matches!(self.data_source, PlotData::TickBased(_))
+            || self.wants_visible_range_profile()
+    }
+
+    /// Fetch executed trades for whatever candles are currently on screen.
+    fn wants_visible_trade_fetch(&self) -> bool {
+        matches!(self.kind, KlineChartKind::Footprint { .. }) || self.wants_visible_range_profile()
+    }
+
+    fn accepts_main_trade_source(&self, source: TickerInfo) -> bool {
+        if matches!(
+            self.kind,
+            KlineChartKind::Footprint { .. } | KlineChartKind::Tpo { .. }
+        ) {
+            self.feed
+                .sources()
+                .iter()
+                .any(|candidate| candidate.ticker.same_market(&source.ticker))
+        } else {
+            source.ticker.same_market(&self.chart.ticker_info.ticker)
+        }
+    }
+
+    fn footprint_qty_is_quote(&self) -> bool {
+        exchange::unit::qty::volume_size_unit() == exchange::SizeUnit::Quote
+            || self
+                .feed
+                .sources()
+                .iter()
+                .all(|source| source.market_type() == exchange::adapter::MarketKind::InversePerps)
+    }
+
+    fn vpvr_group_step(&self) -> PriceStep {
+        TickMultiplier(self.visual_config.vpvr_ticks.max(1)).multiply_step(self.feed.price_step())
+    }
+
     fn for_each_trade_history(&mut self, mut f: impl FnMut(&mut dyn KlineIndicatorImpl)) {
         for kind in [
             KlineIndicator::FootprintHistory,
@@ -782,6 +867,19 @@ impl KlineChart {
         }
     }
 
+    fn sync_time_cursor(&mut self) {
+        let PlotData::TimeBased(timeseries) = &self.data_source else {
+            return;
+        };
+        let Some(latest) = timeseries.latest_timestamp() else {
+            return;
+        };
+        self.chart.latest_x = self.chart.latest_x.max(latest.as_u64());
+        if let Some((_, dp)) = timeseries.datapoints.last_key_value() {
+            self.chart.last_price = Some(PriceInfoLabel::new(dp.kline.close, dp.kline.open));
+        }
+    }
+
     pub fn update_latest_kline(&mut self, kline: &Kline) {
         match self.data_source {
             PlotData::TimeBased(ref mut timeseries) => {
@@ -843,13 +941,7 @@ impl KlineChart {
         let mut specs = Vec::new();
 
         for source in sources {
-            let trade_history_available = match fetch_mode {
-                TradeFetchMode::Off => false,
-                TradeFetchMode::Exchange => {
-                    matches!(source.exchange().venue(), Venue::Binance | Venue::Bybit)
-                }
-                TradeFetchMode::Server => true,
-            };
+            let trade_history_available = trade_history_available(source, fetch_mode.clone());
             let source_fetch_active = self
                 .footprint_history
                 .trade_requests
@@ -980,7 +1072,7 @@ impl KlineChart {
         {
             let letter_tf = config.letter_timeframe();
             let latest = UnixMs::now();
-            let need_earliest = latest.saturating_sub(config.history_range_ms());
+            let need_earliest = tpo_history_earliest(*config, latest);
             let page_ms = letter_tf.to_milliseconds().saturating_mul(1_000);
 
             for source in self.feed.sources().iter().copied() {
@@ -1060,6 +1152,12 @@ impl KlineChart {
             let visible_latest_ms = UnixMs::new(visible_latest);
             let visible_span = visible_latest.saturating_sub(visible_earliest);
             let prefetch_earliest = visible_earliest.saturating_sub(visible_span);
+            let interval = timeseries.interval;
+            let suggested_trade_range =
+                timeseries.suggest_trade_fetch_range(visible_earliest_ms, visible_latest_ms);
+            let check_earliest = UnixMs::new(prefetch_earliest).max(kline_earliest);
+            let check_latest = visible_latest_ms.saturating_add(timeframe_ms);
+            let missing_kline_keys = timeseries.check_kline_integrity(check_earliest, check_latest);
 
             // priority 1, initial klines for visible range
             if visible_earliest_ms < kline_earliest {
@@ -1071,30 +1169,44 @@ impl KlineChart {
             }
 
             // priority 2, trades
-            if let KlineChartKind::Footprint { .. } = self.kind
-                && !self.fetching_trades.0
-                && is_trade_fetch_enabled()
-                && let Some((fetch_from, fetch_to)) =
-                    timeseries.suggest_trade_fetch_range(visible_earliest_ms, visible_latest_ms)
+            if self.wants_visible_trade_fetch() && !self.fetching_trades && is_trade_fetch_enabled()
             {
-                let range = FetchRange::FootprintTrades(fetch_from, fetch_to);
-                let mut specs = Vec::new();
-                for source in self.feed.sources().iter().copied() {
-                    let stream = StreamKind::Trades {
-                        ticker_info: source,
-                    };
-                    if let Ok(Some(req_id)) = self.request_handler.add_request(range, Some(stream))
-                    {
-                        specs.push(FetchSpec {
-                            req_id,
-                            fetch: range,
-                            stream: Some(stream),
-                        });
-                    }
-                }
+                let fetch_mode = trade_fetch_mode();
+                let specs = self.visible_trade_prefix_fetches(
+                    visible_earliest_ms,
+                    visible_latest_ms,
+                    interval,
+                    fetch_mode.clone(),
+                );
                 if !specs.is_empty() {
-                    self.fetching_trades = (true, None);
+                    self.begin_trade_fetches(&specs);
                     return Some(Action::RequestFetch(specs));
+                }
+
+                if let Some((fetch_from, fetch_to)) = suggested_trade_range {
+                    let range = FetchRange::FootprintTrades(fetch_from, fetch_to);
+                    let mut specs = Vec::new();
+                    for source in self.feed.sources().iter().copied() {
+                        if !trade_history_available(source, fetch_mode.clone()) {
+                            continue;
+                        }
+                        let stream = StreamKind::Trades {
+                            ticker_info: source,
+                        };
+                        if let Ok(Some(req_id)) =
+                            self.request_handler.add_request(range, Some(stream))
+                        {
+                            specs.push(FetchSpec {
+                                req_id,
+                                fetch: range,
+                                stream: Some(stream),
+                            });
+                        }
+                    }
+                    if !specs.is_empty() {
+                        self.begin_trade_fetches(&specs);
+                        return Some(Action::RequestFetch(specs));
+                    }
                 }
             }
 
@@ -1102,7 +1214,7 @@ impl KlineChart {
             // (e.g. open interest needs external fetch as it's not derived from klines)
             let ctx = indicator::kline::FetchCtx {
                 main_chart: &self.chart,
-                timeframe: timeseries.interval,
+                timeframe: interval,
                 visible_earliest: visible_earliest_ms,
                 kline_latest,
                 prefetch_earliest: UnixMs::new(prefetch_earliest),
@@ -1114,7 +1226,7 @@ impl KlineChart {
                 for source in indi.open_interest_sources().iter().copied() {
                     let stream = StreamKind::Kline {
                         ticker_info: source,
-                        timeframe: timeseries.interval,
+                        timeframe: interval,
                     };
                     if let Ok(Some(req_id)) = self.request_handler.add_request(range, Some(stream))
                     {
@@ -1144,12 +1256,7 @@ impl KlineChart {
             }
 
             // priority 4, missing klines & integrity check
-            let check_earliest = UnixMs::new(prefetch_earliest).max(kline_earliest);
-            let check_latest = visible_latest_ms.saturating_add(timeframe_ms);
-
-            if let Some(missing_keys) =
-                timeseries.check_kline_integrity(check_earliest, check_latest)
-            {
+            if let Some(missing_keys) = missing_kline_keys {
                 let latest = missing_keys
                     .iter()
                     .max()
@@ -1309,11 +1416,89 @@ impl KlineChart {
 
     pub fn reset_request_handler(&mut self) {
         self.request_handler.drop_non_footprint_history();
-        self.fetching_trades = (false, None);
+        self.reset_trade_fetch_state();
     }
 
     pub fn reset_trade_fetch_state(&mut self) {
-        self.fetching_trades = (false, None);
+        self.fetching_trades = false;
+        self.active_trade_fetches.clear();
+        self.trade_fetch_handles.clear();
+    }
+
+    fn begin_trade_fetches(&mut self, specs: &[FetchSpec]) {
+        if self.active_trade_fetches.is_empty() {
+            self.trade_fetch_handles.clear();
+        }
+        self.active_trade_fetches
+            .extend(specs.iter().map(|spec| spec.req_id));
+        self.fetching_trades = !self.active_trade_fetches.is_empty();
+    }
+
+    fn finish_trade_fetch(&mut self, req_id: uuid::Uuid) {
+        if !self.active_trade_fetches.remove(&req_id) {
+            return;
+        }
+        if self.active_trade_fetches.is_empty() {
+            self.fetching_trades = false;
+            self.trade_fetch_handles.clear();
+        }
+    }
+
+    fn complete_main_trade_fetch(&mut self, req_id: Option<uuid::Uuid>) {
+        if let Some(req_id) = req_id {
+            self.request_handler.mark_completed(req_id);
+            self.finish_trade_fetch(req_id);
+        } else {
+            self.reset_trade_fetch_state();
+        }
+    }
+
+    pub fn is_fetching_trades(&self) -> bool {
+        self.fetching_trades
+    }
+
+    fn visible_trade_prefix_fetches(
+        &mut self,
+        visible_earliest: UnixMs,
+        visible_latest: UnixMs,
+        interval: Timeframe,
+        fetch_mode: TradeFetchMode,
+    ) -> Vec<FetchSpec> {
+        let mut specs = Vec::new();
+        let sources = self.feed.sources().to_vec();
+        let interval_ms = interval.to_milliseconds();
+
+        for source in sources {
+            if !trade_history_available(source, fetch_mode.clone()) {
+                continue;
+            }
+            let Some(first_live) = self.live_trade_starts.get(&source).copied() else {
+                continue;
+            };
+            let fetch_from = first_live.floor_to(interval);
+            let fetch_to = first_live.saturating_sub(1);
+            let bucket_end = fetch_from.saturating_add(interval_ms);
+            if fetch_from >= fetch_to
+                || fetch_from > visible_latest
+                || bucket_end < visible_earliest
+            {
+                continue;
+            }
+
+            let range = FetchRange::FootprintTrades(fetch_from, fetch_to);
+            let stream = StreamKind::Trades {
+                ticker_info: source,
+            };
+            if let Ok(Some(req_id)) = self.request_handler.add_request(range, Some(stream)) {
+                specs.push(FetchSpec {
+                    req_id,
+                    fetch: range,
+                    stream: Some(stream),
+                });
+            }
+        }
+
+        specs
     }
 
     /// Finish a successful trade-history fetch that did not already finalize
@@ -1324,8 +1509,8 @@ impl KlineChart {
             self.request_handler.mark_completed(req_id);
             return;
         }
-        self.fetching_trades = (false, None);
         self.request_handler.mark_completed(req_id);
+        self.finish_trade_fetch(req_id);
         // TPO only seeds trades once; without this flag the chart re-requests the
         // same history window after every capped seed.
         if matches!(
@@ -1346,6 +1531,7 @@ impl KlineChart {
         // bounds total attempts, so a permanently broken range still cannot
         // retry forever.
         self.request_handler.mark_failed(req_id);
+        self.finish_trade_fetch(req_id);
     }
 
     /// Mark a fetch request as having no data. The source confirmed the
@@ -1354,6 +1540,7 @@ impl KlineChart {
         self.footprint_history.trade_requests.remove(&req_id);
         self.footprint_history.oi_requests.remove(&req_id);
         self.request_handler.mark_no_data(req_id);
+        self.finish_trade_fetch(req_id);
         if matches!(
             &self.data_source,
             PlotData::TickBased(tick_aggr) if tick_aggr.is_tpo()
@@ -1366,12 +1553,28 @@ impl KlineChart {
         self.raw_trades.clone()
     }
 
-    pub fn set_handle(&mut self, handle: Handle) {
-        // Seed fetches (TPO/Renko/footprint gap-fill) still replace a single
-        // abort handle. Daily-delta / footprint-history backfills must keep
-        // every venue handle; replacing would abort in-flight pages.
-        if self.fetching_trades.0 {
-            self.fetching_trades.1 = Some(handle);
+    pub fn live_trade_starts(&self) -> FxHashMap<TickerInfo, UnixMs> {
+        self.live_trade_starts.clone()
+    }
+
+    pub fn restore_live_trade_starts(&mut self, starts: FxHashMap<TickerInfo, UnixMs>) {
+        self.live_trade_starts = starts;
+        let sources = self.feed.sources();
+        self.live_trade_starts.retain(|source, _| {
+            sources
+                .iter()
+                .any(|candidate| candidate.ticker.same_market(&source.ticker))
+        });
+    }
+
+    pub fn set_handle(&mut self, req_id: uuid::Uuid, handle: Handle) {
+        // Main visible-history requests can contain one task per selected
+        // venue. Retain every handle or registering Bybit/Hyperliquid aborts
+        // the Binance task that was registered immediately before it. Route
+        // by request identity so a concurrent Daily Delta day fetch cannot be
+        // mistaken for (and later aborted with) a VPVR/main-history request.
+        if self.active_trade_fetches.contains(&req_id) {
+            self.trade_fetch_handles.push(handle);
         } else {
             self.footprint_history.fetch_handles.push(handle);
         }
@@ -1383,6 +1586,7 @@ impl KlineChart {
     pub fn release_undispatched_requests(&mut self, ids: &[uuid::Uuid]) {
         for id in ids {
             self.request_handler.remove(*id);
+            self.finish_trade_fetch(*id);
         }
     }
 
@@ -1639,9 +1843,10 @@ impl KlineChart {
             PlotData::TickBased(tick_aggr) => {
                 tick_aggr.change_tick_size(new_step, &self.raw_trades);
             }
-            PlotData::TimeBased(timeseries) => {
-                timeseries.change_tick_size(new_step, &self.raw_trades);
-            }
+            // Time-based footprints are stored at the feed's base price step
+            // and grouped onto `new_step` at draw time (`grouped_to_step`),
+            // so switching multipliers only needs the ViewState update above.
+            PlotData::TimeBased(_) => {}
         }
 
         self.indicators
@@ -1671,8 +1876,10 @@ impl KlineChart {
                     self.raw_trades.clear();
                 };
 
-                let step = self.chart.tick_size;
-                let timeseries = TimeSeries::<KlineDataPoint>::new(interval, step, &[]);
+                // Store footprint bins on the feed's base tick; the selected
+                // tick multiplier is applied when drawing (grouped_to_step).
+                let storage_step = self.feed.price_step();
+                let timeseries = TimeSeries::<KlineDataPoint>::new(interval, storage_step, &[]);
                 self.data_source = PlotData::TimeBased(timeseries);
             }
             Basis::Tick(tick_count) => {
@@ -1702,6 +1909,7 @@ impl KlineChart {
             .filter_map(Option::as_mut)
             .for_each(|indi| indi.on_basis_change(&self.data_source));
 
+        self.live_trade_starts.clear();
         self.reset_request_handler();
         self.invalidate(Some(Instant::now()))
     }
@@ -1729,28 +1937,16 @@ impl KlineChart {
             indicator.on_source_trades(source, buffer, false);
         });
 
-        let source_is_primary = source.ticker.same_market(&self.chart.ticker_info.ticker);
-        let source_is_feed = self
-            .feed
-            .sources()
-            .iter()
-            .any(|candidate| candidate.ticker.same_market(&source.ticker));
-        let main_uses_trades = matches!(
-            self.kind,
-            KlineChartKind::Footprint { .. }
-                | KlineChartKind::Renko { .. }
-                | KlineChartKind::Tpo { .. }
-        ) || matches!(self.data_source, PlotData::TickBased(_));
-        let main_accepts_source = if matches!(
-            self.kind,
-            KlineChartKind::Footprint { .. } | KlineChartKind::Tpo { .. }
-        ) {
-            source_is_feed
-        } else {
-            source_is_primary
-        };
-        if !main_uses_trades || !main_accepts_source {
+        let main_uses_trades = self.wants_bucketed_trades();
+        if !main_uses_trades || !self.accepts_main_trade_source(source) {
             return;
+        }
+
+        if let Some(first_live) = buffer.iter().map(|trade| trade.time).min() {
+            self.live_trade_starts
+                .entry(source)
+                .and_modify(|current| *current = (*current).min(first_live))
+                .or_insert(first_live);
         }
 
         // Live stream can run for hours — keep a hard ceiling so TPO/Renko
@@ -1782,7 +1978,15 @@ impl KlineChart {
                 self.invalidate(None);
             }
             PlotData::TimeBased(ref mut timeseries) => {
-                timeseries.insert_trades_existing_buckets(buffer);
+                if matches!(self.kind, KlineChartKind::Footprint { .. }) {
+                    // Aggregated live tape can arrive before REST klines.
+                    // Create the minute/hour buckets from trades so the
+                    // footprint is not a blank "Waiting for data" pane.
+                    timeseries.insert_trades_or_create_bucket(buffer);
+                } else {
+                    timeseries.insert_trades_existing_buckets(buffer);
+                }
+                self.sync_time_cursor();
 
                 self.indicators
                     .values_mut()
@@ -1833,6 +2037,16 @@ impl KlineChart {
             return;
         }
 
+        // Source toggles replace the chart while previously dispatched fetch
+        // tasks can still deliver a final message. Only accept main-history
+        // pages owned by this chart generation and selected by its current
+        // feed; otherwise deselected or duplicated venue data leaks back in.
+        if req_id.is_some_and(|id| !self.active_trade_fetches.contains(&id))
+            || !self.accepts_main_trade_source(source)
+        {
+            return;
+        }
+
         let is_renko = matches!(
             &self.data_source,
             PlotData::TickBased(tick_aggr) if tick_aggr.is_renko()
@@ -1846,17 +2060,14 @@ impl KlineChart {
         // from an older request must never replace the live chart.
         if is_renko {
             if is_batches_done {
-                self.fetching_trades = (false, None);
-                if let Some(req_id) = req_id {
-                    self.request_handler.mark_completed(req_id);
-                }
+                self.complete_main_trade_fetch(req_id);
             }
             return;
         }
 
         if matches!(&self.data_source, PlotData::TickBased(_)) && !is_trade_profile {
             if is_batches_done {
-                self.fetching_trades = (false, None);
+                self.complete_main_trade_fetch(req_id);
             }
             return;
         }
@@ -1870,10 +2081,7 @@ impl KlineChart {
             if self.trade_history_loaded && !raw_trades.is_empty() {
                 // Late pages after we already hit the cap — drop them.
                 if is_batches_done {
-                    self.fetching_trades = (false, None);
-                    if let Some(req_id) = req_id {
-                        self.request_handler.mark_completed(req_id);
-                    }
+                    self.complete_main_trade_fetch(req_id);
                 }
                 return;
             }
@@ -1912,21 +2120,15 @@ impl KlineChart {
             // Hit the seed cap: abort further history paging and go live.
             if self.raw_trades.len() >= MAX_SEED_TRADES {
                 // Dropping the abort handle cancels the in-flight fetch task.
-                self.fetching_trades = (false, None);
+                self.complete_main_trade_fetch(req_id);
                 self.trade_history_loaded = true;
-                if let Some(req_id) = req_id {
-                    self.request_handler.mark_completed(req_id);
-                }
                 self.invalidate(Some(Instant::now()));
                 return;
             }
 
             if is_batches_done {
-                self.fetching_trades = (false, None);
+                self.complete_main_trade_fetch(req_id);
                 self.trade_history_loaded = true;
-                if let Some(req_id) = req_id {
-                    self.request_handler.mark_completed(req_id);
-                }
             }
 
             // Redraw on completion, or lightly while seeding so the UI stays alive.
@@ -1936,22 +2138,23 @@ impl KlineChart {
             return;
         }
 
-        // Skip unnecessary work when the batch is empty (e.g. the final
-        // batch was completely filtered out by until_time).  The true
-        // "no data at all" case is handled separately via
-        // mark_fetch_no_data in the dashboard.
+        // Skip unnecessary work when the batch is empty. The true "no data
+        // at all" case is handled separately via mark_fetch_no_data in the
+        // dashboard.
         if raw_trades.is_empty() {
             if is_batches_done {
-                self.fetching_trades = (false, None);
-                if let Some(req_id) = req_id {
-                    self.request_handler.mark_completed(req_id);
-                }
+                self.complete_main_trade_fetch(req_id);
             }
             return;
         }
 
         if let PlotData::TimeBased(ref mut timeseries) = self.data_source {
-            timeseries.insert_trades_existing_buckets(&raw_trades);
+            if matches!(self.kind, KlineChartKind::Footprint { .. }) {
+                timeseries.insert_trades_or_create_bucket(&raw_trades);
+            } else {
+                timeseries.insert_trades_existing_buckets(&raw_trades);
+            }
+            self.sync_time_cursor();
         }
 
         self.raw_trades.extend_from_slice(&raw_trades);
@@ -1962,11 +2165,7 @@ impl KlineChart {
             .for_each(|indi| indi.on_insert_trades(&raw_trades, 0, &self.data_source));
 
         if is_batches_done {
-            self.fetching_trades = (false, None);
-
-            if let Some(req_id) = req_id {
-                self.request_handler.mark_completed(req_id);
-            }
+            self.complete_main_trade_fetch(req_id);
         }
 
         self.invalidate(None);
@@ -1981,7 +2180,8 @@ impl KlineChart {
         match &mut self.data_source {
             PlotData::TimeBased(timeseries) => {
                 timeseries.insert_klines(klines_raw);
-                timeseries.insert_trades_existing_buckets(&self.raw_trades);
+                timeseries.fill_empty_footprints_from_trades(&self.raw_trades);
+                self.sync_time_cursor();
 
                 self.indicators
                     .values_mut()
@@ -2033,13 +2233,13 @@ impl KlineChart {
                     .for_each(|indicator| indicator.on_basis_change(&self.data_source));
                 self.invalidate(None);
             }
-            PlotData::TickBased(_) if matches!(self.kind, KlineChartKind::Tpo { .. }) => {
+            PlotData::TickBased(tick_aggr) if matches!(self.kind, KlineChartKind::Tpo { .. }) => {
                 if klines_raw.is_empty() {
                     // No more historical bars available — stop paging.
                     self.request_handler.mark_no_data(req_id);
                     self.tpo_klines.mark_exhausted(source);
                     if let KlineChartKind::Tpo { config } = &self.kind {
-                        let need_earliest = UnixMs::now().saturating_sub(config.history_range_ms());
+                        let need_earliest = tpo_history_earliest(*config, UnixMs::now());
                         self.trade_history_loaded =
                             self.tpo_klines.all_sources_complete(need_earliest);
                     }
@@ -2048,31 +2248,34 @@ impl KlineChart {
                 }
 
                 self.tpo_klines.insert(source, klines_raw);
-                let composite_klines = self.tpo_klines.composite_klines();
+                let page_start = klines_raw
+                    .iter()
+                    .map(|kline| kline.time)
+                    .min()
+                    .expect("non-empty TPO history page");
+                let page_end = klines_raw
+                    .iter()
+                    .map(|kline| kline.time)
+                    .max()
+                    .expect("non-empty TPO history page");
+                let composite_page = self
+                    .tpo_klines
+                    .composite_klines_in_range(page_start, page_end);
 
-                // Rebuild from all seeded bars, then re-apply live trades for
-                // the developing session (print-accurate last letter).
-                if let KlineChartKind::Tpo { config } = &self.kind {
-                    self.data_source = PlotData::TickBased(TickAggr::new_tpo_seeded(
-                        *config,
-                        self.chart.tick_size,
-                        &composite_klines,
-                        &self.raw_trades,
-                    ));
-                    self.chart.last_price = match &self.data_source {
-                        PlotData::TickBased(tick_aggr) => tick_aggr
-                            .datapoints
-                            .last()
-                            .map(|dp| PriceInfoLabel::new(dp.kline.close, dp.kline.open)),
-                        PlotData::TimeBased(_) => None,
-                    };
-                }
+                // Each source can only expand the composite high/low envelope,
+                // so applying the returned page is equivalent to rebuilding all
+                // accumulated bars while keeping the UI work bounded per page.
+                tick_aggr.insert_tpo_klines(&composite_page);
+                self.chart.last_price = tick_aggr
+                    .datapoints
+                    .last()
+                    .map(|dp| PriceInfoLabel::new(dp.kline.close, dp.kline.open));
 
                 self.request_handler.mark_completed(req_id);
 
                 // Done when we cover the configured profile history depth.
                 if let KlineChartKind::Tpo { config } = &self.kind {
-                    let need_earliest = UnixMs::now().saturating_sub(config.history_range_ms());
+                    let need_earliest = tpo_history_earliest(*config, UnixMs::now());
                     self.trade_history_loaded = self.tpo_klines.all_sources_complete(need_earliest);
                 }
 
@@ -2148,6 +2351,7 @@ impl KlineChart {
                     UnixMs::new(latest),
                     rounded_highest,
                     rounded_lowest,
+                    step,
                 )
                 .to_f64(),
             PlotData::TickBased(tick_aggr) => {
@@ -2231,18 +2435,20 @@ impl KlineChart {
                         if chart_height > f32::EPSILON && tick_size > 0.0 {
                             let (fit_lowest, fit_highest) = match &self.kind {
                                 KlineChartKind::Footprint { .. } => {
-                                    if let Some((footprint_low, footprint_high)) = self
+                                    const MIN_VISIBLE_FOOTPRINT_ROWS: f32 = 14.0;
+                                    let (profile_low, profile_high) = self
                                         .data_source
                                         .visible_footprint_price_range(start_interval, end_interval)
-                                    {
-                                        let half_tick = tick_size * 0.5;
-                                        (
-                                            footprint_low.to_f32_lossy() - half_tick,
-                                            footprint_high.to_f32_lossy() + half_tick,
-                                        )
-                                    } else {
-                                        (lowest, highest)
-                                    }
+                                        .map(|(low, high)| {
+                                            (low.to_f32_lossy(), high.to_f32_lossy())
+                                        })
+                                        .unwrap_or((lowest, highest));
+                                    let midpoint = (profile_low + profile_high) * 0.5;
+                                    let profile_span =
+                                        (profile_high - profile_low).max(0.0) + tick_size;
+                                    let fitted_span =
+                                        profile_span.max(tick_size * MIN_VISIBLE_FOOTPRINT_ROWS);
+                                    (midpoint - fitted_span * 0.5, midpoint + fitted_span * 0.5)
                                 }
                                 KlineChartKind::Tpo { config } => {
                                     const MIN_VISIBLE_TPO_ROWS: f32 = 16.0;
@@ -2319,15 +2525,19 @@ impl KlineChart {
             indi.clear_all_caches();
         }
 
-        let overlay_action = self
-            .footprint_history
-            .liquidity
-            .as_mut()
-            .and_then(|runtime| {
-                runtime
-                    .heatmap
-                    .sync_overlay(&self.chart, now.unwrap_or_else(Instant::now))
-            });
+        let overlay_action = if self.indicators[KlineIndicator::LiquidityHeatmap].is_some() {
+            self.footprint_history
+                .liquidity
+                .as_mut()
+                .and_then(|runtime| {
+                    runtime
+                        .heatmap
+                        .sync_overlay(&self.chart, now.unwrap_or_else(Instant::now))
+                })
+        } else {
+            self.footprint_history.liquidity = None;
+            None
+        };
 
         if let Some(t) = now {
             self.last_tick = t;
@@ -2369,6 +2579,12 @@ impl KlineChart {
             if indicator.needs_trade_history() {
                 self.request_handler = RequestHandler::default();
                 self.footprint_history.cutoff = None;
+                // Dropping these abort handles cancels every in-flight venue
+                // backfill. Forget their ownership records as well; otherwise
+                // `fetch_footprint_history` keeps those venues permanently
+                // marked active and never retries them for the new indicator.
+                self.footprint_history.trade_requests.clear();
+                self.footprint_history.oi_requests.clear();
                 self.footprint_history.fetch_handles.clear();
                 box_indi.configure_footprint_history(
                     &self.footprint_history.sources,
@@ -2462,7 +2678,9 @@ impl canvas::Program<Message> for KlineChart {
                         *clusters,
                     );
 
-                    let candle_width = 0.1 * chart.cell_width;
+                    // Never let the candle shrink below ~2.5 screen px so
+                    // body/wick stay visible when panned/zoomed away.
+                    let candle_width = (chart.cell_width * 0.1).max(2.5 / chart.scaling.max(0.1));
                     let content_spacing = ContentGaps::from_view(candle_width, chart.scaling);
 
                     let imbalance = studies.iter().find_map(|study| {
@@ -2487,9 +2705,6 @@ impl canvas::Program<Message> for KlineChart {
                         gaps: content_spacing,
                     };
 
-                    let text_size = cell_layout.text_size(chart.scaling);
-                    let show_text = cell_layout.should_show_text(chart.scaling);
-
                     draw_all_npocs(
                         &self.data_source,
                         frame,
@@ -2502,6 +2717,7 @@ impl canvas::Program<Message> for KlineChart {
                         imbalance.is_some(),
                     );
 
+                    let qty_is_quote = self.footprint_qty_is_quote();
                     render_data_source(
                         &self.data_source,
                         frame,
@@ -2509,10 +2725,14 @@ impl canvas::Program<Message> for KlineChart {
                         latest,
                         interval_to_x,
                         |frame, x_position, kline, trades| {
-                            let visible_max_notional =
-                                max_cluster_qty * kline.close.to_f64().max(1.0);
+                            let grouped = trades.grouped_to_step(self.tick_size());
+                            let visible_max_notional = if qty_is_quote {
+                                max_cluster_qty
+                            } else {
+                                max_cluster_qty * kline.close.to_f64().max(1.0)
+                            };
                             let individual_max_notional =
-                                max_cluster_notional(trades, cell_layout.cluster);
+                                max_cluster_notional(&grouped, cell_layout.cluster, qty_is_quote);
                             let cluster_scaling = effective_notional_scale(
                                 *scaling,
                                 visible_max_notional,
@@ -2526,13 +2746,12 @@ impl canvas::Program<Message> for KlineChart {
                                 &cell_layout,
                                 chart.scaling,
                                 cluster_scaling,
-                                text_size,
+                                qty_is_quote,
                                 self.tick_size(),
-                                show_text,
                                 self.visual_config.show_footprint_summary,
                                 imbalance,
                                 kline,
-                                trades,
+                                &grouped,
                             );
                         },
                     );
@@ -2599,6 +2818,7 @@ impl canvas::Program<Message> for KlineChart {
                         row_step,
                         visible_high,
                         visible_low,
+                        region.x + region.width,
                     );
                 }
             }
@@ -2645,6 +2865,18 @@ impl canvas::Program<Message> for KlineChart {
                 );
             }
 
+            if let Some(indicator) = self.indicators[KlineIndicator::VisibleRangeProfile].as_ref() {
+                let group_step = self.vpvr_group_step();
+                indicator.draw_overlay(
+                    frame,
+                    chart,
+                    &self.data_source,
+                    palette,
+                    region,
+                    group_step,
+                );
+            }
+
             chart.draw_last_price_line(frame, palette, region);
         });
 
@@ -2677,9 +2909,7 @@ impl canvas::Program<Message> for KlineChart {
                 );
             }
 
-            if let Some(cursor_position) = cursor.position_in(bounds)
-                && let Some(indicator) = self.indicators[KlineIndicator::LargeTrades].as_ref()
-            {
+            if let Some(cursor_position) = cursor.position_in(bounds) {
                 let center = Vector::new(bounds.width / 2.0, bounds.height / 2.0);
                 frame.translate(center);
                 frame.scale(chart.scaling);
@@ -2688,14 +2918,28 @@ impl canvas::Program<Message> for KlineChart {
                     (cursor_position.x - bounds.width / 2.0) / chart.scaling - chart.translation.x,
                     (cursor_position.y - bounds.height / 2.0) / chart.scaling - chart.translation.y,
                 );
-                indicator.draw_hover(
-                    frame,
-                    chart,
-                    &self.data_source,
-                    palette,
-                    visible_region,
-                    cursor_chart,
-                );
+                if let Some(indicator) = self.indicators[KlineIndicator::LargeTrades].as_ref() {
+                    indicator.draw_hover(
+                        frame,
+                        chart,
+                        &self.data_source,
+                        palette,
+                        visible_region,
+                        cursor_chart,
+                    );
+                }
+                if let Some(indicator) =
+                    self.indicators[KlineIndicator::VisibleRangeProfile].as_ref()
+                {
+                    indicator.draw_hover(
+                        frame,
+                        chart,
+                        &self.data_source,
+                        palette,
+                        visible_region,
+                        cursor_chart,
+                    );
+                }
             }
         });
 
@@ -2738,6 +2982,7 @@ fn draw_tpo_profiles(
     row_step: PriceStep,
     visible_high: Price,
     visible_low: Price,
+    visible_right: f32,
 ) {
     let PlotData::TickBased(tick_aggr) = data_source else {
         return;
@@ -2758,31 +3003,169 @@ fn draw_tpo_profiles(
     let end_idx = latest as usize;
     const MAX_PROFILES_PER_FRAME: usize = TpoConfig::MAX_HISTORY_PROFILES as usize;
 
-    tick_aggr
+    let visible_profiles = tick_aggr
         .datapoints
         .iter()
         .rev()
         .enumerate()
         .filter(|(index, _)| *index >= start_idx && *index <= end_idx)
         .take(MAX_PROFILES_PER_FRAME)
-        .for_each(|(index, datapoint)| {
-            if let Some(profile) = &datapoint.tpo {
-                draw_tpo_profile(
-                    frame,
-                    &price_to_y,
-                    interval_to_x(index as u64),
-                    cell_width,
-                    cell_height,
-                    scaling,
-                    palette,
-                    config,
-                    profile,
-                    row_step,
-                    visible_high,
-                    visible_low,
+        .filter_map(|(index, datapoint)| datapoint.tpo.as_ref().map(|profile| (index, profile)))
+        .collect::<Vec<_>>();
+
+    // Paint extensions first so every profile and its labels remain legible on
+    // top. Tick-chart indices are offsets from the newest profile, while the
+    // backing vector is oldest-to-newest; the helper below performs that
+    // conversion before looking for the first future tag.
+    if config.show_single_prints {
+        let scale = scaling.max(0.1);
+        let min_chart_px = 1.0 / scale;
+        let row_body_h = (cell_height * 0.94).max(min_chart_px);
+        let half_body = row_body_h * 0.5;
+        let line_width = min_chart_px.max(0.5);
+        let extension_fill = palette.warning.base.color.scale_alpha(0.14);
+        let extension_line = palette.warning.base.color.scale_alpha(0.42);
+
+        for (index, profile) in &visible_profiles {
+            let profile_right = interval_to_x(*index as u64)
+                + tpo_profile_half_width(profile, config, cell_width, scaling);
+
+            for price in profile
+                .rows
+                .keys()
+                .copied()
+                .filter(|&price| profile.is_single_print(price))
+            {
+                let tag_x = first_future_tpo_tag_offset(&tick_aggr.datapoints, *index, price)
+                    .and_then(|tag_index| {
+                        tick_aggr
+                            .datapoints
+                            .iter()
+                            .rev()
+                            .nth(tag_index)
+                            .and_then(|datapoint| datapoint.tpo.as_ref())
+                            .map(|tag_profile| {
+                                interval_to_x(tag_index as u64)
+                                    - tpo_profile_half_width(
+                                        tag_profile,
+                                        config,
+                                        cell_width,
+                                        scaling,
+                                    )
+                            })
+                    })
+                    .unwrap_or(visible_right)
+                    .min(visible_right);
+                let width = tag_x - profile_right;
+                if !width.is_finite() || width <= 0.0 {
+                    continue;
+                }
+
+                let y = price_to_y(price);
+                if !y.is_finite() {
+                    continue;
+                }
+                frame.fill_rectangle(
+                    Point::new(profile_right, y - half_body),
+                    Size::new(width, row_body_h),
+                    extension_fill,
+                );
+                frame.stroke(
+                    &Path::line(Point::new(profile_right, y), Point::new(tag_x, y)),
+                    Stroke::with_color(
+                        Stroke {
+                            width: line_width,
+                            ..Default::default()
+                        },
+                        extension_line,
+                    ),
                 );
             }
-        });
+        }
+    }
+
+    for (index, profile) in visible_profiles {
+        draw_tpo_profile(
+            frame,
+            &price_to_y,
+            interval_to_x(index as u64),
+            cell_width,
+            cell_height,
+            scaling,
+            palette,
+            config,
+            profile,
+            row_step,
+            visible_high,
+            visible_low,
+        );
+    }
+}
+
+/// Return the first later profile that trades `price`, expressed as the same
+/// offset-from-newest index used by tick-chart rendering.
+fn first_future_tpo_tag_offset(
+    datapoints: &[data::aggr::ticks::TickAccumulation],
+    current_offset: usize,
+    price: Price,
+) -> Option<usize> {
+    let current_raw = datapoints
+        .len()
+        .checked_sub(current_offset.checked_add(1)?)?;
+    let future_start = current_raw.checked_add(1)?;
+    let future_position = datapoints
+        .get(future_start..)?
+        .iter()
+        .position(|datapoint| {
+            datapoint
+                .tpo
+                .as_ref()
+                .is_some_and(|profile| profile.rows.contains_key(&price))
+        })?;
+    let tag_raw = future_start.checked_add(future_position)?;
+    datapoints.len().checked_sub(tag_raw.checked_add(1)?)
+}
+
+fn tpo_profile_half_width(
+    profile: &TpoProfile,
+    config: TpoConfig,
+    cell_width: f32,
+    scaling: f32,
+) -> f32 {
+    0.5 * tpo_profile_width(
+        config,
+        profile
+            .rows
+            .values()
+            .map(|row| row.count())
+            .max()
+            .unwrap_or(1),
+        cell_width,
+        scaling,
+    )
+}
+
+/// Full on-screen width of a TPO profile silhouette. Shared by the profile
+/// renderer and single-print extension rails so both agree where a profile
+/// column begins and ends.
+fn tpo_profile_width(
+    config: TpoConfig,
+    max_row_count: usize,
+    cell_width: f32,
+    scaling: f32,
+) -> f32 {
+    let scale = scaling.max(0.1);
+    let min_chart_px = 1.0 / scale;
+    // Keep daily profiles separated while giving each TPO enough width to be
+    // read as a letter or distinct block instead of a narrow gray silhouette.
+    let profile_width_fraction = if config.profile_period == TpoProfilePeriod::Day {
+        0.90
+    } else {
+        0.96
+    };
+    let available_width = (cell_width * profile_width_fraction).max(min_chart_px);
+    let block_width = (available_width / max_row_count.max(1) as f32).max(min_chart_px * 0.5);
+    block_width * max_row_count.max(1) as f32
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2817,15 +3200,8 @@ fn draw_tpo_profile(
     // that used to collapse the whole silhouette into a hairline.
     let scale = scaling.max(0.1);
     let min_chart_px = 1.0 / scale;
-    // Keep daily profiles separated while giving each TPO enough width to be
-    // read as a letter or distinct block instead of a narrow gray silhouette.
-    let profile_width_fraction = if config.profile_period == TpoProfilePeriod::Day {
-        0.90
-    } else {
-        0.96
-    };
-    let available_width = (cell_width * profile_width_fraction).max(min_chart_px);
-    let block_width = (available_width / max_row_count as f32).max(min_chart_px * 0.5);
+    let profile_width = tpo_profile_width(config, max_row_count, cell_width, scaling);
+    let block_width = (profile_width / max_row_count as f32).max(min_chart_px * 0.5);
     if !block_width.is_finite() || block_width <= 0.0 {
         return;
     }
@@ -2860,6 +3236,10 @@ fn draw_tpo_profile(
     };
     let profile_strong = mix_color(profile_color, palette.background.base.text, 0.82);
     let profile_muted = mix_color(profile_color, palette.background.base.color, 0.32);
+    // Warning is the theme's yellow/orange semantic color. Keep the single
+    // print ink and its full-row band deliberately faint while remaining
+    // independent of bullish/bearish profile direction.
+    let single_print_color = |alpha: f32| palette.warning.base.color.scale_alpha(alpha);
     let y_pad = (cell_height * 2.0).max(4.0 / scale);
 
     let y_hi = price_to_y(visible_high);
@@ -2892,8 +3272,20 @@ fn draw_tpo_profile(
             );
         }
 
+        // Faint full-width band behind single prints so un-auctioned territory
+        // stands out even when letters collapse into bars.
+        if is_single {
+            frame.fill_rectangle(
+                Point::new(left, y - half_body),
+                Size::new(profile_width, half_body * 2.0),
+                single_print_color(0.14),
+            );
+        }
+
         if compact_row_bars {
-            let color = if is_poc && config.show_poc {
+            let color = if is_single {
+                single_print_color(0.72)
+            } else if is_poc && config.show_poc {
                 profile_strong
             } else if config.show_value_area && in_value_area {
                 profile_color
@@ -2912,7 +3304,9 @@ fn draw_tpo_profile(
 
         for (ordinal, block) in row.blocks.iter().enumerate() {
             let x = left + (ordinal as f32 + 0.5) * block_width;
-            let base_color = if is_poc && config.show_poc {
+            let base_color = if is_single {
+                single_print_color(0.72)
+            } else if is_poc && config.show_poc {
                 profile_strong
             } else if config.show_value_area && in_value_area {
                 profile_color
@@ -3076,35 +3470,29 @@ fn draw_footprint_kline(
     let y_low = price_to_y(kline.low);
     let y_close = price_to_y(kline.close);
 
-    let body_color = if kline.close >= kline.open {
-        palette.success.weak.color
+    let is_up = kline.close >= kline.open;
+    let body_color = if is_up {
+        palette.success.base.color
     } else {
-        palette.danger.weak.color
+        palette.danger.base.color
     };
-    frame.fill_rectangle(
-        Point::new(x_position - (candle_width / 8.0), y_open.min(y_close)),
-        Size::new(candle_width / 4.0, (y_open - y_close).abs()),
-        body_color,
-    );
+    let wick_color = if is_up {
+        palette.success.strong.color
+    } else {
+        palette.danger.strong.color
+    };
 
-    let wick_color = if kline.close >= kline.open {
-        palette.success.weak.color
-    } else {
-        palette.danger.weak.color
-    };
-    let marker_line = Stroke::with_color(
-        Stroke {
-            width: 1.0,
-            ..Default::default()
-        },
-        wick_color.scale_alpha(0.6),
+    let body_h = (y_open - y_close).abs().max(candle_width * 0.18);
+    let wick_w = (candle_width * 0.34).max(1.0);
+    frame.fill_rectangle(
+        Point::new(x_position - wick_w / 2.0, y_high.min(y_low)),
+        Size::new(wick_w, (y_high - y_low).abs()),
+        wick_color.scale_alpha(0.95),
     );
-    frame.stroke(
-        &Path::line(
-            Point::new(x_position, y_high),
-            Point::new(x_position, y_low),
-        ),
-        marker_line,
+    frame.fill_rectangle(
+        Point::new(x_position - candle_width / 2.0, y_open.min(y_close)),
+        Size::new(candle_width, body_h),
+        body_color,
     );
 }
 
@@ -3246,7 +3634,7 @@ fn draw_all_npocs(
 
     let line_height = layout.cell_h.min(1.0);
 
-    let bar_width_factor: f32 = 0.9;
+    let bar_width_factor: f32 = 0.98;
     let inset = (layout.cell_w * (1.0 - bar_width_factor)) / 2.0;
 
     let candle_lane_factor: f32 = match layout.cluster {
@@ -3256,9 +3644,8 @@ fn draw_all_npocs(
 
     let start_x_for = |cell_center_x: f32| -> f32 {
         match layout.cluster {
-            ClusterKind::Table => cell_center_x + (layout.cell_w / 2.0) - inset,
-            ClusterKind::BidAsk => {
-                cell_center_x + (layout.candle_w / 2.0) + layout.gaps.candle_to_cluster
+            ClusterKind::Table | ClusterKind::BidAsk => {
+                cell_center_x + (layout.cell_w / 2.0) - inset
             }
             ClusterKind::VolumeProfile | ClusterKind::DeltaProfile => {
                 let content_left = (cell_center_x - (layout.cell_w / 2.0)) + inset;
@@ -3294,7 +3681,7 @@ fn draw_all_npocs(
 
     let end_x_for = |cell_center_x: f32| -> f32 {
         match layout.cluster {
-            ClusterKind::Table => {
+            ClusterKind::Table | ClusterKind::BidAsk => {
                 let content_left = cell_center_x - (layout.cell_w / 2.0) + inset;
                 let content_right = cell_center_x + (layout.cell_w / 2.0) - inset;
                 let table_layout = TableLayout::new(
@@ -3305,9 +3692,6 @@ fn draw_all_npocs(
                     imb_study_on,
                 );
                 table_layout.table_left
-            }
-            ClusterKind::BidAsk => {
-                cell_center_x - (layout.candle_w / 2.0) - layout.gaps.candle_to_cluster
             }
             ClusterKind::VolumeProfile | ClusterKind::DeltaProfile => wick_x_for(cell_center_x),
         }
@@ -3381,6 +3765,20 @@ fn draw_all_npocs(
     }
 }
 
+fn cluster_label_size(available_w: f32, cell_h: f32, scaling: f32) -> Option<f32> {
+    let scaling = scaling.max(0.1);
+    let screen_h = cell_h * scaling;
+    let screen_w = available_w.max(0.0) * scaling;
+    // Keep values visible while zoomed/panned away — shrink the font instead
+    // of dropping it, and only hide labels once they'd be a smudge.
+    if screen_h < 4.5 || screen_w < 10.0 {
+        return None;
+    }
+    // ~5-character labels ("12.3k") in a monospace chart font.
+    let size = (screen_w / 4.6).min(screen_h * 0.72).min(14.0);
+    (size >= 4.5).then_some(size / scaling)
+}
+
 fn draw_clusters(
     frame: &mut canvas::Frame,
     price_to_y: impl Fn(Price) -> f32,
@@ -3388,17 +3786,17 @@ fn draw_clusters(
     layout: &FootprintCellLayout<'_>,
     scaling: f32,
     max_cluster_qty: f64,
-    text_size: f32,
+    qty_is_quote: bool,
     step: PriceStep,
-    show_text: bool,
     show_summary: bool,
     imbalance: Option<(usize, Option<usize>, bool)>,
     kline: &Kline,
     footprint: &KlineTrades,
 ) {
     let text_color = layout.pal.background.weakest.text;
+    let max_cluster_qty = max_cluster_qty.max(1.0);
 
-    let bar_width_factor: f32 = 0.9;
+    let bar_width_factor: f32 = 0.96;
     let inset = (layout.cell_w * (1.0 - bar_width_factor)) / 2.0;
 
     let cell_left = x_position - (layout.cell_w / 2.0);
@@ -3416,13 +3814,14 @@ fn draw_clusters(
                 layout.gaps,
                 imbalance.is_some(),
             );
-            let bar_alpha = if show_text { 0.25 } else { 1.0 };
+            let text_size = cluster_label_size(area.bars_width, layout.cell_h, scaling);
+            let bar_alpha = if text_size.is_some() { 0.25 } else { 1.0 };
 
             for (price, group) in &footprint.trades {
                 let buy_base = group.buy_qty.to_f64();
                 let sell_base = group.sell_qty.to_f64();
-                let buy_qty = usd_notional(*price, buy_base);
-                let sell_qty = usd_notional(*price, sell_base);
+                let buy_qty = usd_notional(*price, buy_base, qty_is_quote);
+                let sell_qty = usd_notional(*price, sell_base, qty_is_quote);
                 let y = price_to_y(*price);
 
                 match layout.cluster {
@@ -3442,7 +3841,7 @@ fn draw_clusters(
                             true,
                         );
 
-                        if show_text {
+                        if let Some(text_size) = text_size {
                             draw_cluster_text(
                                 frame,
                                 &abbr_large_numbers(buy_qty + sell_qty),
@@ -3456,7 +3855,7 @@ fn draw_clusters(
                     }
                     ClusterKind::DeltaProfile => {
                         let delta = buy_qty - sell_qty;
-                        if show_text {
+                        if let Some(text_size) = text_size {
                             draw_cluster_text(
                                 frame,
                                 &abbr_large_numbers(delta),
@@ -3468,7 +3867,8 @@ fn draw_clusters(
                             );
                         }
 
-                        let bar_width = (delta.abs() / max_cluster_qty) as f32 * area.bars_width;
+                        let bar_width = ((delta.abs() / max_cluster_qty) as f32 * area.bars_width)
+                            .clamp(0.0, area.bars_width);
                         if bar_width > 0.0 {
                             let color = if delta >= 0.0 {
                                 layout.pal.success.base.color.scale_alpha(bar_alpha)
@@ -3533,13 +3933,15 @@ fn draw_clusters(
             table_layout = Some(tl);
             let table_width = area.width();
             let half_width = table_width / 2.0;
-            let cell_border = 1.0;
-            let grid_color = layout.pal.background.weakest.text.scale_alpha(0.32);
+            let mid_x = area.table_left + half_width;
+            let cell_border = 1.0 / scaling.max(0.1);
+            let text_size =
+                cluster_label_size(half_width - 4.0 / scaling.max(0.1), layout.cell_h, scaling);
             for (price, group) in &footprint.trades {
                 let buy_base = group.buy_qty.to_f64();
                 let sell_base = group.sell_qty.to_f64();
-                let buy_qty = usd_notional(*price, buy_base);
-                let sell_qty = usd_notional(*price, sell_base);
+                let buy_qty = usd_notional(*price, buy_base, qty_is_quote);
+                let sell_qty = usd_notional(*price, sell_base, qty_is_quote);
                 let y = price_to_y(*price);
                 let row_top = y - (layout.cell_h / 2.0);
 
@@ -3605,7 +4007,7 @@ fn draw_clusters(
                             buy_qty,
                             max_cluster_qty,
                             Rectangle::new(
-                                Point::new(area.table_left + half_width, row_top),
+                                Point::new(mid_x, row_top),
                                 Size::new(half_width, layout.cell_h),
                             ),
                         );
@@ -3613,29 +4015,9 @@ fn draw_clusters(
                 }
 
                 frame.fill_rectangle(
-                    Point::new(area.table_left, row_top),
-                    Size::new(table_width, cell_border),
-                    grid_color,
-                );
-                frame.fill_rectangle(
-                    Point::new(area.table_left, row_top + layout.cell_h - cell_border),
-                    Size::new(table_width, cell_border),
-                    grid_color,
-                );
-                frame.fill_rectangle(
-                    Point::new(area.table_left, row_top),
-                    Size::new(cell_border, layout.cell_h),
-                    grid_color,
-                );
-                frame.fill_rectangle(
                     Point::new(area.table_left + half_width, row_top),
                     Size::new(cell_border, layout.cell_h),
-                    grid_color,
-                );
-                frame.fill_rectangle(
-                    Point::new(area.table_right - cell_border, row_top),
-                    Size::new(cell_border, layout.cell_h),
-                    grid_color,
+                    layout.pal.background.weakest.text.scale_alpha(0.32),
                 );
 
                 if footprint
@@ -3650,15 +4032,15 @@ fn draw_clusters(
                         ),
                         Stroke::default()
                             .with_color(layout.pal.primary.strong.color)
-                            .with_width(2.0 / scaling.max(0.1)),
+                            .with_width(1.0),
                     );
                 }
 
-                if show_text {
+                if let Some(text_size) = text_size {
                     draw_cluster_text(
                         frame,
                         &abbr_large_numbers(sell_qty),
-                        Point::new(area.table_left + half_width - 3.0, y),
+                        Point::new(area.table_left + half_width - 3.0 / scaling.max(0.1), y),
                         text_size,
                         sell_text_color,
                         Alignment::End,
@@ -3667,7 +4049,7 @@ fn draw_clusters(
                     draw_cluster_text(
                         frame,
                         &abbr_large_numbers(buy_qty),
-                        Point::new(area.table_left + half_width + 3.0, y),
+                        Point::new(area.table_left + half_width + 3.0 / scaling.max(0.1), y),
                         text_size,
                         buy_text_color,
                         Alignment::Start,
@@ -3677,15 +4059,7 @@ fn draw_clusters(
             }
         }
         ClusterKind::BidAsk => {
-            let area = BidAskArea::new(
-                x_position,
-                content_left,
-                content_right,
-                layout.candle_w,
-                layout.gaps,
-            );
-
-            let bar_alpha = if show_text { 0.25 } else { 1.0 };
+            let area = BidAskArea::new(content_left, content_right, layout.candle_w, layout.gaps);
 
             let imb_marker_reserve = if imbalance.is_some() {
                 ((area.imb_marker_width - 1.0) / 2.0).max(1.0)
@@ -3700,16 +4074,22 @@ fn draw_clusters(
             let left_min_x =
                 area.ask_area_left + imb_marker_reserve + (2.0 * layout.gaps.marker_to_bars);
             let left_area_width = (area.ask_area_right - left_min_x).max(0.0);
+            let text_size = cluster_label_size(
+                left_area_width.min(right_area_width),
+                layout.cell_h,
+                scaling,
+            );
+            let bar_alpha = if text_size.is_some() { 0.25 } else { 1.0 };
 
             for (price, group) in &footprint.trades {
                 let buy_base = group.buy_qty.to_f64();
                 let sell_base = group.sell_qty.to_f64();
-                let buy_qty = usd_notional(*price, buy_base);
-                let sell_qty = usd_notional(*price, sell_base);
+                let buy_qty = usd_notional(*price, buy_base, qty_is_quote);
+                let sell_qty = usd_notional(*price, sell_base, qty_is_quote);
                 let y = price_to_y(*price);
 
                 if buy_qty > 0.0 && right_area_width > 0.0 {
-                    if show_text {
+                    if let Some(text_size) = text_size {
                         draw_cluster_text(
                             frame,
                             &abbr_large_numbers(buy_qty),
@@ -3721,7 +4101,8 @@ fn draw_clusters(
                         );
                     }
 
-                    let bar_width = (buy_qty / max_cluster_qty) as f32 * right_area_width;
+                    let bar_width = ((buy_qty / max_cluster_qty) as f32 * right_area_width)
+                        .clamp(0.0, right_area_width);
                     if bar_width > 0.0 {
                         frame.fill_rectangle(
                             Point::new(area.bid_area_left, y - (layout.cell_h / 2.0)),
@@ -3731,7 +4112,7 @@ fn draw_clusters(
                     }
                 }
                 if sell_qty > 0.0 && left_area_width > 0.0 {
-                    if show_text {
+                    if let Some(text_size) = text_size {
                         draw_cluster_text(
                             frame,
                             &abbr_large_numbers(sell_qty),
@@ -3743,11 +4124,12 @@ fn draw_clusters(
                         );
                     }
 
-                    let bar_width = (sell_qty / max_cluster_qty) as f32 * left_area_width;
+                    let bar_width = ((sell_qty / max_cluster_qty) as f32 * left_area_width)
+                        .clamp(0.0, left_area_width);
                     if bar_width > 0.0 {
                         frame.fill_rectangle(
-                            Point::new(area.ask_area_right, y - (layout.cell_h / 2.0)),
-                            Size::new(-bar_width, layout.cell_h),
+                            Point::new(area.ask_area_right - bar_width, y - (layout.cell_h / 2.0)),
+                            Size::new(bar_width, layout.cell_h),
                             layout.pal.danger.base.color.scale_alpha(bar_alpha),
                         );
                     }
@@ -3794,7 +4176,9 @@ fn draw_clusters(
     }
 
     if show_summary {
-        let Some((total_notional, delta_notional)) = footprint_notional_summary(footprint) else {
+        let Some((total_notional, delta_notional)) =
+            footprint_notional_summary(footprint, qty_is_quote)
+        else {
             return;
         };
 
@@ -3852,17 +4236,21 @@ fn draw_clusters(
     }
 }
 
-fn usd_notional(price: Price, base_qty: f64) -> f64 {
-    price.to_f64() * base_qty
+fn usd_notional(price: Price, qty: f64, qty_is_quote: bool) -> f64 {
+    if qty_is_quote {
+        qty
+    } else {
+        price.to_f64() * qty
+    }
 }
 
-fn max_cluster_notional(footprint: &KlineTrades, cluster: ClusterKind) -> f64 {
+fn max_cluster_notional(footprint: &KlineTrades, cluster: ClusterKind, qty_is_quote: bool) -> f64 {
     footprint
         .trades
         .iter()
         .map(|(price, group)| {
-            let buy = usd_notional(*price, group.buy_qty.to_f64());
-            let sell = usd_notional(*price, group.sell_qty.to_f64());
+            let buy = usd_notional(*price, group.buy_qty.to_f64(), qty_is_quote);
+            let sell = usd_notional(*price, group.sell_qty.to_f64(), qty_is_quote);
             match cluster {
                 ClusterKind::BidAsk | ClusterKind::Table => buy.max(sell),
                 ClusterKind::DeltaProfile => (buy - sell).abs(),
@@ -3883,14 +4271,14 @@ fn effective_notional_scale(scaling: ClusterScaling, visible_max: f64, individua
     }
 }
 
-fn footprint_notional_summary(footprint: &KlineTrades) -> Option<(f64, f64)> {
+fn footprint_notional_summary(footprint: &KlineTrades, qty_is_quote: bool) -> Option<(f64, f64)> {
     (!footprint.trades.is_empty()).then(|| {
         footprint
             .trades
             .iter()
             .fold((0.0, 0.0), |(total, delta), (price, group)| {
-                let buy = usd_notional(*price, group.buy_qty.to_f64());
-                let sell = usd_notional(*price, group.sell_qty.to_f64());
+                let buy = usd_notional(*price, group.buy_qty.to_f64(), qty_is_quote);
+                let sell = usd_notional(*price, group.sell_qty.to_f64(), qty_is_quote);
                 (total + buy + sell, delta + buy - sell)
             })
     })
@@ -4133,7 +4521,9 @@ enum ImbalanceSide {
 
 impl ImbalanceSide {
     fn volume_bg_color(self, qty: f64, max_qty: f64, palette: &Extended) -> Color {
-        const MIN_ALPHA: f32 = 0.04;
+        // Strong floor so even low-volume rows read as solid cells (the
+        // reference footprint look); intensity still ramps to full alpha.
+        const MIN_ALPHA: f32 = 0.45;
 
         let intensity = if max_qty > 0.0 {
             (qty / max_qty).clamp(0.0, 1.0) as f32
@@ -4274,16 +4664,19 @@ struct ContentGaps {
     candle_to_cluster: f32,
     /// Inner space reserved between imb. markers and clusters (used for BidAsk)
     marker_to_bars: f32,
+    /// Gutter between the sell and buy halves in BidAsk mode
+    bid_to_ask: f32,
 }
 
 impl ContentGaps {
     fn from_view(candle_width: f32, scaling: f32) -> Self {
-        let px = |p: f32| p / scaling;
+        let px = |p: f32| p / scaling.max(0.1);
         let base = (candle_width * 0.2).max(px(2.0));
         Self {
             marker_to_candle: base,
             candle_to_cluster: base,
             marker_to_bars: px(2.0),
+            bid_to_ask: px(8.0),
         }
     }
 }
@@ -4296,24 +4689,6 @@ struct FootprintCellLayout<'a> {
     pal: &'a Extended,
     cluster: ClusterKind,
     gaps: ContentGaps,
-}
-
-impl FootprintCellLayout<'_> {
-    /// Compute the text size for cluster labels based on on-screen cell dimensions.
-    fn text_size(&self, scaling: f32) -> f32 {
-        let cell_height_unscaled = self.cell_h * scaling;
-        let cell_width_unscaled = self.cell_w * scaling;
-        let from_height = cell_height_unscaled.round().min(16.0) - 3.0;
-        let from_width = (cell_width_unscaled * 0.1).round().min(16.0) - 3.0;
-        from_height.min(from_width)
-    }
-
-    /// Whether cluster text labels should be drawn given current zoom level.
-    fn should_show_text(&self, scaling: f32) -> bool {
-        const THRESHOLD: f32 = 8.0;
-        self.cell_h * scaling > THRESHOLD
-            && self.cell_w * scaling > self.cluster.min_footprint_width()
-    }
 }
 
 struct ProfileArea {
@@ -4364,27 +4739,28 @@ struct BidAskArea {
 }
 
 impl BidAskArea {
-    fn new(
-        x_position: f32,
-        content_left: f32,
-        content_right: f32,
-        candle_width: f32,
-        spacing: ContentGaps,
-    ) -> Self {
-        let candle_body_width = candle_width * 0.25;
+    fn new(content_left: f32, content_right: f32, candle_width: f32, spacing: ContentGaps) -> Self {
+        // Candle lives in its own lane on the left edge of the cell, both
+        // histograms sit to its right (reference footprint layout).
+        let candle_center_x = content_left + candle_width / 2.0;
+        let hist_left =
+            (content_left + candle_width + spacing.candle_to_cluster).min(content_right);
+        let half_width = ((content_right - hist_left) / 2.0).max(0.0);
 
-        let candle_left = x_position - (candle_body_width / 2.0);
-        let candle_right = x_position + (candle_body_width / 2.0);
-
-        let ask_area_right = candle_left - spacing.candle_to_cluster;
-        let bid_area_left = candle_right + spacing.candle_to_cluster;
+        // Keep a readable gutter between the sell and buy halves.
+        let mid = hist_left + half_width;
+        let gutter = spacing.bid_to_ask.min(half_width);
+        let ask_area_left = hist_left;
+        let ask_area_right = (mid - gutter / 2.0).max(hist_left);
+        let bid_area_left = (mid + gutter / 2.0).min(content_right);
+        let bid_area_right = content_right;
 
         Self {
             bid_area_left,
-            bid_area_right: content_right,
-            ask_area_left: content_left,
+            bid_area_right,
+            ask_area_left,
             ask_area_right,
-            candle_center_x: x_position,
+            candle_center_x,
             imb_marker_width: candle_width,
         }
     }
@@ -4520,6 +4896,9 @@ fn price_padding_from_pixels(cell_height: f32, tick_size: f32) -> f32 {
 mod tests {
     use super::*;
     use exchange::{Ticker, Trade, Volume, adapter::Exchange, unit::Qty};
+    use std::sync::Mutex;
+
+    static TRADE_FETCH_MODE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn test_trade(price: f64, qty: f64, is_sell: bool) -> Trade {
         Trade {
@@ -4530,6 +4909,390 @@ mod tests {
         }
     }
 
+    fn tpo_seed_bar(day: u64, low: f64, high: f64) -> Kline {
+        let open = Price::from_f64((low + high) * 0.5);
+        Kline {
+            time: UnixMs::new(day * 86_400_000 + 60_000),
+            open,
+            high: Price::from_f64(high),
+            low: Price::from_f64(low),
+            close: open,
+            volume: Volume::TotalOnly(Qty::ZERO),
+        }
+    }
+
+    #[test]
+    fn tpo_single_print_extension_stops_at_first_future_tag() {
+        let config = TpoConfig {
+            ticks_per_row: 1,
+            ..TpoConfig::default()
+        };
+        let bars = [
+            tpo_seed_bar(1, 100.0, 102.0),
+            tpo_seed_bar(2, 101.0, 102.0),
+            tpo_seed_bar(3, 100.0, 101.0),
+        ];
+        let tick_aggr = TickAggr::new_tpo_seeded(
+            config,
+            PriceStep {
+                units: Price::from_f64(1.0).units,
+            },
+            &bars,
+            &[],
+        );
+
+        // Rendering offsets run newest-to-oldest: 0=newest, 2=oldest.
+        assert_eq!(
+            first_future_tpo_tag_offset(&tick_aggr.datapoints, 2, Price::from_f64(101.0)),
+            Some(1),
+            "the immediately following profile is the first tag"
+        );
+        assert_eq!(
+            first_future_tpo_tag_offset(&tick_aggr.datapoints, 2, Price::from_f64(100.0)),
+            Some(0),
+            "the extension must skip a non-tagging profile"
+        );
+        assert_eq!(
+            first_future_tpo_tag_offset(&tick_aggr.datapoints, 1, Price::from_f64(102.0)),
+            None,
+            "older profiles must never count as future tags"
+        );
+        assert_eq!(
+            first_future_tpo_tag_offset(&tick_aggr.datapoints, 0, Price::from_f64(101.0)),
+            None,
+            "the newest profile has no future tag"
+        );
+    }
+
+    #[test]
+    fn tpo_history_boundary_aligns_to_the_profile_session() {
+        let config = TpoConfig {
+            session_start_minutes_utc: 8 * 60 + 30,
+            ..TpoConfig::default()
+        };
+        let now = UnixMs::new(200 * 86_400_000 + 17 * 60 * 60 * 1_000 + 12_345);
+        let boundary = tpo_history_earliest(config, now);
+
+        assert_eq!(boundary, config.profile_start(boundary));
+        assert!(boundary <= now.saturating_sub(config.history_range_ms()));
+        assert!(
+            now.saturating_sub(config.history_range_ms())
+                .saturating_diff(boundary)
+                < config.profile_period.millis()
+        );
+    }
+
+    #[test]
+    fn incremental_aggregate_tpo_pages_match_a_full_rebuild() {
+        let primary = TickerInfo::new(
+            Ticker::new("BTCUSDT", Exchange::BinanceLinear),
+            1.0,
+            0.001,
+            None,
+        );
+        let secondary = TickerInfo::new(
+            Ticker::new("BTCUSDT", Exchange::BybitLinear),
+            1.0,
+            0.001,
+            None,
+        );
+        let feed = ResolvedFeed::aggregated(
+            data::aggregation::AggregateFeedId::BtcUsdtPerpetual,
+            primary,
+            &[primary, secondary],
+        );
+        let config = TpoConfig {
+            ticks_per_row: 1,
+            ..TpoConfig::default()
+        };
+        let step = PriceStep {
+            units: Price::from_f64(1.0).units,
+        };
+        let primary_first = [tpo_seed_bar(1, 100.0, 102.0), tpo_seed_bar(2, 101.0, 103.0)];
+        let primary_second = [tpo_seed_bar(3, 102.0, 104.0)];
+        let secondary_page = [
+            tpo_seed_bar(1, 99.0, 103.0),
+            tpo_seed_bar(2, 100.0, 104.0),
+            tpo_seed_bar(3, 101.0, 105.0),
+        ];
+
+        let mut aggregator = KlineAggregator::new(&feed);
+        let mut incremental = TickAggr::new_tpo_seeded(config, step, &[], &[]);
+        for (source, page) in [
+            (primary, primary_first.as_slice()),
+            (primary, primary_second.as_slice()),
+            (secondary, secondary_page.as_slice()),
+        ] {
+            aggregator.insert(source, page);
+            let start = page.iter().map(|bar| bar.time).min().unwrap();
+            let end = page.iter().map(|bar| bar.time).max().unwrap();
+            incremental.insert_tpo_klines(&aggregator.composite_klines_in_range(start, end));
+        }
+
+        let rebuilt = TickAggr::new_tpo_seeded(config, step, &aggregator.composite_klines(), &[]);
+        assert_eq!(incremental.datapoints.len(), rebuilt.datapoints.len());
+        for (actual, expected) in incremental.datapoints.iter().zip(&rebuilt.datapoints) {
+            assert_eq!(actual.kline.open, expected.kline.open);
+            assert_eq!(actual.kline.high, expected.kline.high);
+            assert_eq!(actual.kline.low, expected.kline.low);
+            assert_eq!(actual.kline.close, expected.kline.close);
+            let actual = actual.tpo.as_ref().unwrap();
+            let expected = expected.tpo.as_ref().unwrap();
+            assert_eq!(actual.poc, expected.poc);
+            assert_eq!(actual.value_area_high, expected.value_area_high);
+            assert_eq!(actual.value_area_low, expected.value_area_low);
+            assert_eq!(actual.total_tpos, expected.total_tpos);
+            assert_eq!(
+                actual
+                    .rows
+                    .iter()
+                    .map(|(price, row)| (*price, row.blocks.clone()))
+                    .collect::<Vec<_>>(),
+                expected
+                    .rows
+                    .iter()
+                    .map(|(price, row)| (*price, row.blocks.clone()))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn aggregated_live_trades_create_footprint_buckets_before_klines() {
+        let source = TickerInfo::new(
+            Ticker::new("BTCUSDT", Exchange::BinanceLinear),
+            0.1,
+            0.001,
+            None,
+        );
+        let mut chart = KlineChart::new(
+            ViewConfig::default(),
+            Basis::Time(Timeframe::M5),
+            PriceStep::from(source.min_ticksize),
+            &[],
+            Vec::new(),
+            &[],
+            source,
+            &KlineChartKind::Footprint {
+                clusters: ClusterKind::Table,
+                scaling: ClusterScaling::default(),
+                studies: vec![],
+            },
+            None,
+        );
+        chart.set_feed(ResolvedFeed::direct(source));
+        assert!(chart.is_empty());
+
+        let mut trade = test_trade(67_000.0, 0.01, false);
+        trade.time = UnixMs::now();
+        chart.insert_trades(source, &[trade]);
+
+        assert!(!chart.is_empty());
+        assert!(chart.chart.latest_x > 0);
+    }
+
+    #[test]
+    fn live_footprint_backfills_each_sources_missing_candle_prefix_once() {
+        let binance = TickerInfo::new(
+            Ticker::new("BTCUSDT", Exchange::BinanceLinear),
+            0.1,
+            0.001,
+            None,
+        );
+        let bybit = TickerInfo::new(
+            Ticker::new("BTCUSDT", Exchange::BybitLinear),
+            0.1,
+            0.001,
+            None,
+        );
+        let feed = ResolvedFeed::from_sources_selected(binance, &[binance, bybit], None);
+        let interval = Timeframe::M30;
+        let bucket = UnixMs::new(1_800_000_000_000).floor_to(interval);
+        let kline = seed_kline(bucket, 67_000.0);
+        let mut chart = KlineChart::new(
+            ViewConfig::default(),
+            Basis::Time(interval),
+            feed.price_step(),
+            &[kline],
+            Vec::new(),
+            &[],
+            binance,
+            &KlineChartKind::Footprint {
+                clusters: ClusterKind::Table,
+                scaling: ClusterScaling::default(),
+                studies: vec![],
+            },
+            None,
+        );
+        chart.set_feed(feed);
+
+        let binance_start = bucket.saturating_add(13 * 60_000);
+        let bybit_start = bucket.saturating_add(14 * 60_000);
+        let mut binance_trade = test_trade(67_000.0, 0.5, false);
+        binance_trade.time = binance_start;
+        let mut bybit_trade = test_trade(67_000.0, 0.25, true);
+        bybit_trade.time = bybit_start;
+        chart.insert_trades(binance, &[binance_trade]);
+        chart.insert_trades(bybit, &[bybit_trade]);
+
+        let specs = chart.visible_trade_prefix_fetches(
+            bucket,
+            bucket.saturating_add(interval.to_milliseconds()),
+            interval,
+            TradeFetchMode::Server,
+        );
+        assert_eq!(specs.len(), 2);
+        for spec in &specs {
+            let source = spec.stream.expect("prefix fetch must identify its source");
+            let expected_end = if source.ticker_info() == binance {
+                binance_start.saturating_sub(1)
+            } else if source.ticker_info() == bybit {
+                bybit_start.saturating_sub(1)
+            } else {
+                panic!("unexpected prefix source: {source:?}");
+            };
+            assert_eq!(
+                spec.fetch,
+                FetchRange::FootprintTrades(bucket, expected_end)
+            );
+            chart.request_handler.mark_completed(spec.req_id);
+        }
+
+        assert!(
+            chart
+                .visible_trade_prefix_fetches(
+                    bucket,
+                    bucket.saturating_add(interval.to_milliseconds()),
+                    interval,
+                    TradeFetchMode::Server,
+                )
+                .is_empty(),
+            "completed source prefixes must not be requested again"
+        );
+    }
+
+    #[test]
+    fn aggregate_trade_fetch_stays_active_until_every_venue_finishes() {
+        let source = TickerInfo::new(
+            Ticker::new("BTCUSDT", Exchange::BinanceLinear),
+            0.1,
+            0.001,
+            None,
+        );
+        let mut chart = KlineChart::new(
+            ViewConfig::default(),
+            Basis::Time(Timeframe::M30),
+            PriceStep::from(source.min_ticksize),
+            &[],
+            Vec::new(),
+            &[],
+            source,
+            &KlineChartKind::Footprint {
+                clusters: ClusterKind::Table,
+                scaling: ClusterScaling::default(),
+                studies: vec![],
+            },
+            None,
+        );
+        let range = FetchRange::FootprintTrades(UnixMs::new(1), UnixMs::new(2));
+        let specs = [
+            Exchange::BinanceLinear,
+            Exchange::BybitLinear,
+            Exchange::HyperliquidLinear,
+        ]
+        .into_iter()
+        .map(|exchange| FetchSpec {
+            req_id: uuid::Uuid::new_v4(),
+            fetch: range,
+            stream: Some(StreamKind::Trades {
+                ticker_info: TickerInfo::new(
+                    Ticker::new(
+                        if exchange == Exchange::HyperliquidLinear {
+                            "BTC"
+                        } else {
+                            "BTCUSDT"
+                        },
+                        exchange,
+                    ),
+                    0.1,
+                    0.001,
+                    None,
+                ),
+            }),
+        })
+        .collect::<Vec<_>>();
+
+        chart.begin_trade_fetches(&specs);
+        assert!(chart.is_fetching_trades());
+        assert_eq!(chart.active_trade_fetches.len(), 3);
+
+        chart.finalize_trade_fetch(specs[0].req_id);
+        assert!(chart.is_fetching_trades());
+        assert_eq!(chart.active_trade_fetches.len(), 2);
+        chart.finalize_trade_fetch(specs[1].req_id);
+        assert!(chart.is_fetching_trades());
+        assert_eq!(chart.active_trade_fetches.len(), 1);
+        chart.finalize_trade_fetch(specs[2].req_id);
+        assert!(!chart.is_fetching_trades());
+        assert!(chart.active_trade_fetches.is_empty());
+    }
+
+    #[test]
+    fn aggregate_chart_rejects_stale_and_deselected_source_pages() {
+        let binance = TickerInfo::new(
+            Ticker::new("BTCUSDT", Exchange::BinanceLinear),
+            0.1,
+            0.001,
+            None,
+        );
+        let bybit = TickerInfo::new(
+            Ticker::new("BTCUSDT", Exchange::BybitLinear),
+            0.1,
+            0.001,
+            None,
+        );
+        let feed =
+            ResolvedFeed::from_sources_selected(bybit, &[binance, bybit], Some(&[bybit.ticker]));
+        let bucket = UnixMs::new(1_800_000_000_000).floor_to(Timeframe::M30);
+        let mut chart = KlineChart::new(
+            ViewConfig::default(),
+            Basis::Time(Timeframe::M30),
+            feed.price_step(),
+            &[seed_kline(bucket, 67_000.0)],
+            Vec::new(),
+            &[],
+            bybit,
+            &KlineChartKind::Footprint {
+                clusters: ClusterKind::Table,
+                scaling: ClusterScaling::default(),
+                studies: vec![],
+            },
+            None,
+        );
+        chart.set_feed(feed);
+        let current_id = uuid::Uuid::new_v4();
+        chart.begin_trade_fetches(&[FetchSpec {
+            req_id: current_id,
+            fetch: FetchRange::FootprintTrades(bucket, bucket.saturating_add(60_000)),
+            stream: Some(StreamKind::Trades { ticker_info: bybit }),
+        }]);
+        let mut trade = test_trade(67_000.0, 1.0, false);
+        trade.time = bucket.saturating_add(1_000);
+
+        chart.insert_raw_trades(bybit, vec![trade], false, Some(uuid::Uuid::new_v4()));
+        chart.insert_raw_trades(binance, vec![trade], false, Some(current_id));
+        let PlotData::TimeBased(series) = &chart.data_source else {
+            panic!("time chart expected");
+        };
+        assert!(series.datapoints[&bucket].footprint.trades.is_empty());
+
+        chart.insert_raw_trades(bybit, vec![trade], false, Some(current_id));
+        let PlotData::TimeBased(series) = &chart.data_source else {
+            panic!("time chart expected");
+        };
+        assert_eq!(series.datapoints[&bucket].footprint.trades.len(), 1);
+    }
+
     #[test]
     fn footprint_rows_and_summary_use_usd_notional() {
         let mut footprint = KlineTrades::new();
@@ -4537,8 +5300,137 @@ mod tests {
         footprint.add_trade_to_nearest_bin(&test_trade(100.0, 2.0, false), step);
         footprint.add_trade_to_nearest_bin(&test_trade(100.0, 1.0, true), step);
 
-        assert_eq!(max_cluster_notional(&footprint, ClusterKind::Table), 200.0);
-        assert_eq!(footprint_notional_summary(&footprint), Some((300.0, 100.0)));
+        assert_eq!(
+            max_cluster_notional(&footprint, ClusterKind::Table, false),
+            200.0
+        );
+        assert_eq!(
+            footprint_notional_summary(&footprint, false),
+            Some((300.0, 100.0))
+        );
+        assert_eq!(
+            footprint_notional_summary(&footprint, true),
+            Some((3.0, 1.0)),
+            "quote-normalized quantities must not be multiplied by price twice"
+        );
+    }
+
+    #[test]
+    fn vpvr_grouping_uses_feed_ticks_not_footprint_display_rows() {
+        let source = TickerInfo::new(
+            Ticker::new("BTCUSDT", Exchange::BinanceLinear),
+            0.1,
+            0.001,
+            None,
+        );
+        let config = data::chart::kline::Config {
+            vpvr_ticks: 10,
+            ..Default::default()
+        };
+        let mut chart = KlineChart::new(
+            ViewConfig::default(),
+            Basis::Time(Timeframe::M30),
+            PriceStep::from(source.min_ticksize),
+            &[],
+            Vec::new(),
+            &[KlineIndicator::VisibleRangeProfile],
+            source,
+            &KlineChartKind::Footprint {
+                clusters: ClusterKind::Table,
+                scaling: ClusterScaling::default(),
+                studies: vec![],
+            },
+            Some(config),
+        );
+        chart.change_tick_size(PriceStep {
+            units: Price::from_f64(50.0).units,
+        });
+
+        assert_eq!(chart.chart.tick_size.to_ui_string(), "50");
+        assert_eq!(chart.vpvr_group_step().to_ui_string(), "1");
+    }
+
+    #[test]
+    fn cluster_labels_hide_when_the_cell_is_too_small() {
+        assert!(cluster_label_size(40.0, 16.0, 1.0).is_some());
+        assert!(cluster_label_size(10.0, 16.0, 1.0).is_none());
+        assert!(cluster_label_size(80.0, 4.0, 1.0).is_none());
+    }
+
+    #[test]
+    fn kline_history_pages_do_not_double_fill_existing_footprints() {
+        let source = TickerInfo::new(
+            Ticker::new("BTCUSDT", Exchange::BinanceLinear),
+            0.1,
+            0.001,
+            None,
+        );
+        let step = PriceStep::from(source.min_ticksize);
+        let mut chart = KlineChart::new(
+            ViewConfig::default(),
+            Basis::Time(Timeframe::M5),
+            step,
+            &[],
+            Vec::new(),
+            &[],
+            source,
+            &KlineChartKind::Footprint {
+                clusters: ClusterKind::Table,
+                scaling: ClusterScaling::default(),
+                studies: vec![],
+            },
+            None,
+        );
+        chart.set_feed(ResolvedFeed::direct(source));
+
+        let bucket = UnixMs::now().floor_to(Timeframe::M5);
+        let mut trade = test_trade(67_000.0, 0.5, false);
+        trade.time = bucket;
+        chart.insert_trades(source, &[trade]);
+
+        let qty_before = match &chart.data_source {
+            PlotData::TimeBased(series) => series
+                .datapoints
+                .values()
+                .next()
+                .unwrap()
+                .footprint
+                .trades
+                .values()
+                .next()
+                .unwrap()
+                .buy_qty
+                .to_f64(),
+            PlotData::TickBased(_) => panic!("expected time series"),
+        };
+
+        let kline = Kline {
+            time: bucket,
+            open: Price::from_f64(67_000.0),
+            high: Price::from_f64(67_000.0),
+            low: Price::from_f64(67_000.0),
+            close: Price::from_f64(67_000.0),
+            volume: Volume::empty_buy_sell(),
+        };
+        chart.insert_hist_klines(uuid::Uuid::new_v4(), source, &[kline]);
+
+        let qty_after = match &chart.data_source {
+            PlotData::TimeBased(series) => series
+                .datapoints
+                .values()
+                .next()
+                .unwrap()
+                .footprint
+                .trades
+                .values()
+                .next()
+                .unwrap()
+                .buy_qty
+                .to_f64(),
+            PlotData::TickBased(_) => panic!("expected time series"),
+        };
+        assert_eq!(qty_before, 0.5);
+        assert_eq!(qty_after, 0.5);
     }
 
     #[test]
@@ -4562,6 +5454,9 @@ mod tests {
 
     #[test]
     fn empty_hyperliquid_day_does_not_block_the_next_history_day() {
+        let _guard = TRADE_FETCH_MODE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         crate::connector::fetcher::set_trade_fetch_mode(TradeFetchMode::Server);
         let source = TickerInfo::new(
             Ticker::new("CACHE_MISS_TEST", Exchange::HyperliquidLinear),
@@ -4612,6 +5507,9 @@ mod tests {
 
     #[test]
     fn cumulative_delta_backfill_is_bounded_to_its_fetch_horizon() {
+        let _guard = TRADE_FETCH_MODE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         crate::connector::fetcher::set_trade_fetch_mode(TradeFetchMode::Server);
         let source = TickerInfo::new(
             Ticker::new("CACHE_MISS_TEST", Exchange::HyperliquidLinear),
@@ -4678,6 +5576,76 @@ mod tests {
                 .all(|day| day.as_u64() >= oldest_allowed),
             "requested {requested_days:?} extends past the {oldest_allowed} fetch horizon"
         );
+        crate::connector::fetcher::set_trade_fetch_mode(TradeFetchMode::Off);
+    }
+
+    #[test]
+    fn enabling_trade_history_indicator_releases_aborted_venue_requests() {
+        let _guard = TRADE_FETCH_MODE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::connector::fetcher::set_trade_fetch_mode(TradeFetchMode::Server);
+        let binance = TickerInfo::new(
+            Ticker::new("CACHE_MISS_BINANCE", Exchange::BinanceLinear),
+            0.1,
+            0.001,
+            None,
+        );
+        let bybit = TickerInfo::new(
+            Ticker::new("CACHE_MISS_BYBIT", Exchange::BybitLinear),
+            0.1,
+            0.001,
+            None,
+        );
+        let price = Price::from_f64(68_000.0);
+        let kline = Kline {
+            time: UnixMs::now(),
+            open: price,
+            high: price,
+            low: price,
+            close: price,
+            volume: Volume::TotalOnly(Qty::ZERO),
+        };
+        let mut chart = KlineChart::new(
+            ViewConfig::default(),
+            Basis::Time(Timeframe::M30),
+            PriceStep::from(binance.min_ticksize),
+            &[kline],
+            Vec::new(),
+            &[KlineIndicator::CumulativeDelta],
+            binance,
+            &KlineChartKind::Candles,
+            None,
+        );
+        chart.configure_footprint_history(vec![binance, bybit], true);
+
+        let Action::RequestFetch(initial) = chart
+            .fetch_footprint_history()
+            .expect("both venue backfills should start")
+        else {
+            panic!("history fetch should return requests");
+        };
+        assert_eq!(initial.len(), 2);
+        assert_eq!(chart.footprint_history.trade_requests.len(), 2);
+
+        chart.toggle_indicator(KlineIndicator::LargeTrades);
+        assert!(chart.footprint_history.trade_requests.is_empty());
+
+        let Action::RequestFetch(retried) = chart
+            .fetch_footprint_history()
+            .expect("aborted venue backfills must be retried")
+        else {
+            panic!("history retry should return requests");
+        };
+        assert_eq!(retried.len(), 2);
+        assert!(retried.iter().any(|spec| {
+            spec.stream
+                .is_some_and(|stream| stream.ticker_info() == binance)
+        }));
+        assert!(retried.iter().any(|spec| {
+            spec.stream
+                .is_some_and(|stream| stream.ticker_info() == bybit)
+        }));
         crate::connector::fetcher::set_trade_fetch_mode(TradeFetchMode::Off);
     }
 
@@ -4761,6 +5729,9 @@ mod tests {
 
     #[test]
     fn renko_seed_pages_are_not_starved_by_cumulative_delta_backfill() {
+        let _guard = TRADE_FETCH_MODE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         crate::connector::fetcher::set_trade_fetch_mode(TradeFetchMode::Server);
         let source = TickerInfo::new(
             Ticker::new("BTCUSDT", Exchange::BinanceLinear),

@@ -145,6 +145,19 @@ impl GroupedTrades {
         self.last_time = trade.time;
     }
 
+    fn merge(&mut self, other: &Self) {
+        self.buy_qty += other.buy_qty;
+        self.sell_qty += other.sell_qty;
+        self.buy_count += other.buy_count;
+        self.sell_count += other.sell_count;
+        if other.first_time < self.first_time {
+            self.first_time = other.first_time;
+        }
+        if other.last_time > self.last_time {
+            self.last_time = other.last_time;
+        }
+    }
+
     pub fn total_qty(&self) -> Qty {
         self.buy_qty + self.sell_qty
     }
@@ -208,6 +221,44 @@ impl KlineTrades {
             .or_insert_with(|| GroupedTrades::new(trade));
     }
 
+    /// Merge already-binned levels onto a coarser price step without needing
+    /// the original trade list. Tick-size changes must do this or the
+    /// histogram keeps drawing the old 0.1 grid.
+    pub fn rebin(&mut self, step: PriceStep) {
+        *self = self.grouped_to_step(step);
+    }
+
+    /// One footprint row per `step` multiple. Drawing must use this, not the
+    /// raw map: live/history inserts can land on a finer grid than the
+    /// selected tick multiplier, and those rows paint on top of each other.
+    pub fn grouped_to_step(&self, step: PriceStep) -> Self {
+        if step.units <= 1 || self.trades.is_empty() {
+            return self.clone();
+        }
+        if self
+            .trades
+            .keys()
+            .all(|price| price.units.rem_euclid(step.units) == 0)
+        {
+            return self.clone();
+        }
+
+        let mut grouped = Self::new();
+        for (price, group) in &self.trades {
+            let key = price.round_to_step(step);
+            grouped
+                .trades
+                .entry(key)
+                .and_modify(|existing| existing.merge(group))
+                .or_insert_with(|| group.clone());
+        }
+        grouped.calculate_poc();
+        if let (Some(src), Some(dst)) = (self.poc, grouped.poc.as_mut()) {
+            dst.status = src.status;
+        }
+        grouped
+    }
+
     /// Max of some extracted qty across price levels within [`lowest`, `highest`].
     pub fn max_qty_by<F>(&self, highest: Price, lowest: Price, f: F) -> Qty
     where
@@ -230,13 +281,45 @@ impl KlineTrades {
     }
 
     /// Max cluster qty across all price levels in this bar (unfiltered).
-    /// Used for per-bar individual scaling, the full bar should contribute.
+    /// Used by per-bar individual scaling, the full bar should contribute.
     pub fn max_cluster_qty_all(&self, cluster_kind: ClusterKind) -> Qty {
         self.trades
             .values()
             .map(|group| group.max_cluster_qty(cluster_kind))
             .max()
             .unwrap_or_default()
+    }
+
+    /// Max cluster qty as it would appear when rows are merged onto
+    /// `group_step` (the same merge [`Self::grouped_to_step`] performs at
+    /// draw time), without allocating the merged histogram.
+    ///
+    /// Storage may sit on a finer grid than the selected tick multiplier;
+    /// scaling must be computed against the *displayed* row quantities or
+    /// cells render over-saturated.
+    pub fn max_cluster_qty_grouped(
+        &self,
+        cluster_kind: ClusterKind,
+        highest: Price,
+        lowest: Price,
+        group_step: PriceStep,
+    ) -> Qty {
+        if group_step.units <= 1 {
+            return self.max_qty_by(highest, lowest, |group| group.max_cluster_qty(cluster_kind));
+        }
+
+        let mut buckets: FxHashMap<Price, Qty> = FxHashMap::default();
+        for (price, group) in &self.trades {
+            if *price < lowest || *price > highest {
+                continue;
+            }
+            let key = price.round_to_step(group_step);
+            buckets
+                .entry(key)
+                .and_modify(|qty| *qty += group.max_cluster_qty(cluster_kind))
+                .or_insert_with(|| group.max_cluster_qty(cluster_kind));
+        }
+        buckets.values().copied().max().unwrap_or_default()
     }
 
     pub fn calculate_poc(&mut self) {
@@ -350,6 +433,7 @@ impl KlineChartKind {
             KlineIndicator::DailyDelta
                 | KlineIndicator::PreviousValueArea
                 | KlineIndicator::LiquidityHeatmap
+                | KlineIndicator::VisibleRangeProfile
         ) {
             if indicator == KlineIndicator::LiquidityHeatmap {
                 return matches!(
@@ -378,7 +462,10 @@ impl KlineChartKind {
 
     pub fn min_scaling(&self) -> f32 {
         match self {
-            KlineChartKind::Footprint { .. } | KlineChartKind::Tpo { .. } => 0.4,
+            // Footprint must stay readable when many bars are on screen;
+            // labels/candles clamp to minimum screen sizes instead.
+            KlineChartKind::Footprint { .. } => 0.25,
+            KlineChartKind::Tpo { .. } => 0.4,
             KlineChartKind::Candles | KlineChartKind::Renko { .. } => 0.6,
         }
     }
@@ -404,7 +491,9 @@ impl KlineChartKind {
 
     pub fn min_cell_width(&self) -> f32 {
         match self {
-            KlineChartKind::Footprint { .. } => 80.0,
+            // Compact columns so a useful number of footprints fits on
+            // screen; text hides itself below readable sizes instead.
+            KlineChartKind::Footprint { .. } => 44.0,
             KlineChartKind::Tpo { .. } => 18.0,
             KlineChartKind::Candles => 1.0,
             KlineChartKind::Renko { .. } => 3.0,
@@ -423,7 +512,7 @@ impl KlineChartKind {
 
     pub fn min_cell_height(&self) -> f32 {
         match self {
-            KlineChartKind::Footprint { .. } => 1.0,
+            KlineChartKind::Footprint { .. } => 6.0,
             // Per-tick height; visual TPO row = cell_height * ticks_per_row.
             // Bound the *visual* row (~1.5 px at scale 1) instead of the raw
             // per-tick height, or large ticks-per-row values make further
@@ -437,7 +526,7 @@ impl KlineChartKind {
 
     pub fn default_cell_width(&self) -> f32 {
         match self {
-            KlineChartKind::Footprint { .. } => 80.0,
+            KlineChartKind::Footprint { .. } => 64.0,
             // Give each daily profile a wide time slot so neighboring Market
             // Profiles remain visually distinct, as on reference TPO charts.
             KlineChartKind::Tpo { config }
@@ -569,6 +658,8 @@ pub struct Config {
     /// Minimum executed-trade notional in quote currency shown by the
     /// Large Trades overlay.
     pub large_trades_min_usd: f32,
+    /// VPVR grouping in exchange min-ticks. `1` is one price level per min tick.
+    pub vpvr_ticks: u16,
 }
 
 impl Config {
@@ -625,19 +716,20 @@ impl Default for Config {
             previous_value_area_value_area_percent: 70,
             liquidity_heatmap_order_size_filter: 0.0,
             large_trades_min_usd: Self::LARGE_TRADES_MIN_USD_DEFAULT,
+            vpvr_ticks: 10,
         }
     }
 }
 
 #[derive(Default, Clone, Copy, Debug, PartialEq, Deserialize, Serialize)]
 pub enum ClusterScaling {
-    #[default]
     /// Scale based on the maximum quantity in the visible range.
     VisibleRange,
     /// Blend global VisibleRange and per-cluster Individual using a weight in [0.0, 1.0].
     /// weight = fraction of global contribution (1.0 == all-global, 0.0 == all-individual).
     Hybrid { weight: f32 },
     /// Scale based only on the maximum quantity inside the datapoint (per-candle).
+    #[default]
     Datapoint,
 }
 
@@ -748,6 +840,109 @@ mod config_tests {
         .expect("legacy kline config should deserialize");
 
         assert_eq!(config.liquidity_heatmap_order_size_filter, 0.0);
+    }
+}
+
+#[cfg(test)]
+mod footprint_rebin_tests {
+    use super::*;
+    use exchange::{
+        TickMultiplier, Trade, UnixMs,
+        unit::{MinTicksize, Price, Qty},
+    };
+
+    fn trade(price: f64, qty: f64, is_sell: bool) -> Trade {
+        Trade {
+            time: UnixMs::new(1_000),
+            price: Price::from_f64(price),
+            qty: Qty::from_f64(qty),
+            is_sell,
+        }
+    }
+
+    #[test]
+    fn rebin_merges_fine_ticks_onto_grouped_step() {
+        let fine: PriceStep = MinTicksize::new(-1).into();
+        let coarse = TickMultiplier(200).multiply_step(fine);
+        let mut footprint = KlineTrades::new();
+        footprint.add_trade_to_nearest_bin(&trade(77_500.0, 1.0, true), fine);
+        footprint.add_trade_to_nearest_bin(&trade(77_500.1, 1.0, true), fine);
+        footprint.add_trade_to_nearest_bin(&trade(77_505.0, 1.0, false), fine);
+        assert_eq!(footprint.trades.len(), 3);
+
+        footprint.rebin(coarse);
+        assert_eq!(footprint.trades.len(), 1);
+        let group = footprint.trades.values().next().expect("grouped level");
+        assert_eq!(group.sell_qty.to_f64(), 2.0);
+        assert_eq!(group.buy_qty.to_f64(), 1.0);
+    }
+
+    #[test]
+    fn grouped_to_step_does_not_mutate_the_source_and_folds_rows() {
+        let fine: PriceStep = MinTicksize::new(-1).into();
+        let coarse = TickMultiplier(500).multiply_step(fine);
+        let mut footprint = KlineTrades::new();
+        footprint.add_trade_to_nearest_bin(&trade(77_200.0, 1.0, true), fine);
+        footprint.add_trade_to_nearest_bin(&trade(77_210.0, 2.0, false), fine);
+        footprint.add_trade_to_nearest_bin(&trade(77_220.0, 3.0, true), fine);
+        assert_eq!(footprint.trades.len(), 3);
+
+        let grouped = footprint.grouped_to_step(coarse);
+        assert_eq!(footprint.trades.len(), 3);
+        assert_eq!(grouped.trades.len(), 1);
+        let group = grouped.trades.values().next().expect("grouped level");
+        assert_eq!(group.sell_qty.to_f64(), 4.0);
+        assert_eq!(group.buy_qty.to_f64(), 2.0);
+    }
+
+    /// Storage sits on the feed's base tick; switching the display
+    /// multiplier must regroup rows losslessly in both directions.
+    #[test]
+    fn multiplier_switches_regroup_base_tick_rows() {
+        let base: PriceStep = MinTicksize::new(-1).into();
+        let mut footprint = KlineTrades::new();
+        for i in 0..11 {
+            let price = 77_200.0 + (i as f64) * 10.0;
+            footprint.add_trade_to_nearest_bin(&trade(price, 1.0, i % 2 == 0), base);
+        }
+        assert_eq!(footprint.trades.len(), 11);
+
+        let step_200 = TickMultiplier(200).multiply_step(base);
+        let step_500 = TickMultiplier(500).multiply_step(base);
+
+        let grouped_200 = footprint.grouped_to_step(step_200);
+        let grouped_500 = footprint.grouped_to_step(step_500);
+
+        assert!(
+            grouped_200.trades.len() > grouped_500.trades.len(),
+            "200-tick grouping ({}) should show more rows than 500-tick ({})",
+            grouped_200.trades.len(),
+            grouped_500.trades.len()
+        );
+        assert_eq!(grouped_500.trades.len(), 3);
+        assert_eq!(grouped_200.trades.len(), 6);
+        // Source stays untouched so switching back restores finer rows.
+        assert_eq!(footprint.trades.len(), 11);
+    }
+
+    #[test]
+    fn max_cluster_qty_grouped_matches_merged_histogram() {
+        let base: PriceStep = MinTicksize::new(-1).into();
+        let step = TickMultiplier(200).multiply_step(base);
+        let mut footprint = KlineTrades::new();
+        for (i, qty) in [0.5f64, 2.0, 1.0, 3.5, 0.25].iter().enumerate() {
+            let price = 77_200.0 + f64::from(i as u32) * 7.0;
+            footprint.add_trade_to_nearest_bin(&trade(price, *qty, false), base);
+        }
+
+        let grouped = footprint.grouped_to_step(step);
+        let highest = Price::from_f64(78_000.0);
+        let lowest = Price::from_f64(76_000.0);
+        let expected = grouped.max_qty_by(highest, lowest, |group| {
+            group.max_cluster_qty(ClusterKind::Table)
+        });
+        let actual = footprint.max_cluster_qty_grouped(ClusterKind::Table, highest, lowest, step);
+        assert_eq!(actual, expected);
     }
 }
 

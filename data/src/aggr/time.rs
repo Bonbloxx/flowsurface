@@ -320,14 +320,54 @@ impl TimeSeries<KlineDataPoint> {
         }
     }
 
-    pub fn change_tick_size(&mut self, tick_size: PriceStep, raw_trades: &[Trade]) {
-        self.tick_size = tick_size;
-
-        self.clear_trades();
-
-        if !raw_trades.is_empty() {
-            self.insert_trades_existing_buckets(raw_trades);
+    /// Apply `buffer` only to candles that still have an empty footprint.
+    ///
+    /// Historical kline pages used to replay the whole live buffer onto every
+    /// existing bucket, so already-filled cells grew a second copy of every
+    /// print. New empty slots still get a one-shot backfill from the buffer.
+    pub fn fill_empty_footprints_from_trades(&mut self, buffer: &[Trade]) {
+        if buffer.is_empty() {
+            return;
         }
+
+        let empty_times: Vec<UnixMs> = self
+            .datapoints
+            .iter()
+            .filter(|(_, dp)| dp.footprint.trades.is_empty())
+            .map(|(time, _)| *time)
+            .collect();
+        if empty_times.is_empty() {
+            return;
+        }
+
+        let mut updated_times: Vec<UnixMs> = Vec::new();
+        for trade in buffer {
+            let rounded_time = trade.time.floor_to(self.interval);
+            if !empty_times.contains(&rounded_time) {
+                continue;
+            }
+            let Some(entry) = self.datapoints.get_mut(&rounded_time) else {
+                continue;
+            };
+            if !updated_times.contains(&rounded_time) {
+                updated_times.push(rounded_time);
+            }
+            entry.add_trade(trade, self.tick_size);
+        }
+
+        for time in updated_times {
+            if let Some(data_point) = self.datapoints.get_mut(&time) {
+                data_point.calculate_poc();
+            }
+        }
+    }
+
+    /// The footprint is stored at a fixed base price step (see [`Self::new`]).
+    /// Display grouping happens at draw time via `KlineTrades::grouped_to_step`,
+    /// so changing the tick multiplier never needs to touch stored levels and
+    /// switching between multipliers is lossless in both directions.
+    pub fn storage_tick_size(&self) -> PriceStep {
+        self.tick_size
     }
 
     pub fn update_poc_status(&mut self) {
@@ -407,10 +447,26 @@ impl TimeSeries<KlineDataPoint> {
             return None;
         }
 
-        self.find_trade_gap()
+        self.find_trade_gap(visible_earliest, visible_latest)
             .and_then(|(last_t_before_gap, first_t_after_gap)| {
                 if last_t_before_gap.is_none() && first_t_after_gap.is_none() {
-                    return None;
+                    // A freshly enabled trade-backed overlay (such as VPVR)
+                    // starts with kline buckets but no footprints at all. Do
+                    // not wait for the first live print before requesting the
+                    // visible history: there is no trade boundary to infer yet.
+                    let interval_ms = self.interval.to_milliseconds();
+                    let first = self
+                        .datapoints
+                        .range(visible_earliest.floor_to(self.interval)..=visible_latest)
+                        .next()
+                        .map(|(time, _)| *time)?;
+                    let last = self
+                        .datapoints
+                        .range(first..=visible_latest)
+                        .next_back()
+                        .map(|(time, _)| *time)?;
+                    let end = last.saturating_add(interval_ms.saturating_sub(1));
+                    return (first < end).then_some((first, end));
                 }
                 let (data_earliest, data_latest) = self.timerange();
 
@@ -454,10 +510,14 @@ impl TimeSeries<KlineDataPoint> {
             })
     }
 
-    fn find_trade_gap(&self) -> Option<(Option<UnixMs>, Option<UnixMs>)> {
+    fn find_trade_gap(
+        &self,
+        visible_earliest: UnixMs,
+        visible_latest: UnixMs,
+    ) -> Option<(Option<UnixMs>, Option<UnixMs>)> {
         let empty_kline_time = self
             .datapoints
-            .iter()
+            .range(visible_earliest.floor_to(self.interval)..=visible_latest)
             .rev()
             .find(|(_, dp)| dp.footprint.trades.is_empty())
             .map(|(&time, _)| time);
@@ -487,14 +547,19 @@ impl TimeSeries<KlineDataPoint> {
         latest: UnixMs,
         highest: Price,
         lowest: Price,
+        group_step: PriceStep,
     ) -> Qty {
         let mut max_cluster_qty: Qty = Qty::default();
 
         self.datapoints
             .range(earliest..=latest)
             .for_each(|(_, dp)| {
-                max_cluster_qty =
-                    max_cluster_qty.max(dp.max_cluster_qty(cluster_kind, highest, lowest));
+                max_cluster_qty = max_cluster_qty.max(dp.footprint.max_cluster_qty_grouped(
+                    cluster_kind,
+                    highest,
+                    lowest,
+                    group_step,
+                ));
             });
 
         max_cluster_qty
@@ -572,5 +637,88 @@ impl From<&TimeSeries<KlineDataPoint>> for BTreeMap<UnixMs, exchange::Volume> {
             .iter()
             .map(|(time, dp)| (*time, dp.kline.volume))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_kline(time: u64) -> Kline {
+        let price = Price::from_f64(100.0);
+        Kline {
+            time: UnixMs::new(time),
+            open: price,
+            high: price,
+            low: price,
+            close: price,
+            volume: Volume::empty_buy_sell(),
+        }
+    }
+
+    #[test]
+    fn all_empty_footprints_request_visible_history_without_waiting_for_live_trade() {
+        let interval = Timeframe::M5;
+        let interval_ms = interval.to_milliseconds();
+        let first = 1_800_000_000_000_u64;
+        let second = first + interval_ms;
+        let third = second + interval_ms;
+        let series = TimeSeries::<KlineDataPoint>::new(
+            interval,
+            PriceStep {
+                units: Price::from_f64(0.1).units,
+            },
+            &[empty_kline(first), empty_kline(second), empty_kline(third)],
+        );
+
+        assert_eq!(
+            series.suggest_trade_fetch_range(UnixMs::new(second), UnixMs::new(third)),
+            Some((UnixMs::new(second), UnixMs::new(third + interval_ms - 1)))
+        );
+    }
+
+    #[test]
+    fn offscreen_empty_bucket_does_not_hide_visible_trade_gap() {
+        let interval = Timeframe::M5;
+        let interval_ms = interval.to_milliseconds();
+        let first = 1_800_000_000_000_u64;
+        let second = first + interval_ms;
+        let third = second + interval_ms;
+        let offscreen = third + interval_ms;
+        let mut series = TimeSeries::<KlineDataPoint>::new(
+            interval,
+            PriceStep {
+                units: Price::from_f64(0.1).units,
+            },
+            &[
+                empty_kline(first),
+                empty_kline(second),
+                empty_kline(third),
+                empty_kline(offscreen),
+            ],
+        );
+        let trades = [
+            Trade {
+                time: UnixMs::new(first + 1_000),
+                price: Price::from_f64(100.0),
+                qty: Qty::from_f64(1.0),
+                is_sell: false,
+            },
+            Trade {
+                time: UnixMs::new(third + 1_000),
+                price: Price::from_f64(101.0),
+                qty: Qty::from_f64(1.0),
+                is_sell: true,
+            },
+        ];
+        series.insert_trades_existing_buckets(&trades);
+
+        let (fetch_from, fetch_to) = series
+            .suggest_trade_fetch_range(UnixMs::new(first), UnixMs::new(third))
+            .expect("the visible empty candle must produce a gap request");
+
+        assert!(fetch_from < UnixMs::new(second + interval_ms));
+        assert!(fetch_to >= UnixMs::new(second));
+        assert!(fetch_to < UnixMs::new(offscreen));
     }
 }

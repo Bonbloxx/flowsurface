@@ -639,14 +639,36 @@ pub fn kline_cfg_view<'a>(
     pane: pane_grid::Pane,
     basis: data::chart::Basis,
     tick_size: exchange::unit::PriceStep,
-    aggregate_sources: Vec<(exchange::TickerInfo, &'static str, bool)>,
+    tick_multiply: TickMultiplier,
+    aggregate_sources: Vec<(exchange::TickerInfo, String, bool)>,
     footprint_history: FootprintHistorySettings,
     liquidity_heatmap: LiquidityHeatmapSettings,
     daily_delta: Option<(u16, u16)>,
     previous_value_area: Option<u16>,
     large_trades: Option<f32>,
+    vpvr_ticks: Option<u16>,
 ) -> Element<'a, Message> {
     let uses_shared_price_grid = !aggregate_sources.is_empty();
+    let data_sources: Element<'a, Message> = if aggregate_sources.is_empty() {
+        column![].into()
+    } else {
+        let choices = aggregate_sources.into_iter().fold(
+            column![].spacing(6),
+            |choices, (ticker_info, label, selected)| {
+                choices.push(checkbox(selected).label(label).on_toggle(move |enabled| {
+                    Message::PaneEvent(pane, Event::AggregateSourceToggled(ticker_info, enabled))
+                }))
+            },
+        );
+
+        column![
+            text("Data sources").size(crate::style::text_size::SECTION),
+            text("Combine Binance, Bybit, and Hyperliquid, or pick one venue."),
+            choices,
+        ]
+        .spacing(8)
+        .into()
+    };
     let display_readout_section = {
         let data_labels_checkbox = tooltip(
             checkbox(cfg.data_labels_always_visible)
@@ -917,30 +939,6 @@ pub fn kline_cfg_view<'a>(
                     )
                 });
 
-            let data_sources: Element<'a, Message> = if aggregate_sources.is_empty() {
-                column![].into()
-            } else {
-                let choices = aggregate_sources.into_iter().fold(
-                    column![].spacing(6),
-                    |choices, (ticker_info, label, selected)| {
-                        choices.push(checkbox(selected).label(label).on_toggle(move |enabled| {
-                            Message::PaneEvent(
-                                pane,
-                                Event::AggregateSourceToggled(ticker_info, enabled),
-                            )
-                        }))
-                    },
-                );
-
-                column![
-                    text("Data sources").size(crate::style::text_size::SECTION),
-                    text("Select one venue for independent data, or combine any venues."),
-                    choices,
-                ]
-                .spacing(8)
-                .into()
-            };
-
             split_column![
                 display_readout_section,
                 data_sources,
@@ -1063,9 +1061,26 @@ pub fn kline_cfg_view<'a>(
                     )
                 });
 
+            let tick_picklist = pick_list(
+                TickMultiplier::ALL,
+                Some(tick_multiply),
+                move |multiplier| Message::PaneEvent(pane, Event::TicksizeSelected(multiplier)),
+            );
+
             let mut content = split_column![
                 display_readout_section,
+                data_sources,
                 text("Executed market sells × buys are grouped at every traded price."),
+                column![
+                    text("Tick size").size(crate::style::text_size::SECTION),
+                    text(format!(
+                        "Each histogram level is {}. Lower grouping (10x–50x) keeps more rows readable.",
+                        tick_size.to_ui_string()
+                    )),
+                    row![text("Grouping"), space::horizontal(), tick_picklist]
+                        .align_y(Alignment::Center),
+                ]
+                .spacing(8),
                 column![text("Footprint summary").size(crate::style::text_size::SECTION), footprint_summary_checkbox].spacing(8),
                 column![text("Cluster type").size(crate::style::text_size::SECTION), cluster_picklist].spacing(8),
                 ; spacing = 12, align_x = Alignment::Start
@@ -1312,6 +1327,32 @@ pub fn kline_cfg_view<'a>(
                 text("Large Trades").size(crate::style::text_size::SECTION),
                 text("Circles mark executed trades above the threshold. Same-side prints within 100ms — including across selected venues — are drawn as one bubble at VWAP. Buy markers use bid color, sells use ask color; size scales with notional. Hover a circle to see its value."),
                 threshold_slider,
+            ]
+            .spacing(8),
+        );
+    }
+
+    if let Some(ticks) = vpvr_ticks {
+        let tick_choices = pick_list(
+            data::chart::kline::Config::DAILY_DELTA_TICK_PRESETS,
+            Some(TickMultiplier(ticks)),
+            move |multiplier| {
+                Message::VisualConfigChanged(
+                    pane,
+                    VisualConfig::Kline(data::chart::kline::Config {
+                        vpvr_ticks: multiplier.0,
+                        ..cfg
+                    }),
+                    false,
+                )
+            },
+        );
+        content = content.push(
+            column![
+                text("VPVR").size(crate::style::text_size::SECTION),
+                text("Aggregated USD delta of the candles currently on screen. Panning and zooming rebuilds the profile from the new visible range. Bar length is |delta|; blue is positive, red is negative. Historical candles need Settings → Network trade fetch."),
+                row![text("Ticks per level"), space::horizontal(), tick_choices]
+                    .align_y(Alignment::Center),
             ]
             .spacing(8),
         );

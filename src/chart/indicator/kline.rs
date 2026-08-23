@@ -21,6 +21,7 @@ pub mod liquidity_heatmap;
 pub mod open_interest;
 pub mod previous_value_area;
 pub mod volume;
+pub mod vpvr;
 
 /// UI adapter methods for converting domain `BasisSeries` into plot-ready series.
 trait BasisSeriesExt<T> {
@@ -259,6 +260,9 @@ pub fn make_empty(which: KlineIndicator) -> Box<dyn KlineIndicatorImpl> {
         }
         KlineIndicator::LargeTrades => {
             Box::new(super::kline::large_trades::LargeTradesIndicator::new())
+        }
+        KlineIndicator::VisibleRangeProfile => {
+            Box::new(super::kline::vpvr::VisibleRangeProfileIndicator::new())
         }
     }
 }

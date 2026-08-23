@@ -61,11 +61,11 @@ pub fn is_trade_fetch_enabled() -> bool {
 pub enum FetchedData {
     Trades {
         batch: Vec<Trade>,
-        /// Upper bound of the fetch gap — trades beyond this timestamp
-        /// already exist on the chart and must be filtered out.
-        until_time: UnixMs,
-        /// Optional request ID to mark completion on the chart's
-        /// [`RequestHandler`] once the batch is processed.
+        /// Optional request ID used to route every streamed page to the
+        /// chart generation that requested it. Completion is delivered by
+        /// [`FetchTaskStatus::Completed`], never inferred from a page's last
+        /// timestamp: a server page can reach the upper bound before the
+        /// fetcher fills an older exchange/archive gap.
         req_id: Option<Uuid>,
     },
     Klines {
@@ -198,18 +198,31 @@ impl RequestHandler {
             };
         }
 
-        // A range already covered by a tracked request must not burn another
-        // rate-limited page. Only Failed ranges fall through so the cooldown
-        // logic above stays in charge of retries.
-        let covered = self
+        // A range already covered by a tracked request normally must not burn
+        // another rate-limited page. Visible footprint history is the exception:
+        // a broad server response can span an internal recorder outage, and the
+        // chart deliberately follows it with a narrower request for the proven
+        // empty candle range. That second pass is what lets the fetcher fall back
+        // to exchange/archive data. Exact completed ranges remain suppressed.
+        let mut completed_coverage = false;
+        for existing in self
             .requests
-            .iter()
-            .find_map(|(k, v)| v.contains(&request).then_some((*k, v.status.clone())));
-        match covered {
-            Some((_, RequestStatus::Completed)) => return Ok(None),
-            Some((_, RequestStatus::Pending)) => return Err(ReqError::Overlaps),
-            Some((_, RequestStatus::NoData)) => return Err(ReqError::NoData),
-            _ => {}
+            .values()
+            .filter(|existing| existing.contains(&request))
+        {
+            match existing.status {
+                RequestStatus::Pending => return Err(ReqError::Overlaps),
+                RequestStatus::NoData => return Err(ReqError::NoData),
+                RequestStatus::Completed => {
+                    if !existing.allows_completed_footprint_subrange(&request) {
+                        completed_coverage = true;
+                    }
+                }
+                RequestStatus::Failed { .. } => {}
+            }
+        }
+        if completed_coverage {
+            return Ok(None);
         }
 
         self.requests.insert(id, request);
@@ -372,6 +385,16 @@ impl FetchRequest {
         };
         std::mem::discriminant(&self.fetch_type) == std::mem::discriminant(&other.fetch_type)
             && range_contains(outer, inner)
+    }
+
+    fn allows_completed_footprint_subrange(&self, other: &FetchRequest) -> bool {
+        matches!(
+            (&self.fetch_type, &other.fetch_type),
+            (
+                FetchRange::FootprintTrades(outer_from, outer_to),
+                FetchRange::FootprintTrades(inner_from, inner_to),
+            ) if (outer_from, outer_to) != (inner_from, inner_to)
+        )
     }
 }
 
@@ -593,7 +616,6 @@ pub fn request_fetch(
                         let data = FetchedData::Trades {
                             batch,
                             req_id: Some(req_id),
-                            until_time: to_time,
                         };
 
                         FetchUpdate::Data {
@@ -618,7 +640,6 @@ pub fn request_fetch(
                                 data: FetchedData::Trades {
                                     batch: Vec::new(),
                                     req_id: Some(req_id),
-                                    until_time: to_time,
                                 },
                                 stream,
                             }
@@ -694,7 +715,7 @@ pub fn request_fetch_many(
     ready_streams: &[StreamKind],
     layout_id: Uuid,
     reqs: impl IntoIterator<Item = (Uuid, FetchRange, Option<StreamKind>)>,
-    mut on_trade_handle: impl FnMut(Handle),
+    mut on_trade_handle: impl FnMut(Uuid, Handle),
 ) -> (Task<FetchUpdate>, Vec<Uuid>) {
     let mut tasks = Vec::new();
     let mut undispatched = Vec::new();
@@ -707,6 +728,7 @@ pub fn request_fetch_many(
             undispatched.push(req_id);
             continue;
         }
+        let mut retain_handle = |handle| on_trade_handle(req_id, handle);
         tasks.push(request_fetch(
             sources,
             pane_id,
@@ -715,7 +737,7 @@ pub fn request_fetch_many(
             req_id,
             fetch,
             stream,
-            &mut on_trade_handle,
+            &mut retain_handle,
         ));
     }
 
@@ -1311,6 +1333,53 @@ mod tests {
                 Some(stream),
             ),
             Ok(None)
+        ));
+    }
+
+    #[test]
+    fn completed_footprint_range_allows_targeted_gap_subrange() {
+        let stream = StreamKind::Trades {
+            ticker_info: TickerInfo::new(
+                Ticker::new("BTCUSDT", Exchange::BinanceLinear),
+                0.1,
+                0.001,
+                None,
+            ),
+        };
+        let mut handler = RequestHandler::default();
+        let outer = FetchRange::FootprintTrades(UnixMs::new(1_000), UnixMs::new(10_000));
+        let id = handler.add_request(outer, Some(stream)).unwrap().unwrap();
+        handler.mark_completed(id);
+
+        let inner = FetchRange::FootprintTrades(UnixMs::new(4_000), UnixMs::new(5_000));
+        assert!(handler.add_request(inner, Some(stream)).unwrap().is_some());
+    }
+
+    #[test]
+    fn pending_footprint_range_still_blocks_targeted_gap_subrange() {
+        let stream = StreamKind::Trades {
+            ticker_info: TickerInfo::new(
+                Ticker::new("BTCUSDT", Exchange::BinanceLinear),
+                0.1,
+                0.001,
+                None,
+            ),
+        };
+        let mut handler = RequestHandler::default();
+        handler
+            .add_request(
+                FetchRange::FootprintTrades(UnixMs::new(1_000), UnixMs::new(10_000)),
+                Some(stream),
+            )
+            .unwrap()
+            .unwrap();
+
+        assert!(matches!(
+            handler.add_request(
+                FetchRange::FootprintTrades(UnixMs::new(4_000), UnixMs::new(5_000)),
+                Some(stream),
+            ),
+            Err(ReqError::Overlaps)
         ));
     }
 

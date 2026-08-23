@@ -202,10 +202,11 @@ impl Dashboard {
                 Some(id) => {
                     if let Some(state) = self.get_mut_pane_state_by_uuid(main_window.id, id) {
                         if let pane::Content::Kline { chart: Some(c), .. } = &mut state.content {
-                            c.reset_trade_fetch_state();
                             if let DashboardError::Fetch(ref msg, Some(req_id)) = err {
                                 log::error!("Fetch error: {msg}");
                                 c.mark_fetch_failed(req_id);
+                            } else {
+                                c.reset_trade_fetch_state();
                             }
                         } else if let pane::Content::FootprintHistory(Some(history)) =
                             &mut state.content
@@ -396,12 +397,12 @@ impl Dashboard {
                                     &ready_streams,
                                     *layout_id,
                                     reqs.into_iter().map(|r| (r.req_id, r.fetch, r.stream)),
-                                    |handle| {
+                                    |req_id, handle| {
                                         if let pane::Content::Kline { chart, .. } =
                                             &mut state.content
                                             && let Some(c) = chart
                                         {
-                                            c.set_handle(handle);
+                                            c.set_handle(req_id, handle);
                                         } else if let pane::Content::FootprintHistory(Some(
                                             history,
                                         )) = &mut state.content
@@ -435,22 +436,17 @@ impl Dashboard {
             }
             Message::ChangePaneStatus(pane_id, status) => {
                 if let Some(pane_state) = self.get_mut_pane_state_by_uuid(main_window.id, pane_id) {
-                    if let pane::Status::Ready = status
-                        && let pane::Content::Kline { chart: Some(c), .. } = &mut pane_state.content
-                    {
-                        c.reset_trade_fetch_state();
-                    }
                     pane_state.status = status;
                 }
             }
             Message::TradeFetchCompleted(pane_id, req_id) => {
                 if let Some(pane_state) = self.get_mut_pane_state_by_uuid(main_window.id, pane_id) {
                     if let pane::Content::Kline { chart: Some(c), .. } = &mut pane_state.content {
-                        c.reset_trade_fetch_state();
                         if let Some(req_id) = req_id {
-                            // mark_completed is private to chart via request_handler —
-                            // reuse the public path that also clears trade flags.
                             c.finalize_trade_fetch(req_id);
+                        }
+                        if !c.is_fetching_trades() {
+                            pane_state.status = pane::Status::Ready;
                         }
                     } else if let pane::Content::FootprintHistory(Some(history)) =
                         &mut pane_state.content
@@ -484,11 +480,11 @@ impl Dashboard {
                     &ready_streams,
                     *layout_id,
                     reqs.into_iter().map(|r| (r.req_id, r.fetch, r.stream)),
-                    |handle| {
+                    |req_id, handle| {
                         if let pane::Content::Kline { chart, .. } = &mut state.content
                             && let Some(chart) = chart
                         {
-                            chart.set_handle(handle);
+                            chart.set_handle(req_id, handle);
                         } else if let pane::Content::FootprintHistory(Some(history)) =
                             &mut state.content
                         {
@@ -1025,20 +1021,18 @@ impl Dashboard {
         stream_type: StreamKind,
     ) -> Task<Message> {
         match data {
-            FetchedData::Trades {
-                batch,
-                req_id,
-                until_time,
-            } => {
+            FetchedData::Trades { batch, req_id } => {
                 let source = stream_type.ticker_info();
                 if batch.is_empty() {
                     if let Some(pane_state) = self.get_mut_pane_state_by_uuid(main_window, pane_id)
                     {
                         if let pane::Content::Kline { chart: Some(c), .. } = &mut pane_state.content
                         {
-                            c.reset_trade_fetch_state();
                             if let Some(req_id) = req_id {
                                 c.mark_fetch_no_data(req_id);
+                            }
+                            if !c.is_fetching_trades() {
+                                pane_state.status = pane::Status::Ready;
                             }
                         } else if let pane::Content::FootprintHistory(Some(history)) =
                             &mut pane_state.content
@@ -1047,42 +1041,21 @@ impl Dashboard {
                             history.mark_fetch_no_data(req_id);
                         }
 
-                        if matches!(pane_state.status, pane::Status::Loading(..)) {
+                        if matches!(pane_state.status, pane::Status::Loading(..))
+                            && !matches!(
+                                &pane_state.content,
+                                pane::Content::Kline { chart: Some(c), .. }
+                                    if c.is_fetching_trades()
+                            )
+                        {
                             pane_state.status = pane::Status::Ready;
                         }
                     }
                     return Task::done(Message::ContinueTradeHistory(pane_id));
-                } else {
-                    let last_trade_time = batch.last().map_or(UnixMs::ZERO, |trade| trade.time);
-
-                    if last_trade_time < until_time {
-                        if let Err(reason) = self.insert_fetched_trades(
-                            main_window,
-                            pane_id,
-                            source,
-                            &batch,
-                            false,
-                            req_id,
-                        ) {
-                            return self.handle_error(Some(pane_id), &reason, main_window);
-                        }
-                    } else {
-                        let filtered_batch = batch
-                            .into_iter()
-                            .filter(|trade| trade.time <= until_time)
-                            .collect::<Vec<_>>();
-
-                        if let Err(reason) = self.insert_fetched_trades(
-                            main_window,
-                            pane_id,
-                            source,
-                            &filtered_batch,
-                            true,
-                            req_id,
-                        ) {
-                            return self.handle_error(Some(pane_id), &reason, main_window);
-                        }
-                    }
+                } else if let Err(reason) =
+                    self.insert_fetched_trades(main_window, pane_id, source, &batch, req_id)
+                {
+                    return self.handle_error(Some(pane_id), &reason, main_window);
                 }
             }
             FetchedData::Klines { data, req_id } => {
@@ -1118,7 +1091,6 @@ impl Dashboard {
         pane_id: uuid::Uuid,
         source: TickerInfo,
         trades: &[Trade],
-        is_batches_done: bool,
         req_id: Option<uuid::Uuid>,
     ) -> Result<(), DashboardError> {
         let pane_state = self
@@ -1141,11 +1113,7 @@ impl Dashboard {
         match &mut pane_state.content {
             pane::Content::Kline { chart, .. } => {
                 if let Some(c) = chart {
-                    c.insert_raw_trades(source, trades.to_owned(), is_batches_done, req_id);
-
-                    if is_batches_done {
-                        pane_state.status = pane::Status::Ready;
-                    }
+                    c.insert_raw_trades(source, trades.to_owned(), false, req_id);
                     Ok(())
                 } else {
                     Err(DashboardError::Unknown(
@@ -1154,10 +1122,7 @@ impl Dashboard {
                 }
             }
             pane::Content::FootprintHistory(Some(history)) => {
-                history.insert_historical_trades(source, trades, req_id, is_batches_done);
-                if is_batches_done {
-                    pane_state.status = pane::Status::Ready;
-                }
+                history.insert_historical_trades(source, trades, req_id, false);
                 Ok(())
             }
             _ => Err(DashboardError::Unknown(
@@ -1366,11 +1331,11 @@ impl Dashboard {
                         &ready_streams,
                         self.layout_id,
                         reqs.into_iter().map(|r| (r.req_id, r.fetch, r.stream)),
-                        |handle| {
+                        |req_id, handle| {
                             if let pane::Content::Kline { chart, .. } = &mut state.content
                                 && let Some(c) = chart
                             {
-                                c.set_handle(handle);
+                                c.set_handle(req_id, handle);
                             } else if let pane::Content::FootprintHistory(Some(history)) =
                                 &mut state.content
                             {
@@ -1431,7 +1396,28 @@ impl Dashboard {
         streams: Vec<StreamKind>,
     ) -> Task<Message> {
         if let Some(state) = self.get_mut_pane_state_by_uuid(main_window, pane_id) {
-            state.streams = ResolvedStream::Ready(streams.clone());
+            let mut streams = streams;
+            if state.content.kind() == ContentKind::FootprintChart
+                && !streams
+                    .iter()
+                    .any(|stream| matches!(stream, StreamKind::Kline { .. }))
+            {
+                let ticker_info = streams
+                    .first()
+                    .map(StreamKind::ticker_info)
+                    .or_else(|| state.stream_pair());
+                let timeframe = match state.settings.selected_basis {
+                    Some(data::chart::Basis::Time(tf)) => tf,
+                    _ => exchange::Timeframe::M5,
+                };
+                if let Some(ticker_info) = ticker_info {
+                    streams.push(StreamKind::Kline {
+                        ticker_info,
+                        timeframe,
+                    });
+                }
+            }
+            state.streams = ResolvedStream::Ready(streams);
         }
         self.refresh_streams(main_window)
     }
@@ -1587,10 +1573,9 @@ impl From<fetcher::FetchUpdate> for Message {
                     Message::ChangePaneStatus(pane_id, pane::Status::Loading(info))
                 }
                 fetcher::FetchTaskStatus::Completed => {
-                    // Finalize trade-fetch bookkeeping even when no batch crossed
-                    // `until_time` (common for footprint gap fills). Without this,
-                    // the request stays Pending forever and further trade backfills
-                    // are blocked by has_pending / fetching_trades.
+                    // This terminal event is the only authority for completion.
+                    // A streamed server page may reach the requested upper bound
+                    // before an older exchange/archive gap has been filled.
                     Message::TradeFetchCompleted(pane_id, req_id)
                 }
             },

@@ -52,6 +52,18 @@ fn cluster_same_side_prints(mut prints: Vec<StoredLargeTrade>) -> Vec<StoredLarg
     clustered
 }
 
+fn display_clusters_above_threshold(
+    prints: Vec<StoredLargeTrade>,
+    threshold: f64,
+) -> Vec<StoredLargeTrade> {
+    // Keep cluster membership independent of the display threshold. Filtering
+    // constituents first makes a bubble shrink, move, or disappear as the
+    // slider rises even when its displayed total still clears the threshold.
+    let mut clustered = cluster_same_side_prints(prints);
+    clustered.retain(|trade| trade.notional >= threshold);
+    clustered
+}
+
 fn merge_print_cluster(prints: &[StoredLargeTrade]) -> StoredLargeTrade {
     if prints.len() == 1 {
         return prints[0];
@@ -238,24 +250,25 @@ impl LargeTradesIndicator {
         let last_day = day_start(UnixMs::new(window.to));
         let mut day = first_day;
         loop {
-            self.inner.for_each_large_trade(day, threshold, |trade| {
-                let time = trade.time.as_u64();
-                if time < window.from || time > window.to {
-                    return;
-                }
-                let price = Price::from_units(trade.price_units);
-                if price > highest || price < lowest {
-                    return;
-                }
-                prints.push(trade);
-            });
+            self.inner
+                .for_each_large_trade(day, capture_floor_usd(), |trade| {
+                    let time = trade.time.as_u64();
+                    if time < window.from || time > window.to {
+                        return;
+                    }
+                    let price = Price::from_units(trade.price_units);
+                    if price > highest || price < lowest {
+                        return;
+                    }
+                    prints.push(trade);
+                });
             if day >= last_day {
                 break;
             }
             day = day.saturating_add(DAY_MS);
         }
 
-        let clustered = cluster_same_side_prints(prints);
+        let clustered = display_clusters_above_threshold(prints, f64::from(threshold));
         let mut markers: Vec<(f32, StoredLargeTrade)> = Vec::with_capacity(clustered.len());
         for trade in clustered {
             let Some(x) = self.marker_x(chart, data_source, window, trade.time.as_u64()) else {
@@ -705,6 +718,23 @@ mod tests {
         assert!((clustered[0].notional - 4_000_000.0).abs() < 1.0);
         let vwap = Price::from_units(clustered[0].price_units).to_f64();
         assert!((vwap - 80_110.0).abs() < 50.0);
+    }
+
+    #[test]
+    fn aggregate_bubble_survives_a_higher_threshold_below_its_displayed_value() {
+        let prints = vec![
+            stored(1_000, 80_000.0, 3_350_000.0, false),
+            stored(1_040, 80_100.0, 1_200_000.0, false),
+            stored(1_090, 80_200.0, 1_140_000.0, false),
+        ];
+
+        let at_one_million = display_clusters_above_threshold(prints.clone(), 1_000_000.0);
+        let at_three_million = display_clusters_above_threshold(prints, 3_000_000.0);
+
+        assert_eq!(at_one_million.len(), 1);
+        assert_eq!(at_three_million.len(), 1);
+        assert!((at_one_million[0].notional - 5_690_000.0).abs() < 1.0);
+        assert_eq!(at_three_million[0], at_one_million[0]);
     }
 
     #[test]

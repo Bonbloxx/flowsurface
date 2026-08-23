@@ -7,7 +7,7 @@ use crate::{
 use data::{chart::PlotData, chart::kline::KlineDataPoint, util::abbr_large_numbers};
 use exchange::{
     OpenInterest, SizeUnit, Ticker, TickerInfo, Trade, UnixMs,
-    adapter::Venue,
+    adapter::{MarketKind, Venue},
     unit::{Price, PriceStep, qty::volume_size_unit},
 };
 use iced::widget::canvas::{self, Cache, Geometry};
@@ -39,7 +39,9 @@ pub(crate) const DAYS: usize = 3;
 /// v6: Cumulative Delta used to persist the shared day file without large
 /// prints, then win the writer race and wipe whales that Daily Delta / live
 /// tape had already stored. Those files must be dropped and re-fetched.
-pub(crate) const CACHE_SCHEMA_VERSION: u16 = 6;
+/// v7: quote-normalized and inverse trades are no longer multiplied by price
+/// a second time when producing USD notionals.
+pub(crate) const CACHE_SCHEMA_VERSION: u16 = 7;
 const MAX_LOOKBACK_DAYS: usize = 732;
 
 /// Notional floor (quote currency) at which an executed trade is retained for
@@ -220,10 +222,15 @@ impl DayStats {
         self.insert_trade_with(trade, DayBookRetain::ALL);
     }
 
+    #[cfg(test)]
     fn insert_trade_with(&mut self, trade: Trade, retain: DayBookRetain) {
+        self.insert_trade_with_unit(trade, retain, false);
+    }
+
+    fn insert_trade_with_unit(&mut self, trade: Trade, retain: DayBookRetain, qty_is_quote: bool) {
         let price = trade.price.to_f64();
         let qty = trade.qty.to_f64();
-        let notional = price * qty;
+        let notional = if qty_is_quote { qty } else { price * qty };
 
         if self.first.is_none_or(|(time, _)| trade.time < time) {
             self.first = Some((trade.time, price));
@@ -1185,6 +1192,8 @@ impl KlineIndicatorImpl for FootprintHistoryIndicator {
 
         let cutoff = self.history_cutoffs.get(&source_key).copied();
         let retain = self.retain;
+        let qty_is_quote = volume_size_unit() == SizeUnit::Quote
+            || source.market_type() == MarketKind::InversePerps;
         {
             let history = self.histories.entry(source_key).or_default();
             for trade in trades.iter() {
@@ -1203,7 +1212,7 @@ impl KlineIndicatorImpl for FootprintHistoryIndicator {
                     .days
                     .entry(day_start(trade.time))
                     .or_default()
-                    .insert_trade_with(*trade, retain);
+                    .insert_trade_with_unit(*trade, retain, qty_is_quote);
             }
             history.days.retain(|day, _| *day >= oldest);
         }
@@ -1970,6 +1979,14 @@ mod tests {
         assert_eq!(stats.volume(), 290.0);
         assert_eq!(stats.delta(), 110.0);
         assert_eq!(stats.notional, 290.0);
+    }
+
+    #[test]
+    fn quote_normalized_trade_is_not_multiplied_by_price_twice() {
+        let mut stats = DayStats::default();
+        stats.insert_trade_with_unit(trade(1_000, 100.0, 200.0, false), DayBookRetain::ALL, true);
+        assert_eq!(stats.notional, 200.0);
+        assert_eq!(stats.buy, 200.0);
     }
 
     fn stored_print(time: u64, notional: f64, is_sell: bool) -> StoredLargeTrade {

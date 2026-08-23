@@ -702,44 +702,46 @@ impl Flowsurface {
 
                         let task = {
                             if let Some(kind) = content {
-                                let ticker_infos =
-                                    if kind == data::layout::pane::ContentKind::FootprintHistory {
-                                        data::aggregation::equivalent_footprint_sources(
-                                            ticker_info,
-                                            self.sidebar
-                                                .tickers_info()
-                                                .values()
-                                                .filter_map(|info| *info),
-                                        )
-                                    } else {
-                                        data::aggregation::AggregateFeedId::for_seed_ticker(
-                                            ticker_info.ticker,
-                                        )
-                                        .filter(|_| kind.supports_aggregate_feed())
-                                        .map(|feed| {
-                                            feed.source_tickers()
-                                                .filter_map(|ticker| {
-                                                    let tickers_info = self.sidebar.tickers_info();
-                                                    tickers_info
-                                                        .get(&ticker)
-                                                        .copied()
-                                                        .flatten()
-                                                        .or_else(|| {
-                                                            tickers_info.iter().find_map(
-                                                                |(candidate, info)| {
-                                                                    ticker
-                                                                        .same_market(candidate)
-                                                                        .then_some(*info)
-                                                                        .flatten()
-                                                                },
-                                                            )
-                                                        })
-                                                })
-                                                .collect::<Vec<_>>()
-                                        })
-                                        .filter(|sources| !sources.is_empty())
-                                        .unwrap_or_else(|| vec![ticker_info])
-                                    };
+                                let ticker_infos = if kind
+                                    == data::layout::pane::ContentKind::FootprintHistory
+                                    || kind == data::layout::pane::ContentKind::FootprintChart
+                                {
+                                    data::aggregation::equivalent_footprint_sources(
+                                        ticker_info,
+                                        self.sidebar
+                                            .tickers_info()
+                                            .values()
+                                            .filter_map(|info| *info),
+                                    )
+                                } else {
+                                    data::aggregation::AggregateFeedId::for_seed_ticker(
+                                        ticker_info.ticker,
+                                    )
+                                    .filter(|_| kind.supports_aggregate_feed())
+                                    .map(|feed| {
+                                        feed.source_tickers()
+                                            .filter_map(|ticker| {
+                                                let tickers_info = self.sidebar.tickers_info();
+                                                tickers_info
+                                                    .get(&ticker)
+                                                    .copied()
+                                                    .flatten()
+                                                    .or_else(|| {
+                                                        tickers_info.iter().find_map(
+                                                            |(candidate, info)| {
+                                                                ticker
+                                                                    .same_market(candidate)
+                                                                    .then_some(*info)
+                                                                    .flatten()
+                                                            },
+                                                        )
+                                                    })
+                                            })
+                                            .collect::<Vec<_>>()
+                                    })
+                                    .filter(|sources| !sources.is_empty())
+                                    .unwrap_or_else(|| vec![ticker_info])
+                                };
 
                                 self.active_dashboard_mut().init_focused_pane_with_sources(
                                     &handles,
