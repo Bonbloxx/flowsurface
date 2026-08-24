@@ -100,33 +100,6 @@ impl OpenInterestIndicator {
         }
     }
 
-    fn source_intervals_label(&self) -> String {
-        let Some(chart_timeframe) = self.timeframe else {
-            return Timeframe::M5.to_string();
-        };
-        let intervals = self
-            .sources
-            .iter()
-            .map(|source| {
-                let venue = source.exchange().venue();
-                match Self::native_history_timeframe_for(source.exchange(), chart_timeframe) {
-                    Some(history) => {
-                        format!("{venue}: 1m collected snapshots + {history} venue history")
-                    }
-                    None => format!("{venue}: 1m collected snapshots from collection start"),
-                }
-            })
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>()
-            .join("; ");
-        if intervals.is_empty() {
-            "current snapshot".to_string()
-        } else {
-            intervals
-        }
-    }
-
     fn indicator_elem<'a>(
         &'a self,
         main_chart: &'a ViewState,
@@ -142,7 +115,6 @@ impl OpenInterestIndicator {
             return row![].into();
         }
 
-        let source_intervals = self.source_intervals_label();
         let value_label = if self.sources.len() > 1 {
             "Combined venue-reported OI"
         } else {
@@ -167,8 +139,8 @@ impl OpenInterestIndicator {
                 "Change: N/A".to_string()
             };
             let coverage = format!(
-                "Sources: {}/{}\nHistorical sampling: {}",
-                value.source_count, value.expected_source_count, source_intervals
+                "Sources: {}/{}",
+                value.source_count, value.expected_source_count
             );
             PlotTooltip::new(format!("{value_text}\n{change_text}\n{coverage}"))
         };

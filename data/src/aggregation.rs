@@ -567,6 +567,10 @@ impl KlineAggregator {
         composite.into_values().collect()
     }
 
+    pub fn sources(&self) -> &[TickerInfo] {
+        &self.sources
+    }
+
     /// Build a composite only for the requested inclusive time range.
     ///
     /// Historical TPO paging uses this to apply one returned page to the

@@ -743,6 +743,7 @@ impl KlineChart {
         }
         self.footprint_history.sources = sources;
         self.footprint_history.aggregate = aggregate;
+        self.reconfigure_previous_value_area_sources();
         for kind in [
             KlineIndicator::FootprintHistory,
             KlineIndicator::DailyDelta,
@@ -878,6 +879,35 @@ impl KlineChart {
         } else {
             self.footprint_history.sources.get(..1).unwrap_or(&[])
         }
+    }
+
+    fn previous_value_area_feed(&self) -> ResolvedFeed {
+        let sources = self.active_footprint_history_sources();
+        sources.first().map_or_else(
+            || self.feed.as_ref().clone(),
+            |primary| ResolvedFeed::from_sources_selected(*primary, sources, None),
+        )
+    }
+
+    fn reconfigure_previous_value_area_sources(&mut self) {
+        let feed = self.previous_value_area_feed();
+        if self.pva_klines.sources() == feed.sources() {
+            return;
+        }
+
+        let timeframe = self
+            .visual_config
+            .previous_value_area_tpo_config()
+            .letter_timeframe();
+        for source in self.pva_klines.sources().iter().copied() {
+            self.request_handler
+                .drop_requests_for_stream(StreamKind::Kline {
+                    ticker_info: source,
+                    timeframe,
+                });
+        }
+        *self.pva_klines = KlineAggregator::new(&feed);
+        self.pva_dirty = true;
     }
 
     fn sync_time_cursor(&mut self) {
@@ -1323,12 +1353,7 @@ impl KlineChart {
         let today = day_start(now);
         if today != self.pva_anchor_day {
             self.pva_anchor_day = today;
-            self.request_handler
-                .drop_requests_for_stream(StreamKind::Kline {
-                    ticker_info: self.feed.primary(),
-                    timeframe: letter_tf,
-                });
-            for source in self.feed.sources().iter().copied() {
+            for source in self.pva_klines.sources().iter().copied() {
                 self.request_handler
                     .drop_requests_for_stream(StreamKind::Kline {
                         ticker_info: source,
@@ -1340,7 +1365,7 @@ impl KlineChart {
         let need_earliest = value_area_history_earliest(config, now);
         let page_ms = letter_tf.to_milliseconds().saturating_mul(1_000);
 
-        for source in self.feed.sources().iter().copied() {
+        for source in self.pva_klines.sources().to_vec() {
             match self.pva_klines.latest(source) {
                 Some(latest) if latest.as_u64().saturating_add(page_ms) > now.as_u64() => {
                     // Newest bar is fresh; only older pages may be missing.
@@ -1435,7 +1460,11 @@ impl KlineChart {
             return false;
         }
         let config = self.visual_config.previous_value_area_tpo_config();
-        let row_step = config.row_step(self.chart.tick_size);
+        let row_step = previous_value_area_price_step(
+            self.active_footprint_history_sources(),
+            self.chart.tick_size,
+            self.visual_config.previous_value_area_ticks,
+        );
         let now = UnixMs::now();
         let dirty = std::mem::take(&mut self.pva_dirty);
         let bars = dirty.then(|| self.pva_klines.composite_klines());
@@ -1728,7 +1757,7 @@ impl KlineChart {
             // changes only need a rebuild from the existing bars.
             self.request_handler = RequestHandler::default();
             if letter_tf_changed {
-                *self.pva_klines = KlineAggregator::new(&self.feed);
+                *self.pva_klines = KlineAggregator::new(&self.previous_value_area_feed());
             }
             self.pva_dirty = true;
         }
@@ -5552,6 +5581,39 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn previous_value_area_uses_its_configured_venue_sources() {
+        let binance = TickerInfo::new(
+            Ticker::new("BTCUSDT", Exchange::BinanceLinear),
+            0.1,
+            0.001,
+            None,
+        );
+        let bybit = TickerInfo::new(
+            Ticker::new("BTCUSDT", Exchange::BybitLinear),
+            0.1,
+            0.001,
+            None,
+        );
+        let mut chart = KlineChart::new(
+            ViewConfig::default(),
+            Basis::Time(Timeframe::M15),
+            PriceStep::from(binance.min_ticksize),
+            &[],
+            Vec::new(),
+            &[KlineIndicator::PreviousValueArea],
+            binance,
+            &KlineChartKind::Candles,
+            None,
+        );
+
+        chart.configure_footprint_history(vec![binance, bybit], true);
+        assert_eq!(chart.pva_klines.sources(), &[binance, bybit]);
+
+        chart.configure_footprint_history(vec![bybit, binance], false);
+        assert_eq!(chart.pva_klines.sources(), &[bybit]);
     }
 
     #[test]
