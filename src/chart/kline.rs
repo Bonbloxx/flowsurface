@@ -25,7 +25,8 @@ use data::chart::kline::{
 };
 use data::chart::tpo::{
     Config as TpoConfig, DisplayStyle as TpoDisplayStyle, Profile as TpoProfile,
-    ProfilePeriod as TpoProfilePeriod, block_letter, price_to_row,
+    ProfilePeriod as TpoProfilePeriod, StructuralComposite, active_three_day_composite,
+    block_letter, price_to_row,
 };
 use data::chart::{Autoscale, KlineChartKind, ViewConfig};
 
@@ -338,6 +339,12 @@ pub struct KlineChart {
     /// coalesced across venue batches.
     last_live_redraw: Instant,
     pending_live_redraw: bool,
+    /// Derived only from completed TPO sessions. Keep it out of the canvas draw
+    /// path: rebuilding the merged price map on every live publication makes a
+    /// 150-profile aggregate chart needlessly CPU-bound.
+    tpo_structural_composite: Option<Box<StructuralComposite>>,
+    /// UTC day used when the cached completed-session set was last evaluated.
+    tpo_structural_anchor_day: u64,
     visual_config: Config,
 }
 
@@ -370,7 +377,7 @@ impl KlineChart {
             basis
         };
 
-        match basis {
+        let mut result = match basis {
             Basis::Time(interval) => {
                 let timeseries = TimeSeries::<KlineDataPoint>::new(interval, step, klines_raw)
                     .with_trades(&raw_trades);
@@ -485,6 +492,8 @@ impl KlineChart {
                     last_tick: Instant::now(),
                     last_live_redraw: Instant::now(),
                     pending_live_redraw: false,
+                    tpo_structural_composite: None,
+                    tpo_structural_anchor_day: day_start(UnixMs::now()),
                 }
             }
             Basis::Tick(interval) => {
@@ -595,9 +604,31 @@ impl KlineChart {
                     last_tick: Instant::now(),
                     last_live_redraw: Instant::now(),
                     pending_live_redraw: false,
+                    tpo_structural_composite: None,
+                    tpo_structural_anchor_day: day_start(UnixMs::now()),
                 }
             }
-        }
+        };
+        result.refresh_tpo_structural_composite(UnixMs::now());
+        result
+    }
+
+    fn refresh_tpo_structural_composite(&mut self, now: UnixMs) -> bool {
+        let next = match &self.kind {
+            KlineChartKind::Tpo { config } if config.show_three_day_composite => {
+                match &self.data_source {
+                    PlotData::TickBased(tick_aggr) => {
+                        structural_composite_for_render(&tick_aggr.datapoints, *config, now)
+                    }
+                    PlotData::TimeBased(_) => None,
+                }
+            }
+            _ => None,
+        };
+        let changed = self.tpo_structural_composite.as_deref() != next.as_ref();
+        self.tpo_structural_composite = next.map(Box::new);
+        self.tpo_structural_anchor_day = day_start(now);
+        changed
     }
 
     pub fn set_feed(&mut self, feed: ResolvedFeed) {
@@ -1843,24 +1874,32 @@ impl KlineChart {
             || config.session_start_minutes_utc != normalized.session_start_minutes_utc
             || config.block_size != normalized.block_size
             || config.ticks_per_row != normalized.ticks_per_row;
+        let construction_changed = config.profile_period != normalized.profile_period
+            || config.session_start_minutes_utc != normalized.session_start_minutes_utc
+            || config.block_size != normalized.block_size
+            || config.ticks_per_row != normalized.ticks_per_row
+            || config.value_area_percent != normalized.value_area_percent
+            || config.initial_balance_blocks != normalized.initial_balance_blocks;
         let letter_tf_changed =
             config.block_size.letter_timeframe() != normalized.block_size.letter_timeframe();
         *config = normalized;
 
-        let composite_klines = self.tpo_klines.composite_klines();
-        self.data_source = PlotData::TickBased(TickAggr::new_tpo_seeded(
-            normalized,
-            self.chart.tick_size,
-            &composite_klines,
-            &self.raw_trades,
-        ));
-        self.chart.last_price = match &self.data_source {
-            PlotData::TickBased(tick_aggr) => tick_aggr
-                .datapoints
-                .last()
-                .map(|dp| PriceInfoLabel::new(dp.kline.close, dp.kline.open)),
-            PlotData::TimeBased(_) => None,
-        };
+        if construction_changed {
+            let composite_klines = self.tpo_klines.composite_klines();
+            self.data_source = PlotData::TickBased(TickAggr::new_tpo_seeded(
+                normalized,
+                self.chart.tick_size,
+                &composite_klines,
+                &self.raw_trades,
+            ));
+            self.chart.last_price = match &self.data_source {
+                PlotData::TickBased(tick_aggr) => tick_aggr
+                    .datapoints
+                    .last()
+                    .map(|dp| PriceInfoLabel::new(dp.kline.close, dp.kline.open)),
+                PlotData::TimeBased(_) => None,
+            };
+        }
         if history_changed {
             if letter_tf_changed {
                 *self.tpo_klines = KlineAggregator::new(&self.feed);
@@ -1868,6 +1907,7 @@ impl KlineChart {
             self.trade_history_loaded = false;
             self.reset_request_handler();
         }
+        self.refresh_tpo_structural_composite(UnixMs::now());
         self.invalidate(None);
     }
 
@@ -1922,6 +1962,8 @@ impl KlineChart {
             // so switching multipliers only needs the ViewState update above.
             PlotData::TimeBased(_) => {}
         }
+
+        self.refresh_tpo_structural_composite(UnixMs::now());
 
         self.indicators
             .values_mut()
@@ -2039,6 +2081,8 @@ impl KlineChart {
             PlotData::TickBased(ref mut tick_aggr) => {
                 let old_dp_len = tick_aggr.datapoints.len();
                 tick_aggr.insert_trades(buffer);
+                let completed_session_changed =
+                    tick_aggr.is_tpo() && tick_aggr.datapoints.len() != old_dp_len;
 
                 if let Some(last_dp) = tick_aggr.datapoints.last() {
                     self.chart.last_price =
@@ -2051,6 +2095,10 @@ impl KlineChart {
                     .values_mut()
                     .filter_map(Option::as_mut)
                     .for_each(|indi| indi.on_insert_trades(buffer, old_dp_len, &self.data_source));
+
+                if completed_session_changed {
+                    self.refresh_tpo_structural_composite(UnixMs::now());
+                }
 
                 self.invalidate_live_render();
             }
@@ -2212,6 +2260,7 @@ impl KlineChart {
 
             // Redraw on completion, or lightly while seeding so the UI stays alive.
             if is_batches_done || self.raw_trades.len().is_multiple_of(20_000) {
+                self.refresh_tpo_structural_composite(UnixMs::now());
                 self.invalidate(Some(Instant::now()));
             }
             return;
@@ -2375,6 +2424,7 @@ impl KlineChart {
                     self.trade_history_loaded = self.tpo_klines.all_sources_complete(need_earliest);
                 }
 
+                self.refresh_tpo_structural_composite(UnixMs::now());
                 self.invalidate(None);
             }
             PlotData::TickBased(_) => {
@@ -2506,6 +2556,13 @@ impl KlineChart {
             self.flush_live_render(now);
         }
         self.last_tick = now;
+
+        let wall_now = UnixMs::now();
+        if self.tpo_structural_anchor_day != day_start(wall_now)
+            && self.refresh_tpo_structural_composite(wall_now)
+        {
+            self.chart.cache.main.clear();
+        }
 
         if self.sync_previous_value_areas() {
             // Previous Value Areas are painted on the main canvas. Their
@@ -2999,6 +3056,7 @@ impl canvas::Program<Message> for KlineChart {
                         visible_high,
                         visible_low,
                         region.x + region.width,
+                        self.tpo_structural_composite.as_deref(),
                     );
                 }
             }
@@ -3163,6 +3221,7 @@ fn draw_tpo_profiles(
     visible_high: Price,
     visible_low: Price,
     visible_right: f32,
+    structural_composite: Option<&StructuralComposite>,
 ) {
     let PlotData::TickBased(tick_aggr) = data_source else {
         return;
@@ -3190,6 +3249,7 @@ fn draw_tpo_profiles(
         row_step,
         visible_high,
         visible_low,
+        structural_composite,
     );
 
     // Paint extensions first so every profile and its labels remain legible on
@@ -3260,8 +3320,37 @@ fn draw_tpo_profiles(
             row_step,
             visible_high,
             visible_low,
+            prepared.opacity,
         );
     }
+
+    if let Some(composite) = structural_composite {
+        draw_structural_composite(
+            frame,
+            &interval_to_x,
+            &price_to_y,
+            &tick_aggr.datapoints,
+            composite,
+            cell_width,
+            cell_height,
+            scaling,
+            palette,
+            visible_high,
+            visible_low,
+        );
+    }
+}
+
+fn structural_composite_for_render(
+    datapoints: &[data::aggr::ticks::TickAccumulation],
+    config: TpoConfig,
+    now: UnixMs,
+) -> Option<StructuralComposite> {
+    let profiles = datapoints
+        .iter()
+        .filter_map(|datapoint| datapoint.tpo.as_ref())
+        .collect::<Vec<_>>();
+    active_three_day_composite(&profiles, config, now)
 }
 
 #[derive(Clone, Copy)]
@@ -3283,6 +3372,155 @@ struct PreparedTpoProfile<'a> {
     half_width: f32,
     single_print_bounds: Option<(Price, Price)>,
     extensions: Vec<TpoSinglePrintExtension>,
+    opacity: f32,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_structural_composite(
+    frame: &mut canvas::Frame,
+    interval_to_x: &impl Fn(u64) -> f32,
+    price_to_y: &impl Fn(Price) -> f32,
+    datapoints: &[data::aggr::ticks::TickAccumulation],
+    composite: &StructuralComposite,
+    cell_width: f32,
+    cell_height: f32,
+    scaling: f32,
+    palette: &Extended,
+    visible_high: Price,
+    visible_low: Price,
+) {
+    let offset_for = |matches: &dyn Fn(&TpoProfile) -> bool| {
+        datapoints
+            .iter()
+            .position(|datapoint| datapoint.tpo.as_ref().is_some_and(matches))
+            .and_then(|raw| datapoints.len().checked_sub(raw.saturating_add(1)))
+    };
+    let Some(oldest_offset) = offset_for(&|profile| profile.start == composite.start) else {
+        return;
+    };
+    let Some(newest_offset) = offset_for(&|profile| profile.end == composite.end) else {
+        return;
+    };
+
+    let oldest_x = interval_to_x(oldest_offset as u64);
+    let newest_x = interval_to_x(newest_offset as u64);
+    let left = oldest_x.min(newest_x) - cell_width * 0.48;
+    let right = oldest_x.max(newest_x) + cell_width * 0.48;
+    let width = right - left;
+    if !left.is_finite() || !right.is_finite() || width <= 0.0 {
+        return;
+    }
+
+    let scale = scaling.max(0.1);
+    let min_chart_px = 1.0 / scale;
+    let balance_high_y = price_to_y(composite.balance_high);
+    let balance_low_y = price_to_y(composite.balance_low);
+    let top = balance_high_y.min(balance_low_y);
+    let bottom = balance_high_y.max(balance_low_y);
+    let height = bottom - top;
+    let color = palette.primary.base.color;
+    if top.is_finite() && bottom.is_finite() && height > 0.0 {
+        frame.fill_rectangle(
+            Point::new(left, top),
+            Size::new(width, height),
+            color.scale_alpha(0.045),
+        );
+        frame.stroke(
+            &Path::rectangle(Point::new(left, top), Size::new(width, height)),
+            Stroke::with_color(
+                Stroke {
+                    width: min_chart_px,
+                    ..Default::default()
+                },
+                color.scale_alpha(0.55),
+            ),
+        );
+    }
+
+    let max_count = composite.rows.values().copied().max().unwrap_or(1).max(1);
+    let histogram_left = left + width * 0.04;
+    let histogram_width = width * 0.92;
+    let row_height = (cell_height * 0.84).max(min_chart_px);
+    let (visible_low, visible_high) = if visible_low <= visible_high {
+        (visible_low, visible_high)
+    } else {
+        (visible_high, visible_low)
+    };
+    for (price, count) in &composite.rows {
+        if *price < visible_low || *price > visible_high {
+            continue;
+        }
+        let y = price_to_y(*price);
+        if !y.is_finite() {
+            continue;
+        }
+        let bar_width = (histogram_width * (*count as f32 / max_count as f32)).max(min_chart_px);
+        let in_value_area =
+            *price >= composite.value_area_low && *price <= composite.value_area_high;
+        let alpha = if *price == composite.poc {
+            0.82
+        } else if in_value_area {
+            0.52
+        } else {
+            0.22
+        };
+        frame.fill_rectangle(
+            Point::new(histogram_left, y - row_height * 0.5),
+            Size::new(bar_width, row_height),
+            color.scale_alpha(alpha),
+        );
+    }
+
+    let line = |alpha: f32, extra_width: f32| {
+        Stroke::with_color(
+            Stroke {
+                width: min_chart_px + extra_width / scale,
+                ..Default::default()
+            },
+            color.scale_alpha(alpha),
+        )
+    };
+    for (price, label) in [
+        (composite.value_area_high, "CVAH"),
+        (composite.value_area_low, "CVAL"),
+    ] {
+        let y = price_to_y(price);
+        if y.is_finite() {
+            frame.stroke(
+                &Path::line(Point::new(left, y), Point::new(right, y)),
+                line(0.82, 1.0),
+            );
+            if width * scale >= 100.0 {
+                draw_cluster_text(
+                    frame,
+                    label,
+                    Point::new(right - 3.0 / scale, y),
+                    10.0 / scale,
+                    color,
+                    Alignment::End,
+                    Alignment::Center,
+                );
+            }
+        }
+    }
+    let poc_y = price_to_y(composite.poc);
+    if poc_y.is_finite() {
+        frame.stroke(
+            &Path::line(Point::new(left, poc_y), Point::new(right, poc_y)),
+            line(0.95, 0.0),
+        );
+    }
+    if top.is_finite() && width * scale >= 120.0 {
+        draw_cluster_text(
+            frame,
+            &format!("3D BAL · {}D", composite.profile_count),
+            Point::new(left + 4.0 / scale, top + 4.0 / scale),
+            11.0 / scale,
+            color,
+            Alignment::Start,
+            Alignment::Start,
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3296,6 +3534,7 @@ fn prepare_tpo_render<'a>(
     row_step: PriceStep,
     visible_high: Price,
     visible_low: Price,
+    structural_composite: Option<&StructuralComposite>,
 ) -> Vec<PreparedTpoProfile<'a>> {
     if end_idx < start_idx {
         return Vec::new();
@@ -3325,11 +3564,13 @@ fn prepare_tpo_render<'a>(
         let Some(profile) = datapoint.tpo.as_ref() else {
             continue;
         };
+        let in_structural_composite =
+            structural_composite.is_some_and(|composite| composite.contains_profile(profile));
         let max_row_count = tpo_profile_max_row_count(profile);
         let half_width = 0.5 * tpo_profile_width(config, max_row_count, cell_width, scaling);
 
         if offset >= start_idx {
-            let single_print_bounds = if config.show_single_prints {
+            let single_print_bounds = if config.show_single_prints && !in_structural_composite {
                 profile.single_print_bounds()
             } else {
                 None
@@ -3360,6 +3601,7 @@ fn prepare_tpo_render<'a>(
                 half_width,
                 single_print_bounds,
                 extensions,
+                opacity: if in_structural_composite { 0.20 } else { 1.0 },
             });
         }
 
@@ -3448,6 +3690,7 @@ fn draw_tpo_profile(
     row_step: PriceStep,
     visible_high: Price,
     visible_low: Price,
+    opacity: f32,
 ) {
     if profile.rows.is_empty() {
         return;
@@ -3491,17 +3734,21 @@ fn draw_tpo_profile(
     // TPO is time-at-price rather than order-flow delta, so use the session's
     // open-to-close direction while sharing Delta History's visual language.
     let (buy_color, sell_color) = delta_history_colors(palette);
-    let profile_color = if profile.close >= profile.open {
+    let base_profile_color = if profile.close >= profile.open {
         buy_color
     } else {
         sell_color
     };
-    let profile_strong = mix_color(profile_color, palette.background.base.text, 0.82);
-    let profile_muted = mix_color(profile_color, palette.background.base.color, 0.32);
+    let opacity = opacity.clamp(0.0, 1.0);
+    let profile_color = base_profile_color.scale_alpha(opacity);
+    let profile_strong =
+        mix_color(base_profile_color, palette.background.base.text, 0.82).scale_alpha(opacity);
+    let profile_muted =
+        mix_color(base_profile_color, palette.background.base.color, 0.32).scale_alpha(opacity);
     // Warning is the theme's yellow/orange semantic color. Keep the single
     // print ink and its full-row band deliberately faint while remaining
     // independent of bullish/bearish profile direction.
-    let single_print_color = |alpha: f32| palette.warning.base.color.scale_alpha(alpha);
+    let single_print_color = |alpha: f32| palette.warning.base.color.scale_alpha(alpha * opacity);
     let y_pad = (cell_height * 2.0).max(4.0 / scale);
 
     let y_hi = price_to_y(visible_high);
@@ -3690,7 +3937,7 @@ fn draw_tpo_profile(
         let ib_x = left - 5.0 / scale;
         let ib_high_y = price_to_y(profile.initial_balance_high);
         let ib_low_y = price_to_y(profile.initial_balance_low);
-        let ib_color = palette.warning.base.color.scale_alpha(0.85);
+        let ib_color = palette.warning.base.color.scale_alpha(0.85 * opacity);
         frame.stroke(
             &Path::line(Point::new(ib_x, ib_high_y), Point::new(ib_x, ib_low_y)),
             line(ib_color),
@@ -3710,7 +3957,7 @@ fn draw_tpo_profile(
         .max(cell_height * 0.35)
         .max(2.5 / scale);
     let open_y = price_to_y(open_row);
-    let open_color = palette.success.base.color.scale_alpha(0.9);
+    let open_color = palette.success.base.color.scale_alpha(0.9 * opacity);
 
     frame.stroke(
         &Path::line(
@@ -5321,6 +5568,7 @@ mod tests {
             step,
             Price::from_f64(1_000.0),
             Price::from_f64(0.0),
+            None,
         );
 
         let mut extension_count = 0usize;
@@ -5368,6 +5616,7 @@ mod tests {
             step,
             Price::from_f64(241.0),
             Price::from_f64(240.0),
+            None,
         );
         let padded_low = Price::from_units(Price::from_f64(240.0).units - step.units);
         let padded_high = Price::from_units(Price::from_f64(241.0).units + step.units);
@@ -5382,6 +5631,101 @@ mod tests {
 
         assert!(extension_count > 0);
         assert!(extension_count < 4 * 59);
+    }
+
+    #[test]
+    fn structural_composite_render_plan_dims_only_completed_member_profiles() {
+        let config = TpoConfig {
+            ticks_per_row: 1,
+            profiles_to_load: 4,
+            show_three_day_composite: true,
+            ..TpoConfig::default()
+        };
+        let (step, tick_aggr) = tpo_single_print_fixture(config, 4);
+        let now = UnixMs::new(3 * TpoProfilePeriod::Day.millis() + 1);
+        let composite = structural_composite_for_render(&tick_aggr.datapoints, config, now)
+            .expect("three completed days form the fixture balance");
+        assert_eq!(composite.profile_count, 3);
+
+        let prepared = prepare_tpo_render(
+            &tick_aggr.datapoints,
+            0,
+            tick_aggr.datapoints.len() - 1,
+            config,
+            44.0,
+            1.0,
+            step,
+            Price::from_f64(1_000.0),
+            Price::from_f64(0.0),
+            Some(&composite),
+        );
+        let member_profiles = prepared
+            .iter()
+            .filter(|profile| profile.opacity < 1.0)
+            .collect::<Vec<_>>();
+        assert_eq!(member_profiles.len(), 3);
+        assert!(member_profiles.iter().all(|profile| {
+            profile.extensions.is_empty()
+                && composite.contains_profile(profile.profile)
+                && (profile.opacity - 0.20).abs() < f32::EPSILON
+        }));
+        assert_eq!(
+            prepared
+                .iter()
+                .filter(|profile| profile.opacity == 1.0)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn developing_tpo_updates_reuse_the_structural_composite_cache() {
+        let config = TpoConfig {
+            ticks_per_row: 1,
+            profiles_to_load: 4,
+            show_three_day_composite: true,
+            ..TpoConfig::default()
+        };
+        let (step, tick_aggr) = tpo_single_print_fixture(config, 4);
+        let source = TickerInfo::new(
+            Ticker::new("BTCUSDT", Exchange::BinanceLinear),
+            1.0,
+            0.001,
+            None,
+        );
+        let mut chart = KlineChart::new(
+            ViewConfig::default(),
+            Basis::Tick(data::aggr::TickCount(1)),
+            step,
+            &[],
+            Vec::new(),
+            &[],
+            source,
+            &KlineChartKind::Tpo { config },
+            None,
+        );
+        chart.data_source = PlotData::TickBased(tick_aggr);
+        chart.refresh_tpo_structural_composite(UnixMs::new(3 * TpoProfilePeriod::Day.millis() + 1));
+        let cached = std::ptr::from_ref(
+            chart
+                .tpo_structural_composite
+                .as_deref()
+                .expect("three completed days form the fixture balance"),
+        );
+
+        let mut developing_trade = test_trade(150.0, 0.01, false);
+        developing_trade.time = UnixMs::new(3 * TpoProfilePeriod::Day.millis() + 60_000);
+        chart.insert_trades(source, &[developing_trade]);
+
+        assert_eq!(
+            cached,
+            std::ptr::from_ref(
+                chart
+                    .tpo_structural_composite
+                    .as_deref()
+                    .expect("developing trade must not discard the completed-session cache")
+            )
+        );
     }
 
     /// Manual release-mode benchmark for the work performed when a TPO canvas
@@ -5416,6 +5760,7 @@ mod tests {
                 step,
                 Price::from_f64(1_000_000.0),
                 Price::from_f64(-1_000_000.0),
+                None,
             );
             let checksum = prepared
                 .iter()
@@ -5449,6 +5794,65 @@ mod tests {
                     .as_ref()
                     .map_or(0, |profile| profile.rows.len()))
                 .sum::<usize>(),
+            median.as_secs_f64() * 1_000.0,
+        );
+    }
+
+    #[test]
+    #[ignore = "manual structural-composite render benchmark"]
+    fn benchmark_tpo_structural_composite_render_plan() {
+        let config = TpoConfig {
+            ticks_per_row: 1,
+            profiles_to_load: TpoConfig::MAX_HISTORY_PROFILES,
+            show_three_day_composite: true,
+            ..TpoConfig::default()
+        };
+        let (step, tick_aggr) =
+            tpo_single_print_fixture(config, u64::from(TpoConfig::MAX_HISTORY_PROFILES));
+        let now = UnixMs::new(
+            (u64::from(TpoConfig::MAX_HISTORY_PROFILES) + 1) * TpoProfilePeriod::Day.millis(),
+        );
+        let derive_started = std::time::Instant::now();
+        let composite = structural_composite_for_render(&tick_aggr.datapoints, config, now)
+            .expect("benchmark balance");
+        let derive_elapsed = derive_started.elapsed();
+        let mut samples = Vec::new();
+        let mut checksum = 0usize;
+        for _ in 0..7 {
+            let started = std::time::Instant::now();
+            let prepared = prepare_tpo_render(
+                &tick_aggr.datapoints,
+                0,
+                tick_aggr.datapoints.len() - 1,
+                config,
+                44.0,
+                1.0,
+                step,
+                Price::from_f64(1_000_000.0),
+                Price::from_f64(-1_000_000.0),
+                Some(&composite),
+            );
+            checksum = composite
+                .rows
+                .values()
+                .fold(prepared.len(), |sum, count| sum.wrapping_add(*count));
+            std::hint::black_box((&composite, &prepared));
+            samples.push(started.elapsed());
+        }
+        samples.sort_unstable();
+        let median = samples[samples.len() / 2];
+        println!(
+            "TPO structural composite cached: profiles={} rows={} derive_once_ms={:.3} render_median_ms={:.3} checksum={checksum}",
+            tick_aggr.datapoints.len(),
+            tick_aggr
+                .datapoints
+                .iter()
+                .map(|datapoint| datapoint
+                    .tpo
+                    .as_ref()
+                    .map_or(0, |profile| profile.rows.len()))
+                .sum::<usize>(),
+            derive_elapsed.as_secs_f64() * 1_000.0,
             median.as_secs_f64() * 1_000.0,
         );
     }

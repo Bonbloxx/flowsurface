@@ -169,6 +169,9 @@ pub struct Config {
     pub show_value_area: bool,
     pub show_initial_balance: bool,
     pub show_single_prints: bool,
+    /// Derive and display the active structure seeded by three completed daily
+    /// profiles whose value areas share a common price.
+    pub show_three_day_composite: bool,
 }
 
 impl Config {
@@ -269,6 +272,7 @@ impl Default for Config {
             show_value_area: true,
             show_initial_balance: true,
             show_single_prints: true,
+            show_three_day_composite: false,
         }
     }
 }
@@ -348,6 +352,88 @@ pub struct Profile {
     pub last_time: UnixMs,
     pub open: Price,
     pub close: Price,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProfileLevels {
+    poc: Price,
+    value_area_high: Price,
+    value_area_low: Price,
+    total_tpos: usize,
+}
+
+fn profile_levels(
+    rows: impl IntoIterator<Item = (Price, usize)>,
+    value_area_percent: u8,
+) -> Option<ProfileLevels> {
+    let rows = rows
+        .into_iter()
+        .filter(|(_, count)| *count > 0)
+        .collect::<Vec<_>>();
+    let (&(low, _), &(high, _)) = (rows.first()?, rows.last()?);
+    let midpoint_units = (i128::from(low.units) + i128::from(high.units)) / 2;
+    let total_tpos = rows
+        .iter()
+        .fold(0usize, |total, (_, count)| total.saturating_add(*count));
+
+    let poc_index = rows
+        .iter()
+        .enumerate()
+        .max_by(|(_, (price_a, count_a)), (_, (price_b, count_b))| {
+            count_a.cmp(count_b).then_with(|| {
+                let dist_a = (i128::from(price_a.units) - midpoint_units).abs();
+                let dist_b = (i128::from(price_b.units) - midpoint_units).abs();
+                dist_b.cmp(&dist_a).then_with(|| price_b.cmp(price_a))
+            })
+        })?
+        .0;
+    let poc = rows[poc_index].0;
+    let target = total_tpos
+        .saturating_mul(usize::from(value_area_percent.clamp(1, 100)))
+        .div_ceil(100);
+    let mut included = rows[poc_index].1;
+    let mut low_index = poc_index;
+    let mut high_index = poc_index;
+
+    while included < target && (low_index > 0 || high_index + 1 < rows.len()) {
+        let below = low_index.checked_sub(1);
+        let above = (high_index + 1 < rows.len()).then_some(high_index + 1);
+        match (below, above) {
+            (Some(below), Some(above)) => match rows[above].1.cmp(&rows[below].1) {
+                std::cmp::Ordering::Greater => {
+                    high_index = above;
+                    included = included.saturating_add(rows[above].1);
+                }
+                std::cmp::Ordering::Less => {
+                    low_index = below;
+                    included = included.saturating_add(rows[below].1);
+                }
+                std::cmp::Ordering::Equal => {
+                    low_index = below;
+                    high_index = above;
+                    included = included
+                        .saturating_add(rows[below].1)
+                        .saturating_add(rows[above].1);
+                }
+            },
+            (Some(below), None) => {
+                low_index = below;
+                included = included.saturating_add(rows[below].1);
+            }
+            (None, Some(above)) => {
+                high_index = above;
+                included = included.saturating_add(rows[above].1);
+            }
+            (None, None) => break,
+        }
+    }
+
+    Some(ProfileLevels {
+        poc,
+        value_area_high: rows[high_index].0,
+        value_area_low: rows[low_index].0,
+        total_tpos,
+    })
 }
 
 impl Profile {
@@ -527,77 +613,16 @@ impl Profile {
         let Some((&high, _)) = self.rows.last_key_value() else {
             return;
         };
-        let midpoint_units = (i128::from(low.units) + i128::from(high.units)) / 2;
-
-        self.total_tpos = self.rows.values().map(Row::count).sum();
-        // POC: longest TPO row; ties break toward the profile midpoint, then the lower row.
-        self.poc = self
-            .rows
-            .iter()
-            .max_by(|(price_a, row_a), (price_b, row_b)| {
-                row_a.count().cmp(&row_b.count()).then_with(|| {
-                    let dist_a = (i128::from(price_a.units) - midpoint_units).abs();
-                    let dist_b = (i128::from(price_b.units) - midpoint_units).abs();
-                    dist_b.cmp(&dist_a).then_with(|| price_b.cmp(price_a))
-                })
-            })
-            .map_or(low, |(price, _)| *price);
-
-        let prices = self.rows.keys().copied().collect::<Vec<_>>();
-        let Ok(poc_index) = prices.binary_search(&self.poc) else {
-            // Should be impossible if POC was taken from `rows`, but never panic
-            // on the UI thread — leave VAH/VAL at POC and return.
-            self.value_area_high = self.poc;
-            self.value_area_low = self.poc;
+        let Some(levels) = profile_levels(
+            self.rows.iter().map(|(price, row)| (*price, row.count())),
+            config.normalized().value_area_percent,
+        ) else {
             return;
         };
-        let target = self
-            .total_tpos
-            .saturating_mul(usize::from(config.normalized().value_area_percent))
-            .div_ceil(100);
-        let mut included = self.rows[&self.poc].count();
-        let mut low_index = poc_index;
-        let mut high_index = poc_index;
-
-        // Standard Market Profile value area: expand from the POC one row at a
-        // time, always taking the side with more TPOs (both when tied).
-        while included < target && (low_index > 0 || high_index + 1 < prices.len()) {
-            let below = low_index.checked_sub(1);
-            let above = (high_index + 1 < prices.len()).then_some(high_index + 1);
-            match (below, above) {
-                (Some(below), Some(above)) => {
-                    let below_count = self.rows[&prices[below]].count();
-                    let above_count = self.rows[&prices[above]].count();
-                    match above_count.cmp(&below_count) {
-                        std::cmp::Ordering::Greater => {
-                            high_index = above;
-                            included += above_count;
-                        }
-                        std::cmp::Ordering::Less => {
-                            low_index = below;
-                            included += below_count;
-                        }
-                        std::cmp::Ordering::Equal => {
-                            low_index = below;
-                            high_index = above;
-                            included += below_count + above_count;
-                        }
-                    }
-                }
-                (Some(below), None) => {
-                    low_index = below;
-                    included += self.rows[&prices[below]].count();
-                }
-                (None, Some(above)) => {
-                    high_index = above;
-                    included += self.rows[&prices[above]].count();
-                }
-                (None, None) => break,
-            }
-        }
-
-        self.value_area_low = prices[low_index];
-        self.value_area_high = prices[high_index];
+        self.poc = levels.poc;
+        self.value_area_high = levels.value_area_high;
+        self.value_area_low = levels.value_area_low;
+        self.total_tpos = levels.total_tpos;
 
         let ib_blocks = u16::from(config.normalized().initial_balance_blocks);
         let mut ib_low = None;
@@ -652,6 +677,154 @@ impl Profile {
                 .then_some(*price)
         })
     }
+}
+
+/// A derived multi-session TPO structure. It never owns or mutates source
+/// market data; row counts are summed from completed daily profiles.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructuralComposite {
+    pub start: UnixMs,
+    pub end: UnixMs,
+    pub seed_end: UnixMs,
+    pub rows: BTreeMap<Price, usize>,
+    pub poc: Price,
+    pub value_area_high: Price,
+    pub value_area_low: Price,
+    pub balance_high: Price,
+    pub balance_low: Price,
+    pub total_tpos: usize,
+    pub profile_count: usize,
+}
+
+impl StructuralComposite {
+    pub fn contains_profile(&self, profile: &Profile) -> bool {
+        profile.start >= self.start && profile.end <= self.end
+    }
+}
+
+fn common_value_area(profiles: &[&Profile]) -> Option<(Price, Price)> {
+    let low = profiles
+        .iter()
+        .map(|profile| profile.value_area_low)
+        .max()?;
+    let high = profiles
+        .iter()
+        .map(|profile| profile.value_area_high)
+        .min()?;
+    (low <= high).then_some((low, high))
+}
+
+fn profile_range(profiles: &[&Profile]) -> Option<(Price, Price)> {
+    let low = profiles
+        .iter()
+        .filter_map(|profile| profile.rows.first_key_value().map(|(price, _)| *price))
+        .min()?;
+    let high = profiles
+        .iter()
+        .filter_map(|profile| profile.rows.last_key_value().map(|(price, _)| *price))
+        .max()?;
+    Some((low, high))
+}
+
+fn merge_structural_profiles(
+    profiles: &[&Profile],
+    seed_end: UnixMs,
+    balance_low: Price,
+    balance_high: Price,
+    value_area_percent: u8,
+) -> Option<StructuralComposite> {
+    let first = profiles.first()?;
+    let last = profiles.last()?;
+    let mut rows = BTreeMap::<Price, usize>::new();
+    for profile in profiles {
+        for (price, row) in &profile.rows {
+            let count = rows.entry(*price).or_default();
+            *count = count.saturating_add(row.count());
+        }
+    }
+    let levels = profile_levels(
+        rows.iter().map(|(price, count)| (*price, *count)),
+        value_area_percent,
+    )?;
+
+    Some(StructuralComposite {
+        start: first.start,
+        end: last.end,
+        seed_end,
+        rows,
+        poc: levels.poc,
+        value_area_high: levels.value_area_high,
+        value_area_low: levels.value_area_low,
+        balance_high,
+        balance_low,
+        total_tpos: levels.total_tpos,
+        profile_count: profiles.len(),
+    })
+}
+
+/// Find the active structure seeded by three consecutive, completed daily
+/// profiles whose value areas share at least one price row.
+///
+/// Once seeded, later completed profiles remain part of the composite until
+/// one establishes its entire value area above or below the original balance
+/// range. The developing profile is deliberately excluded.
+pub fn active_three_day_composite(
+    profiles: &[&Profile],
+    config: Config,
+    now: UnixMs,
+) -> Option<StructuralComposite> {
+    let config = config.normalized();
+    if config.profile_period != ProfilePeriod::Day {
+        return None;
+    }
+
+    let mut completed = profiles
+        .iter()
+        .copied()
+        .filter(|profile| !profile.rows.is_empty() && profile.total_tpos > 0 && profile.end <= now)
+        .collect::<Vec<_>>();
+    completed.sort_by_key(|profile| profile.start);
+    completed.dedup_by_key(|profile| profile.start);
+
+    let mut search_start = 0usize;
+    while search_start.saturating_add(2) < completed.len() {
+        let seed_start = (search_start..=completed.len() - 3).find(|index| {
+            let seed = &completed[*index..*index + 3];
+            seed.windows(2).all(|pair| pair[0].end == pair[1].start)
+                && common_value_area(seed).is_some()
+        })?;
+        let seed = &completed[seed_start..seed_start + 3];
+        let (balance_low, balance_high) = profile_range(seed)?;
+        let seed_end = seed[2].end;
+        let mut composite_end = seed_start + 3;
+        let mut breakout = None;
+
+        while composite_end < completed.len() {
+            let previous = completed[composite_end - 1];
+            let next = completed[composite_end];
+            let separated_value =
+                next.value_area_low > balance_high || next.value_area_high < balance_low;
+            if previous.end != next.start || separated_value {
+                breakout = Some(composite_end);
+                break;
+            }
+            composite_end += 1;
+        }
+
+        if let Some(breakout) = breakout {
+            search_start = breakout;
+            continue;
+        }
+
+        return merge_structural_profiles(
+            &completed[seed_start..composite_end],
+            seed_end,
+            balance_low,
+            balance_high,
+            config.value_area_percent,
+        );
+    }
+    None
 }
 
 /// Map a raw price onto its nearest TPO row increment.
@@ -799,6 +972,7 @@ mod tests {
             show_value_area: false,
             show_initial_balance: false,
             show_single_prints: false,
+            show_three_day_composite: true,
         }
         .normalized();
 
@@ -848,6 +1022,7 @@ mod tests {
             show_value_area: true,
             show_initial_balance: false,
             show_single_prints: true,
+            show_three_day_composite: true,
         };
         let kind = super::super::kline::KlineChartKind::Tpo { config };
 
@@ -856,6 +1031,134 @@ mod tests {
             serde_json::from_str::<super::super::kline::KlineChartKind>(&json)
                 .expect("deserialize TPO chart kind"),
             kind
+        );
+    }
+
+    fn completed_profile(
+        day: u64,
+        rows: &[(i64, usize)],
+        value_area_low: i64,
+        value_area_high: i64,
+    ) -> Profile {
+        let start = UnixMs::new(day * ProfilePeriod::Day.millis());
+        let rows = rows
+            .iter()
+            .map(|(price, count)| {
+                (
+                    dollar(*price as f64),
+                    Row {
+                        blocks: (0..u16::try_from(*count).expect("fixture row count")).collect(),
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let total_tpos = rows.values().map(Row::count).sum();
+        let low = *rows.first_key_value().expect("fixture low").0;
+        let high = *rows.last_key_value().expect("fixture high").0;
+        Profile {
+            start,
+            end: start.saturating_add(ProfilePeriod::Day.millis()),
+            rows,
+            brackets: BTreeMap::new(),
+            poc: dollar(101.0),
+            value_area_high: dollar(value_area_high as f64),
+            value_area_low: dollar(value_area_low as f64),
+            initial_balance_high: high,
+            initial_balance_low: low,
+            total_tpos,
+            first_time: start,
+            last_time: start,
+            open: low,
+            close: high,
+        }
+    }
+
+    #[test]
+    fn legacy_tpo_config_defaults_structural_composite_off() {
+        let mut json = serde_json::to_value(Config {
+            show_three_day_composite: true,
+            ..Config::default()
+        })
+        .expect("serialize TPO config");
+        json.as_object_mut()
+            .expect("TPO config object")
+            .remove("show_three_day_composite");
+
+        let restored = serde_json::from_value::<Config>(json).expect("deserialize legacy config");
+        assert!(!restored.show_three_day_composite);
+    }
+
+    #[test]
+    fn three_completed_balanced_days_merge_without_block_collisions() {
+        let day0 = completed_profile(0, &[(99, 1), (100, 2), (101, 3)], 100, 101);
+        let day1 = completed_profile(1, &[(100, 2), (101, 4), (102, 1)], 100, 101);
+        let day2 = completed_profile(2, &[(100, 1), (101, 2), (102, 2)], 101, 102);
+        let developing = completed_profile(3, &[(101, 10), (102, 10)], 101, 102);
+        let profiles = [&day0, &day1, &day2, &developing];
+
+        let composite = active_three_day_composite(
+            &profiles,
+            Config::default(),
+            UnixMs::new(3 * ProfilePeriod::Day.millis() + 1),
+        )
+        .expect("active three-day balance");
+
+        assert_eq!(composite.profile_count, 3);
+        assert_eq!(composite.end, day2.end);
+        assert_eq!(composite.rows[&dollar(101.0)], 9);
+        assert_eq!(composite.total_tpos, 18);
+        assert_eq!(composite.poc, dollar(101.0));
+        assert!(!composite.contains_profile(&developing));
+    }
+
+    #[test]
+    fn accepted_probe_extends_structure_but_separated_value_breaks_it() {
+        let day0 = completed_profile(0, &[(99, 1), (100, 2), (101, 3)], 100, 101);
+        let day1 = completed_profile(1, &[(100, 2), (101, 4), (102, 1)], 100, 101);
+        let day2 = completed_profile(2, &[(100, 1), (101, 2), (102, 2)], 101, 102);
+        // The range probes above the seed, but value remains accepted inside it.
+        let probe = completed_profile(3, &[(101, 3), (102, 2), (110, 1)], 101, 102);
+        let profiles = [&day0, &day1, &day2, &probe];
+        let composite = active_three_day_composite(
+            &profiles,
+            Config::default(),
+            UnixMs::new(4 * ProfilePeriod::Day.millis() + 1),
+        )
+        .expect("accepted probe extends balance");
+        assert_eq!(composite.profile_count, 4);
+        assert!(composite.contains_profile(&probe));
+        assert_eq!(composite.balance_high, dollar(102.0));
+
+        let breakout = completed_profile(3, &[(110, 2), (111, 4), (112, 2)], 110, 112);
+        assert!(
+            active_three_day_composite(
+                &[&day0, &day1, &day2, &breakout],
+                Config::default(),
+                UnixMs::new(4 * ProfilePeriod::Day.millis() + 1),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn structural_composite_requires_daily_profiles_with_common_value() {
+        let day0 = completed_profile(0, &[(99, 1), (100, 2)], 99, 100);
+        let day1 = completed_profile(1, &[(101, 2), (102, 1)], 101, 102);
+        let day2 = completed_profile(2, &[(102, 2), (103, 1)], 102, 103);
+        let profiles = [&day0, &day1, &day2];
+        let now = UnixMs::new(4 * ProfilePeriod::Day.millis());
+
+        assert!(active_three_day_composite(&profiles, Config::default(), now).is_none());
+        assert!(
+            active_three_day_composite(
+                &profiles,
+                Config {
+                    profile_period: ProfilePeriod::Week,
+                    ..Config::default()
+                },
+                now,
+            )
+            .is_none()
         );
     }
 

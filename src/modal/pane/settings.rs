@@ -940,6 +940,17 @@ pub fn kline_cfg_view<'a>(
                         }),
                     )
                 });
+            let structural_composite = checkbox(config.show_three_day_composite)
+                .label("3-day structural composite")
+                .on_toggle(move |show_three_day_composite| {
+                    Message::PaneEvent(
+                        pane,
+                        Event::TpoConfigChanged(data::chart::tpo::Config {
+                            show_three_day_composite,
+                            ..*config
+                        }),
+                    )
+                });
 
             split_column![
                 display_readout_section,
@@ -975,6 +986,9 @@ pub fn kline_cfg_view<'a>(
                     value_area_toggle,
                     initial_balance_toggle,
                     singles,
+                    structural_composite,
+                    text("Daily profiles only. Uses completed sessions with shared value; the developing session remains separate.")
+                        .size(crate::style::text_size::SMALL),
                 ]
                 .spacing(8),
                 row![

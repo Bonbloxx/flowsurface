@@ -6,6 +6,7 @@ use crate::chart::kline::{ClusterKind, KlineDataPoint, KlineTrades, NPoc};
 
 use exchange::unit::{Price, PriceStep, Qty};
 use exchange::{Kline, Timeframe, Trade, UnixMs, Volume};
+use rustc_hash::FxHashSet;
 
 pub trait DataPoint {
     fn add_trade(&mut self, trade: &Trade, step: PriceStep);
@@ -330,7 +331,7 @@ impl TimeSeries<KlineDataPoint> {
             return;
         }
 
-        let empty_times: Vec<UnixMs> = self
+        let empty_times: FxHashSet<UnixMs> = self
             .datapoints
             .iter()
             .filter(|(_, dp)| dp.footprint.trades.is_empty())
@@ -340,7 +341,7 @@ impl TimeSeries<KlineDataPoint> {
             return;
         }
 
-        let mut updated_times: Vec<UnixMs> = Vec::new();
+        let mut updated_times = FxHashSet::default();
         for trade in buffer {
             let rounded_time = trade.time.floor_to(self.interval);
             if !empty_times.contains(&rounded_time) {
@@ -349,9 +350,7 @@ impl TimeSeries<KlineDataPoint> {
             let Some(entry) = self.datapoints.get_mut(&rounded_time) else {
                 continue;
             };
-            if !updated_times.contains(&rounded_time) {
-                updated_times.push(rounded_time);
-            }
+            updated_times.insert(rounded_time);
             entry.add_trade(trade, self.tick_size);
         }
 

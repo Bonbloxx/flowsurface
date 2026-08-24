@@ -921,7 +921,6 @@ impl FootprintHistoryIndicator {
                 }
             }
         }
-        self.rebuild_display();
     }
 
     pub(crate) fn day_is_complete(day: UnixMs, covered_through: UnixMs) -> bool {
@@ -978,23 +977,18 @@ impl FootprintHistoryIndicator {
             else {
                 continue;
             };
-            let mut source_deltas = BTreeMap::<u64, f64>::new();
             for (bucket, delta) in stats.five_min_delta.range(from..) {
-                *source_deltas.entry(*bucket).or_default() += *delta;
+                *merged.entry(*bucket).or_default() += *delta;
             }
             for (minute, delta) in stats.one_min_deltas().range(from..) {
                 let five_min_bucket = minute / FIVE_MIN_MS * FIVE_MIN_MS;
                 if five_min_bucket >= from
                     && stats.five_min_delta.contains_key(&five_min_bucket)
-                    && let Some(coarse) = source_deltas.get_mut(&five_min_bucket)
+                    && let Some(coarse) = merged.get_mut(&five_min_bucket)
                 {
                     *coarse -= *delta;
                 }
-                *source_deltas.entry(*minute).or_default() += *delta;
-            }
-            source_deltas.retain(|_, delta| delta.abs() > DELTA_ROUNDING_EPSILON);
-            for (time, delta) in source_deltas {
-                *merged.entry(time).or_default() += delta;
+                *merged.entry(*minute).or_default() += *delta;
             }
         }
         merged.retain(|_, delta| delta.abs() > DELTA_ROUNDING_EPSILON);
