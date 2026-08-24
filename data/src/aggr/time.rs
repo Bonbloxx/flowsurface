@@ -370,29 +370,50 @@ impl TimeSeries<KlineDataPoint> {
     }
 
     pub fn update_poc_status(&mut self) {
-        let updates = self
+        let snapshots = self
             .datapoints
             .iter()
-            .filter_map(|(&time, dp)| dp.poc_price().map(|price| (time, price)))
+            .map(|(&time, dp)| {
+                (
+                    time,
+                    dp.poc_price(),
+                    dp.kline.low.round_to_side_step(true, self.tick_size),
+                    dp.kline.high.round_to_side_step(false, self.tick_size),
+                )
+            })
             .collect::<Vec<_>>();
+        let intervals = snapshots
+            .iter()
+            .map(|(_, _, low, high)| (*low, *high))
+            .collect::<Vec<_>>();
+        let queries = snapshots
+            .iter()
+            .map(|(_, poc, _, _)| *poc)
+            .collect::<Vec<_>>();
+        let times = snapshots
+            .iter()
+            .map(|(time, _, _, _)| *time)
+            .collect::<Vec<_>>();
+        let hits = super::npoc::nearest_future_interval_hits(&intervals, &queries);
 
-        for (current_time, poc_price) in updates {
-            let mut npoc = NPoc::default();
-
-            for (&next_time, next_dp) in self.datapoints.range(current_time.saturating_add(1)..) {
-                let next_dp_low = next_dp.kline.low.round_to_side_step(true, self.tick_size);
-                let next_dp_high = next_dp.kline.high.round_to_side_step(false, self.tick_size);
-
-                if next_dp_low <= poc_price && next_dp_high >= poc_price {
-                    npoc.filled(next_time.as_u64());
-                    break;
-                } else {
-                    npoc.unfilled();
-                }
-            }
-
+        for (index, ((current_time, poc_price, _, _), hit)) in
+            snapshots.into_iter().zip(hits).enumerate()
+        {
+            let Some(_) = poc_price else {
+                continue;
+            };
+            let status = match hit {
+                Some(future) => NPoc::Filled {
+                    at: times
+                        .get(future)
+                        .expect("future hit index belongs to the time series")
+                        .as_u64(),
+                },
+                None if index + 1 < intervals.len() => NPoc::Naked,
+                None => NPoc::None,
+            };
             if let Some(data_point) = self.datapoints.get_mut(&current_time) {
-                data_point.set_poc_status(npoc);
+                data_point.set_poc_status(status);
             }
         }
     }
@@ -643,6 +664,8 @@ impl From<&TimeSeries<KlineDataPoint>> for BTreeMap<UnixMs, exchange::Volume> {
 mod tests {
     use super::*;
 
+    const NPOC_BENCH_POINTS: usize = 20_000;
+
     fn empty_kline(time: u64) -> Kline {
         let price = Price::from_f64(100.0);
         Kline {
@@ -653,6 +676,115 @@ mod tests {
             close: price,
             volume: Volume::empty_buy_sell(),
         }
+    }
+
+    fn npoc_benchmark_fixture() -> TimeSeries<KlineDataPoint> {
+        let interval = Timeframe::M1;
+        let interval_ms = interval.to_milliseconds();
+        let step = PriceStep {
+            units: Price::from_f64(0.1).units,
+        };
+        let klines = (0..NPOC_BENCH_POINTS)
+            .map(|index| {
+                let price = Price::from_f64(10_000.0 + index as f64 * 0.1);
+                Kline {
+                    time: UnixMs::new(index as u64 * interval_ms),
+                    open: price,
+                    high: price,
+                    low: price,
+                    close: price,
+                    volume: Volume::empty_buy_sell(),
+                }
+            })
+            .collect::<Vec<_>>();
+        let trades = klines
+            .iter()
+            .map(|kline| Trade {
+                time: kline.time,
+                price: kline.close,
+                qty: Qty::from_f64(1.0),
+                is_sell: false,
+            })
+            .collect::<Vec<_>>();
+        let mut series = TimeSeries::<KlineDataPoint>::new(interval, step, &klines);
+        series.insert_trades_existing_buckets(&trades);
+        series
+    }
+
+    #[test]
+    fn npoc_status_uses_the_first_future_candle_that_touches_the_exact_price() {
+        let interval = Timeframe::M1;
+        let interval_ms = interval.to_milliseconds();
+        let step = PriceStep {
+            units: Price::from_f64(1.0).units,
+        };
+        let prices = [100.0, 110.0, 100.0, 120.0];
+        let klines = prices
+            .iter()
+            .enumerate()
+            .map(|(index, price)| Kline {
+                time: UnixMs::new(index as u64 * interval_ms),
+                open: Price::from_f64(*price),
+                high: Price::from_f64(*price),
+                low: Price::from_f64(*price),
+                close: Price::from_f64(*price),
+                volume: Volume::empty_buy_sell(),
+            })
+            .collect::<Vec<_>>();
+        let trades = klines
+            .iter()
+            .map(|kline| Trade {
+                time: kline.time,
+                price: kline.close,
+                qty: Qty::from_f64(1.0),
+                is_sell: false,
+            })
+            .collect::<Vec<_>>();
+        let mut series = TimeSeries::<KlineDataPoint>::new(interval, step, &klines);
+        series.insert_trades_existing_buckets(&trades);
+        series.update_poc_status();
+
+        let statuses = series
+            .datapoints
+            .values()
+            .map(|point| point.footprint.poc.expect("fixture POC").status)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            statuses,
+            vec![
+                NPoc::Filled {
+                    at: 2 * interval_ms
+                },
+                NPoc::Naked,
+                NPoc::Naked,
+                NPoc::None,
+            ]
+        );
+    }
+
+    #[test]
+    #[ignore = "manual NPoC history benchmark"]
+    fn benchmark_npoc_history_recalculation() {
+        let mut series = npoc_benchmark_fixture();
+        let mut samples = Vec::new();
+        for _ in 0..5 {
+            let started = std::time::Instant::now();
+            series.update_poc_status();
+            samples.push(started.elapsed());
+        }
+        let naked = series
+            .datapoints
+            .values()
+            .filter(|point| matches!(point.footprint.poc.map(|poc| poc.status), Some(NPoc::Naked)))
+            .count();
+        assert_eq!(naked, NPOC_BENCH_POINTS - 1, "NPoC truth changed");
+        samples.sort_unstable();
+        let median = samples[samples.len() / 2];
+        println!(
+            "time-series NPoC: points={} median_ms={:.3} naked={naked}",
+            NPOC_BENCH_POINTS,
+            median.as_secs_f64() * 1_000.0,
+        );
     }
 
     #[test]

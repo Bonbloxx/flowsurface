@@ -636,39 +636,40 @@ impl TickAggr {
     }
 
     pub fn update_poc_status(&mut self) {
-        let updates = self
+        let intervals = self
             .datapoints
             .iter()
-            .enumerate()
-            .filter_map(|(idx, dp)| dp.poc_price().map(|price| (idx, price)))
+            .map(|datapoint| {
+                (
+                    datapoint.kline.low.round_to_side_step(true, self.tick_size),
+                    datapoint
+                        .kline
+                        .high
+                        .round_to_side_step(false, self.tick_size),
+                )
+            })
             .collect::<Vec<_>>();
-
+        let queries = self
+            .datapoints
+            .iter()
+            .map(TickAccumulation::poc_price)
+            .collect::<Vec<_>>();
+        let hits = super::npoc::nearest_future_interval_hits(&intervals, &queries);
         let total_points = self.datapoints.len();
 
-        for (current_idx, poc_price) in updates {
-            let mut npoc = NPoc::default();
-
-            for next_idx in (current_idx + 1)..total_points {
-                let next_dp = &self.datapoints[next_idx];
-
-                let next_dp_low = next_dp.kline.low.round_to_side_step(true, self.tick_size);
-                let next_dp_high = next_dp.kline.high.round_to_side_step(false, self.tick_size);
-
-                if next_dp_low <= poc_price && next_dp_high >= poc_price {
-                    // on render we reverse the order of the points
-                    // as it is easier to just take the idx=0 as latest candle for coords
-                    let reversed_idx = (total_points - 1) - next_idx;
-                    npoc.filled(reversed_idx as u64);
-                    break;
-                } else {
-                    npoc.unfilled();
-                }
+        for (current_idx, (poc_price, hit)) in queries.into_iter().zip(hits).enumerate() {
+            if poc_price.is_none() {
+                continue;
             }
-
-            if current_idx < total_points {
-                let data_point = &mut self.datapoints[current_idx];
-                data_point.set_poc_status(npoc);
-            }
+            let status = match hit {
+                Some(next_idx) => NPoc::Filled {
+                    // Rendering uses offsets from the newest datapoint.
+                    at: ((total_points - 1) - next_idx) as u64,
+                },
+                None if current_idx + 1 < total_points => NPoc::Naked,
+                None => NPoc::None,
+            };
+            self.datapoints[current_idx].set_poc_status(status);
         }
     }
 
@@ -776,6 +777,8 @@ mod tests {
     use super::*;
     use crate::chart::tpo::{BlockSize, Config as TpoConfig, ProfilePeriod};
 
+    const NPOC_BENCH_POINTS: usize = 20_000;
+
     fn trade(time: u64, price: f64) -> Trade {
         Trade {
             time: exchange::UnixMs::new(time),
@@ -789,6 +792,58 @@ mod tests {
         PriceStep {
             units: Price::from_f64(1.0).units,
         }
+    }
+
+    #[test]
+    fn npoc_status_uses_the_first_future_tick_bar_that_touches_the_exact_price() {
+        let trades = [
+            trade(0, 100.0),
+            trade(1, 110.0),
+            trade(2, 100.0),
+            trade(3, 120.0),
+        ];
+        let aggr = TickAggr::new(aggr::TickCount(1), one_dollar_step(), &trades);
+        let statuses = aggr
+            .datapoints
+            .iter()
+            .map(|point| point.footprint.poc.expect("fixture POC").status)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            statuses,
+            vec![NPoc::Filled { at: 1 }, NPoc::Naked, NPoc::Naked, NPoc::None,]
+        );
+    }
+
+    #[test]
+    #[ignore = "manual NPoC tick-history benchmark"]
+    fn benchmark_npoc_tick_history_build() {
+        let trades = (0..NPOC_BENCH_POINTS)
+            .map(|index| trade(index as u64, 10_000.0 + index as f64))
+            .collect::<Vec<_>>();
+        let mut samples = Vec::new();
+        let mut naked = 0;
+        for _ in 0..5 {
+            let started = std::time::Instant::now();
+            let aggr = TickAggr::new(aggr::TickCount(1), one_dollar_step(), &trades);
+            samples.push(started.elapsed());
+            naked = aggr
+                .datapoints
+                .iter()
+                .filter(|point| {
+                    matches!(point.footprint.poc.map(|poc| poc.status), Some(NPoc::Naked))
+                })
+                .count();
+            std::hint::black_box(aggr);
+        }
+        assert_eq!(naked, NPOC_BENCH_POINTS - 1, "NPoC truth changed");
+        samples.sort_unstable();
+        let median = samples[samples.len() / 2];
+        println!(
+            "tick NPoC build: points={} median_ms={:.3} naked={naked}",
+            NPOC_BENCH_POINTS,
+            median.as_secs_f64() * 1_000.0,
+        );
     }
 
     fn kline(time: u64, close: f64) -> Kline {

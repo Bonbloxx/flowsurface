@@ -1,3 +1,5 @@
+mod npoc;
+
 pub mod ticks;
 pub mod time;
 
