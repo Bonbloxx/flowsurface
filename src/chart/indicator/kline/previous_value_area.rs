@@ -136,6 +136,13 @@ impl KlineIndicatorImpl for PreviousValueAreaIndicator {
                 profile_value_area(&self.bars, period, config, row_step).map(|area| (*period, area))
             })
             .collect();
+        log::debug!(
+            "history_load kind=previous_value_area bars={} areas={} earliest={:?} latest={:?}",
+            self.bars.len(),
+            self.areas.len(),
+            self.bars.first().map(|bar| bar.time),
+            self.bars.last().map(|bar| bar.time),
+        );
         true
     }
 

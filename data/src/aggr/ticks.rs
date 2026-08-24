@@ -411,33 +411,36 @@ impl TickAggr {
             return;
         }
 
-        let mut updated_indices = Vec::new();
+        if buffer.is_empty() {
+            return;
+        }
+
+        // Tick aggregation only updates the prior developing bar and appends
+        // new bars, so every touched datapoint is one contiguous suffix.
+        let first_updated = self
+            .datapoints
+            .last()
+            .filter(|datapoint| !datapoint.is_full(self.interval))
+            .map_or(self.datapoints.len(), |_| self.datapoints.len() - 1);
 
         for trade in buffer {
             if self.datapoints.is_empty() {
                 self.datapoints
                     .push(TickAccumulation::new(trade, self.tick_size));
-                updated_indices.push(0);
             } else {
                 let last_idx = self.datapoints.len() - 1;
 
                 if self.datapoints[last_idx].is_full(self.interval) {
                     self.datapoints
                         .push(TickAccumulation::new(trade, self.tick_size));
-                    updated_indices.push(self.datapoints.len() - 1);
                 } else {
                     self.datapoints[last_idx].update_with_trade(trade, self.tick_size);
-                    if !updated_indices.contains(&last_idx) {
-                        updated_indices.push(last_idx);
-                    }
                 }
             }
         }
 
-        for idx in updated_indices {
-            if idx < self.datapoints.len() {
-                self.datapoints[idx].calculate_poc();
-            }
+        for datapoint in &mut self.datapoints[first_updated..] {
+            datapoint.calculate_poc();
         }
 
         self.update_poc_status();
@@ -777,6 +780,7 @@ mod tests {
     use super::*;
     use crate::chart::tpo::{BlockSize, Config as TpoConfig, ProfilePeriod};
 
+    const TICK_INGEST_BENCH_TRADES: usize = 50_000;
     const NPOC_BENCH_POINTS: usize = 20_000;
 
     fn trade(time: u64, price: f64) -> Trade {
@@ -792,6 +796,39 @@ mod tests {
         PriceStep {
             units: Price::from_f64(1.0).units,
         }
+    }
+
+    #[test]
+    #[ignore = "manual tick-history ingestion benchmark"]
+    fn benchmark_tick_history_ingestion() {
+        let trades = (0..TICK_INGEST_BENCH_TRADES)
+            .map(|index| trade(index as u64, 10_000.0 + (index % 1_000) as f64))
+            .collect::<Vec<_>>();
+        let mut samples = Vec::new();
+        let mut datapoints = 0;
+        let mut tick_count = 0;
+        for _ in 0..5 {
+            let started = std::time::Instant::now();
+            let aggr = TickAggr::new(aggr::TickCount(10), one_dollar_step(), &trades);
+            samples.push(started.elapsed());
+            datapoints = aggr.datapoints.len();
+            tick_count = aggr
+                .datapoints
+                .iter()
+                .map(|point| point.tick_count)
+                .sum::<usize>();
+            std::hint::black_box(aggr);
+        }
+        assert_eq!(datapoints, TICK_INGEST_BENCH_TRADES / 10);
+        assert_eq!(tick_count, TICK_INGEST_BENCH_TRADES, "trade count changed");
+        samples.sort_unstable();
+        let median = samples[samples.len() / 2];
+        println!(
+            "tick history ingestion: trades={} datapoints={} median_ms={:.3}",
+            TICK_INGEST_BENCH_TRADES,
+            datapoints,
+            median.as_secs_f64() * 1_000.0,
+        );
     }
 
     #[test]

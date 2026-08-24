@@ -13,7 +13,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 
 pub(super) async fn fetch_ticker_metadata(
-    hub: &mut HttpHub<OkexLimiter>,
+    hub: &HttpHub<OkexLimiter>,
     markets: &[MarketKind],
 ) -> Result<super::super::TickerMetadataMap, AdapterError> {
     let mut map = HashMap::new();
@@ -127,7 +127,7 @@ pub(super) async fn fetch_ticker_metadata(
 }
 
 pub(super) async fn fetch_ticker_stats(
-    hub: &mut HttpHub<OkexLimiter>,
+    hub: &HttpHub<OkexLimiter>,
     markets: &[MarketKind],
 ) -> Result<super::super::TickerStatsMap, AdapterError> {
     let mut map = HashMap::new();
@@ -258,7 +258,7 @@ pub(super) async fn fetch_ticker_stats(
 }
 
 pub(super) async fn fetch_klines(
-    hub: &mut HttpHub<OkexLimiter>,
+    hub: &HttpHub<OkexLimiter>,
     ticker_info: TickerInfo,
     timeframe: Timeframe,
     range: Option<(UnixMs, UnixMs)>,
@@ -277,7 +277,9 @@ pub(super) async fn fetch_klines(
         bar,
         match range {
             Some((start, end)) => {
-                ((end.as_u64() - start.as_u64()) / timeframe.to_milliseconds()).clamp(1, 300)
+                ((end.as_u64() - start.as_u64()) / timeframe.to_milliseconds())
+                    .saturating_add(1)
+                    .clamp(1, 300)
             }
             None => 300,
         }
@@ -342,7 +344,7 @@ pub(super) async fn fetch_klines(
 }
 
 pub(super) async fn fetch_historical_oi(
-    hub: &mut HttpHub<OkexLimiter>,
+    hub: &HttpHub<OkexLimiter>,
     ticker_info: TickerInfo,
     range: Option<(UnixMs, UnixMs)>,
     period: Timeframe,

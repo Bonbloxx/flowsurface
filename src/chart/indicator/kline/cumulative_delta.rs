@@ -30,7 +30,9 @@ use serde::{Deserialize, Serialize};
 /// Resolution of the shared UTC-day trade books backing this indicator.
 const ONE_MIN_MS: u64 = 60 * 1_000;
 const FIVE_MIN_MS: u64 = 5 * ONE_MIN_MS;
-const MINUTE_CACHE_SCHEMA_VERSION: u16 = 1;
+// v2 invalidates sidecars that could mark the provisional-cutoff/live-start
+// interval covered even though the old staging boundary discarded its trades.
+const MINUTE_CACHE_SCHEMA_VERSION: u16 = 2;
 /// UTC days of multi-venue trade history retained in the running sum. Days
 /// are slimmed to compact minute deltas when available and truthful cached
 /// five-minute deltas otherwise, so memory stays linear in time buckets.
@@ -230,7 +232,14 @@ impl MinuteDeltaHistory {
     }
 
     fn prepare(&mut self, source: TickerInfo, cutoff: UnixMs) {
-        self.cutoffs.entry(source.ticker).or_insert(cutoff);
+        // The first planner pass can run before the trade WebSocket connects,
+        // making this a provisional boundary. Once the first live execution
+        // is known, the planner advances `cutoff` to immediately before it so
+        // history can fill the startup seam without overlapping live data.
+        self.cutoffs
+            .entry(source.ticker)
+            .and_modify(|current| *current = (*current).max(cutoff))
+            .or_insert(cutoff);
     }
 
     fn stage(&mut self, req_id: uuid::Uuid, source: TickerInfo, trades: &[Trade]) {
@@ -856,6 +865,45 @@ mod tests {
         assert_eq!(
             indicator.candles[&UnixMs::new(today + 2 * ONE_MIN_MS)].close,
             800.0
+        );
+    }
+
+    #[test]
+    fn delayed_live_start_backfills_the_provisional_cutoff_gap() {
+        let only = source(Exchange::BinanceLinear, "BTCUSDT");
+        let mut indicator = CumulativeDeltaIndicator::new();
+        indicator.configure_footprint_history(&[only], false);
+        indicator.interval_ms = Some(Timeframe::M1.to_milliseconds());
+
+        let today = day_start(UnixMs::now());
+        let provisional_cutoff = UnixMs::new(today + 10_000);
+        let first_live = UnixMs::new(today + 2 * ONE_MIN_MS + 10_000);
+        indicator.prepare_footprint_history(only, provisional_cutoff);
+        indicator.on_source_trades(
+            only,
+            &[trade(first_live.as_u64(), 10.0, 20.0, false)],
+            false,
+        );
+
+        // Once the live seam is known, the planner requests the interval
+        // between its provisional cutoff and the first live execution.
+        indicator.prepare_footprint_history(only, first_live.saturating_sub(1));
+        let req_id = uuid::Uuid::new_v4();
+        indicator.stage_source_trades(
+            req_id,
+            only,
+            &[trade(today + ONE_MIN_MS + 10_000, 10.0, 10.0, false)],
+        );
+        indicator.commit_staged_source_trades(req_id);
+
+        assert_eq!(indicator.candles.len(), 2);
+        assert_eq!(
+            indicator.candles[&UnixMs::new(today + ONE_MIN_MS)].close,
+            100.0
+        );
+        assert_eq!(
+            indicator.candles[&UnixMs::new(today + 2 * ONE_MIN_MS)].close,
+            300.0
         );
     }
 

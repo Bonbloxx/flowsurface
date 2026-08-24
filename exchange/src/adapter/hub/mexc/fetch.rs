@@ -63,7 +63,7 @@ struct DepthData {
 }
 
 pub(super) async fn fetch_depth_snapshot(
-    hub: &mut HttpHub<MexcLimiter>,
+    hub: &HttpHub<MexcLimiter>,
     ticker: Ticker,
 ) -> Result<DepthPayload, AdapterError> {
     let (symbol_str, market_type) = ticker.to_full_symbol_and_type();
@@ -87,7 +87,7 @@ pub(super) async fn fetch_depth_snapshot(
 }
 
 pub(super) async fn fetch_ticker_metadata(
-    hub: &mut HttpHub<MexcLimiter>,
+    hub: &HttpHub<MexcLimiter>,
     markets: &[MarketKind],
 ) -> Result<super::super::TickerMetadataMap, AdapterError> {
     let mut ticker_info_map = HashMap::new();
@@ -231,7 +231,7 @@ pub(super) async fn fetch_ticker_metadata(
 }
 
 pub(super) async fn fetch_ticker_stats(
-    hub: &mut HttpHub<MexcLimiter>,
+    hub: &HttpHub<MexcLimiter>,
     markets: &[MarketKind],
     contract_sizes: Option<&HashMap<Ticker, crate::unit::ContractSize>>,
 ) -> Result<super::super::TickerStatsMap, AdapterError> {
@@ -364,7 +364,7 @@ pub(super) async fn fetch_ticker_stats(
 }
 
 pub(super) async fn fetch_klines(
-    hub: &mut HttpHub<MexcLimiter>,
+    hub: &HttpHub<MexcLimiter>,
     ticker_info: TickerInfo,
     timeframe: Timeframe,
     range: Option<(UnixMs, UnixMs)>,

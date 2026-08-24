@@ -2,11 +2,13 @@ use exchange::adapter::{AdapterError, AdapterHandles, Exchange, StreamKind};
 use exchange::{Kline, OpenInterest, TickerInfo, Trade, UnixMs};
 use iced::{
     Task,
+    futures::{FutureExt, future::BoxFuture, future::Shared},
     task::{Handle, Straw, sipper},
 };
 use rustc_hash::FxHashMap;
 use std::path::PathBuf;
-use std::sync::RwLock;
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::time::Instant;
 use uuid::Uuid;
 
 use crate::connector::{
@@ -78,6 +80,10 @@ pub enum FetchedData {
     OI {
         data: Vec<OpenInterest>,
         req_id: Option<uuid::Uuid>,
+        /// Only the venue task is terminal. Remote history is delivered as an
+        /// early, authoritative partial result while the serialized venue
+        /// worker continues toward its latest observation.
+        terminal: bool,
     },
 }
 
@@ -768,62 +774,35 @@ pub fn oi_fetch_task(
             ticker_info,
             timeframe,
         } => {
-            let fetch = async move {
-                let exchange_fetch = handles.fetch_open_interest(ticker_info, timeframe, range);
-                let remote_fetch = async {
-                    match (oi_history, range) {
-                        (Some(client), Some((from, to))) => {
-                            Some(client.fetch_open_interest(ticker_info, from, to).await)
-                        }
-                        _ => None,
-                    }
-                };
-                let (exchange_result, remote_result) =
-                    iced::futures::future::join(exchange_fetch, remote_fetch).await;
-
-                let fetched = match (exchange_result, remote_result) {
-                    (Ok(exchange), Some(Ok(remote))) => {
-                        merge_open_interest_observations(&exchange, &remote)
-                    }
-                    (Ok(exchange), Some(Err(remote_err))) => {
-                        log::warn!(
-                            "OI history service failed for {}; using venue history: {remote_err}",
-                            ticker_info.ticker
-                        );
-                        exchange
-                    }
-                    (Ok(exchange), None) => exchange,
-                    (Err(exchange_err), Some(Ok(remote))) if !remote.is_empty() => {
-                        log::warn!(
-                            "Venue OI fetch failed for {}; using {} remote observations: {exchange_err}",
-                            ticker_info.ticker,
-                            remote.len()
-                        );
-                        remote
-                    }
-                    (Err(exchange_err), Some(Err(remote_err))) => {
-                        log::warn!(
-                            "OI history service also failed for {}: {remote_err}",
-                            ticker_info.ticker
-                        );
-                        return oi_archive_fallback(ticker_info, range, exchange_err);
-                    }
-                    (Err(exchange_err), Some(Ok(_))) | (Err(exchange_err), None) => {
-                        return oi_archive_fallback(ticker_info, range, exchange_err);
-                    }
-                };
-
-                Ok(open_interest::merge_and_load(ticker_info, &fetched, range))
+            let venue_started_at = Instant::now();
+            let venue_fetch = async move {
+                match handles
+                    .fetch_open_interest(ticker_info, timeframe, range)
+                    .await
+                {
+                    Ok(fetched) => Ok(open_interest::merge_and_load(ticker_info, &fetched, range)),
+                    Err(err) => oi_archive_fallback(ticker_info, range, err),
+                }
             };
-
-            Task::perform(
-                iced::futures::TryFutureExt::map_err(fetch, |err| {
+            let venue_task = Task::perform(
+                iced::futures::TryFutureExt::map_err(venue_fetch, |err| {
                     log::error!("Open interest fetch failed: {err}");
                     err.ui_message()
                 }),
                 move |result| match result {
                     Ok(oi) => {
-                        let data = FetchedData::OI { data: oi, req_id };
+                        log::debug!(
+                            "history_load kind=oi source=venue exchange={} ticker={} timeframe={timeframe:?} range={range:?} elapsed_ms={} points={}",
+                            ticker_info.exchange(),
+                            ticker_info.ticker,
+                            venue_started_at.elapsed().as_millis(),
+                            oi.len()
+                        );
+                        let data = FetchedData::OI {
+                            data: oi,
+                            req_id,
+                            terminal: true,
+                        };
                         FetchUpdate::Data {
                             layout_id,
                             pane_id,
@@ -831,13 +810,59 @@ pub fn oi_fetch_task(
                             stream,
                         }
                     }
-                    Err(err) => FetchUpdate::Error {
-                        pane_id,
-                        error: err,
-                        req_id,
-                    },
+                    Err(err) => {
+                        log::debug!(
+                            "history_load kind=oi source=venue exchange={} ticker={} timeframe={timeframe:?} range={range:?} elapsed_ms={} error={err}",
+                            ticker_info.exchange(),
+                            ticker_info.ticker,
+                            venue_started_at.elapsed().as_millis()
+                        );
+                        FetchUpdate::Error {
+                            pane_id,
+                            error: err,
+                            req_id,
+                        }
+                    }
                 },
-            )
+            );
+
+            let mut tasks = vec![venue_task];
+            if let (Some(client), Some((from, to))) = (oi_history, range) {
+                let remote_started_at = Instant::now();
+                let remote_fetch = async move {
+                    match client.fetch_open_interest(ticker_info, from, to).await {
+                        Ok(fetched) => open_interest::merge_and_load(ticker_info, &fetched, range),
+                        Err(err) => {
+                            log::warn!(
+                                "OI history service failed for {}; venue fetch remains active: {err}",
+                                ticker_info.ticker
+                            );
+                            Vec::new()
+                        }
+                    }
+                };
+                let remote_task = Task::perform(remote_fetch, move |oi| {
+                    log::debug!(
+                        "history_load kind=oi source=remote exchange={} ticker={} timeframe={timeframe:?} range={range:?} elapsed_ms={} points={}",
+                        ticker_info.exchange(),
+                        ticker_info.ticker,
+                        remote_started_at.elapsed().as_millis(),
+                        oi.len()
+                    );
+                    FetchUpdate::Data {
+                        layout_id,
+                        pane_id,
+                        data: FetchedData::OI {
+                            data: oi,
+                            req_id,
+                            terminal: false,
+                        },
+                        stream,
+                    }
+                });
+                tasks.insert(0, remote_task);
+            }
+            Task::batch(tasks)
         }
         _ => Task::none(),
     };
@@ -845,6 +870,7 @@ pub fn oi_fetch_task(
     update_status.chain(fetch_task)
 }
 
+#[cfg(test)]
 fn merge_open_interest_observations(
     exchange: &[OpenInterest],
     remote: &[OpenInterest],
@@ -902,7 +928,8 @@ pub fn kline_fetch_task(
             ticker_info,
             timeframe,
         } => {
-            let fetch = async move { handles.fetch_klines(ticker_info, timeframe, range).await };
+            let started_at = Instant::now();
+            let (fetch, coalesced) = shared_kline_fetch(handles, ticker_info, timeframe, range);
 
             Task::perform(
                 iced::futures::TryFutureExt::map_err(fetch, |err| {
@@ -911,8 +938,15 @@ pub fn kline_fetch_task(
                 }),
                 move |result| match result {
                     Ok(klines) => {
+                        log::debug!(
+                            "history_load kind=kline pane={pane_id} exchange={} ticker={} timeframe={timeframe:?} range={range:?} elapsed_ms={} points={} coalesced={coalesced}",
+                            ticker_info.exchange(),
+                            ticker_info.ticker,
+                            started_at.elapsed().as_millis(),
+                            klines.len()
+                        );
                         let data = FetchedData::Klines {
-                            data: klines,
+                            data: (*klines).clone(),
                             req_id,
                         };
                         FetchUpdate::Data {
@@ -922,11 +956,19 @@ pub fn kline_fetch_task(
                             stream,
                         }
                     }
-                    Err(err) => FetchUpdate::Error {
-                        pane_id,
-                        error: err,
-                        req_id,
-                    },
+                    Err(err) => {
+                        log::debug!(
+                            "history_load kind=kline pane={pane_id} exchange={} ticker={} timeframe={timeframe:?} range={range:?} elapsed_ms={} error={err}",
+                            ticker_info.exchange(),
+                            ticker_info.ticker,
+                            started_at.elapsed().as_millis()
+                        );
+                        FetchUpdate::Error {
+                            pane_id,
+                            error: err,
+                            req_id,
+                        }
+                    }
                 },
             )
         }
@@ -934,6 +976,59 @@ pub fn kline_fetch_task(
     };
 
     update_status.chain(fetch_task)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct KlineFetchKey {
+    ticker_info: TickerInfo,
+    timeframe: exchange::Timeframe,
+    range: Option<(UnixMs, UnixMs)>,
+}
+
+type SharedKlineFetch = Shared<BoxFuture<'static, Result<Arc<Vec<Kline>>, Arc<AdapterError>>>>;
+
+fn in_flight_kline_fetches() -> &'static Mutex<FxHashMap<KlineFetchKey, SharedKlineFetch>> {
+    static FETCHES: OnceLock<Mutex<FxHashMap<KlineFetchKey, SharedKlineFetch>>> = OnceLock::new();
+    FETCHES.get_or_init(|| Mutex::new(FxHashMap::default()))
+}
+
+/// Fan out one exact venue response to every pane requesting the same immutable
+/// source/timeframe/range. The entry exists only while the HTTP request is in
+/// flight, so this cannot serve stale market data.
+fn shared_kline_fetch(
+    handles: AdapterHandles,
+    ticker_info: TickerInfo,
+    timeframe: exchange::Timeframe,
+    range: Option<(UnixMs, UnixMs)>,
+) -> (SharedKlineFetch, bool) {
+    let key = KlineFetchKey {
+        ticker_info,
+        timeframe,
+        range,
+    };
+    let mut fetches = in_flight_kline_fetches()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(fetch) = fetches.get(&key) {
+        return (fetch.clone(), true);
+    }
+
+    let fetch = async move {
+        let result = handles
+            .fetch_klines(ticker_info, timeframe, range)
+            .await
+            .map(Arc::new)
+            .map_err(Arc::new);
+        in_flight_kline_fetches()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&key);
+        result
+    }
+    .boxed()
+    .shared();
+    fetches.insert(key, fetch.clone());
+    (fetch, false)
 }
 
 /// Fetch trades from the configured source using a single forward-paging

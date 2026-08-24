@@ -363,6 +363,25 @@ impl AdapterHandles {
         }
     }
 
+    /// Fetch the smallest authoritative metadata slice needed to restore the
+    /// common market on `venue`. Most venues already expose one market per
+    /// request; Hyperliquid additionally avoids walking every HIP-3 DEX when
+    /// the default perpetual catalog is sufficient for saved panes.
+    pub async fn fetch_priority_ticker_metadata(
+        &self,
+        venue: Venue,
+        market: MarketKind,
+    ) -> Result<HashMap<Ticker, Option<TickerInfo>>, AdapterError> {
+        if venue == Venue::Hyperliquid && market == MarketKind::LinearPerps {
+            let Some(handle) = self.hyperliquid.as_ref() else {
+                return Err(Self::missing_venue_error(venue));
+            };
+            handle.fetch_primary_ticker_metadata(market).await
+        } else {
+            self.fetch_ticker_metadata(venue, &[market]).await
+        }
+    }
+
     /// Returns a map of tickers to their [`TickerStats`].
     ///
     /// `Binance`, `Bybit`, and `Hyperliquid` are fetched per market, while

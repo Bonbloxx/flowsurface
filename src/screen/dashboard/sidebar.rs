@@ -85,6 +85,15 @@ impl Sidebar {
                     Some(tickers_table::Action::FocusWidget(id)) => {
                         return (iced::widget::operation::focus(id), None);
                     }
+                    Some(tickers_table::Action::FocusWidgetAndFetch(id, task)) => {
+                        return (
+                            Task::batch([
+                                iced::widget::operation::focus(id),
+                                task.map(Message::TickersTable),
+                            ]),
+                            None,
+                        );
+                    }
                     None => {}
                 }
             }

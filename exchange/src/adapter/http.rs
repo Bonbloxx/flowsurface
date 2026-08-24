@@ -303,18 +303,20 @@ impl<L: RateLimiter> HttpHub<L> {
 }
 
 pub(super) trait FetchCommandHandler<M> {
+    const MAX_IN_FLIGHT_REQUESTS: usize = 8;
+
     fn fetch_ticker_metadata(
-        &mut self,
+        &self,
         market_scope: M,
     ) -> BoxFuture<'_, Result<TickerMetadataMap, AdapterError>>;
 
     fn fetch_ticker_stats(
-        &mut self,
+        &self,
         market_scope: M,
     ) -> BoxFuture<'_, Result<TickerStatsMap, AdapterError>>;
 
     fn fetch_klines(
-        &mut self,
+        &self,
         ticker_info: TickerInfo,
         timeframe: Timeframe,
         range: Option<(UnixMs, UnixMs)>,
@@ -324,7 +326,7 @@ pub(super) trait FetchCommandHandler<M> {
     }
 
     fn fetch_open_interest(
-        &mut self,
+        &self,
         ticker_info: TickerInfo,
         timeframe: Timeframe,
         range: Option<(UnixMs, UnixMs)>,
@@ -334,7 +336,7 @@ pub(super) trait FetchCommandHandler<M> {
     }
 
     fn fetch_depth_snapshot(
-        &mut self,
+        &self,
         ticker: Ticker,
     ) -> BoxFuture<'_, Result<DepthPayload, AdapterError>> {
         let _ = ticker;
@@ -342,7 +344,7 @@ pub(super) trait FetchCommandHandler<M> {
     }
 
     fn fetch_trades(
-        &mut self,
+        &self,
         ticker_info: TickerInfo,
         from_time: UnixMs,
         to_time: Option<UnixMs>,
@@ -353,16 +355,25 @@ pub(super) trait FetchCommandHandler<M> {
     }
 }
 
-pub(super) fn spawn_fetch_worker<H, M>(mut worker: H) -> RequestPort<FetchCommand<M>>
+pub(super) fn spawn_fetch_worker<H, M>(worker: H) -> RequestPort<FetchCommand<M>>
 where
-    H: FetchCommandHandler<M> + Send + 'static,
+    H: FetchCommandHandler<M> + Send + Sync + 'static,
     M: Send + 'static,
 {
     const COMMAND_BUFFER_CAPACITY: usize = 128;
     let (sender, mut receiver) = tokio::sync::mpsc::channel(COMMAND_BUFFER_CAPACITY);
+    let worker = std::sync::Arc::new(worker);
+    let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(H::MAX_IN_FLIGHT_REQUESTS));
     tokio::spawn(async move {
         while let Some(command) = receiver.recv().await {
-            handle_fetch_command(&mut worker, command).await;
+            let Ok(permit) = std::sync::Arc::clone(&slots).acquire_owned().await else {
+                break;
+            };
+            let worker = std::sync::Arc::clone(&worker);
+            tokio::spawn(async move {
+                let _permit = permit;
+                handle_fetch_command(worker.as_ref(), command).await;
+            });
         }
     });
     RequestPort::new(sender)
@@ -372,7 +383,7 @@ fn unsupported_fetch(feature: &'static str) -> AdapterError {
     AdapterError::InvalidRequest(format!("{feature} is not supported by this worker"))
 }
 
-async fn handle_fetch_command<H, M>(handler: &mut H, command: FetchCommand<M>)
+async fn handle_fetch_command<H, M>(handler: &H, command: FetchCommand<M>)
 where
     H: FetchCommandHandler<M>,
 {

@@ -16,7 +16,8 @@ use rustc_hash::FxHashMap;
 
 use iced::widget::{center, row, text};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, btree_map},
+    iter::Peekable,
     ops::RangeInclusive,
 };
 
@@ -39,6 +40,39 @@ pub struct OpenInterestIndicator {
     /// Wall-clock time of the last developing-bucket re-poll, so the freshest
     /// OI candle tracks venue revisions instead of freezing between buckets.
     last_refresh_request: Option<UnixMs>,
+}
+
+struct SourceCursor<'a> {
+    source: TickerInfo,
+    current: Option<(UnixMs, f64)>,
+    upcoming: Peekable<btree_map::Range<'a, UnixMs, f64>>,
+}
+
+impl<'a> SourceCursor<'a> {
+    fn new(source: TickerInfo, series: &'a BTreeMap<UnixMs, f64>, from: UnixMs) -> Self {
+        Self {
+            source,
+            current: series
+                .range(..from)
+                .next_back()
+                .map(|(time, value)| (*time, *value)),
+            upcoming: series.range(from..).peekable(),
+        }
+    }
+
+    fn next_time(&mut self) -> Option<UnixMs> {
+        self.upcoming.peek().map(|(time, _)| **time)
+    }
+
+    fn advance_through(&mut self, time: UnixMs) {
+        while self.next_time().is_some_and(|next| next <= time) {
+            let (sample_time, value) = self
+                .upcoming
+                .next()
+                .expect("peeked OI observation remains available");
+            self.current = Some((*sample_time, *value));
+        }
+    }
 }
 
 impl OpenInterestIndicator {
@@ -264,14 +298,6 @@ impl OpenInterestIndicator {
 
         let rebuild_from =
             changed_at.map(|time| UnixMs::new(time.as_u64() / interval_ms * interval_ms));
-        let mut times = BTreeSet::new();
-        for (_, series) in &qualified {
-            if let Some(from) = rebuild_from {
-                times.extend(series.range(from..).map(|(time, _)| *time));
-            } else {
-                times.extend(series.keys().copied());
-            }
-        }
         let mut rebuilt = if let Some(from) = rebuild_from {
             let _discarded_tail = self.data.split_off(&from);
             std::mem::take(&mut self.data)
@@ -282,19 +308,27 @@ impl OpenInterestIndicator {
         let recent_snapshot_cutoff = UnixMs::now()
             .as_u64()
             .saturating_sub(10 * Self::DEVELOPING_REFRESH_MS);
+        let cursor_start = rebuild_from.unwrap_or(UnixMs::ZERO);
+        let mut cursors = qualified
+            .into_iter()
+            .map(|(source, series)| SourceCursor::new(source, series, cursor_start))
+            .collect::<Vec<_>>();
 
-        for time in times {
+        while let Some(time) = cursors.iter_mut().filter_map(SourceCursor::next_time).min() {
+            cursors
+                .iter_mut()
+                .for_each(|cursor| cursor.advance_through(time));
             let mut close = 0.0;
             let mut source_count = 0usize;
-            for (source, series) in &qualified {
+            for cursor in &cursors {
                 // Use only a real observation at or before `time`. Never
                 // carry a source backward before its first observation.
-                let Some((sample_time, value)) = series.range(..=time).next_back() else {
+                let Some((sample_time, value)) = cursor.current else {
                     continue;
                 };
                 let staleness = time.as_u64().saturating_sub(sample_time.as_u64());
                 let source_interval =
-                    Self::native_history_timeframe_for(source.exchange(), chart_timeframe)
+                    Self::native_history_timeframe_for(cursor.source.exchange(), chart_timeframe)
                         .unwrap_or(Timeframe::M1);
                 // Venue history is interval data and can be held through its
                 // native bucket. Near the live edge, however, all venues are
@@ -309,7 +343,7 @@ impl OpenInterestIndicator {
                     continue;
                 }
                 source_count += 1;
-                close += *value;
+                close += value;
             }
             if source_count != self.sources.len() {
                 continue;

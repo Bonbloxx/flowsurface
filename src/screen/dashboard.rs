@@ -1197,12 +1197,16 @@ impl Dashboard {
                     }
                 }
             }
-            FetchedData::OI { data, req_id } => {
+            FetchedData::OI {
+                data,
+                req_id,
+                terminal,
+            } => {
                 if let Some(pane_state) = self.get_mut_pane_state_by_uuid(main_window, pane_id) {
                     pane_state.status = pane::Status::Ready;
 
                     if let StreamKind::Kline { ticker_info, .. } = stream_type {
-                        pane_state.insert_hist_oi(ticker_info, req_id, &data);
+                        pane_state.insert_hist_oi(ticker_info, req_id, &data, terminal);
                     }
                 }
             }

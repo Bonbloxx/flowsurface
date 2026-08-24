@@ -232,15 +232,9 @@ impl TimeSeries<KlineDataPoint> {
         timeseries
     }
 
-    pub fn with_trades(&self, trades: &[Trade]) -> TimeSeries<KlineDataPoint> {
-        let mut new_series = Self {
-            datapoints: self.datapoints.clone(),
-            interval: self.interval,
-            tick_size: self.tick_size,
-        };
-
-        new_series.insert_trades_or_create_bucket(trades);
-        new_series
+    pub fn with_trades(mut self, trades: &[Trade]) -> TimeSeries<KlineDataPoint> {
+        self.insert_trades_or_create_bucket(trades);
+        self
     }
 
     pub fn insert_klines(&mut self, klines: &[Kline]) {
@@ -263,14 +257,11 @@ impl TimeSeries<KlineDataPoint> {
         if buffer.is_empty() {
             return;
         }
-        let mut updated_times = Vec::new();
+        let mut updated_times = FxHashSet::default();
 
         buffer.iter().for_each(|trade| {
             let rounded_time = trade.time.floor_to(self.interval);
-
-            if !updated_times.contains(&rounded_time) {
-                updated_times.push(rounded_time);
-            }
+            updated_times.insert(rounded_time);
 
             let entry = self
                 .datapoints
@@ -301,15 +292,13 @@ impl TimeSeries<KlineDataPoint> {
         if buffer.is_empty() {
             return;
         }
-        let mut updated_times: Vec<UnixMs> = Vec::new();
+        let mut updated_times = FxHashSet::default();
 
         for trade in buffer {
             let rounded_time = trade.time.floor_to(self.interval);
 
             if let Some(entry) = self.datapoints.get_mut(&rounded_time) {
-                if !updated_times.contains(&rounded_time) {
-                    updated_times.push(rounded_time);
-                }
+                updated_times.insert(rounded_time);
                 entry.add_trade(trade, self.tick_size);
             }
         }
@@ -664,6 +653,8 @@ impl From<&TimeSeries<KlineDataPoint>> for BTreeMap<UnixMs, exchange::Volume> {
 mod tests {
     use super::*;
 
+    const CONSTRUCTION_BENCH_BUCKETS: usize = 100_000;
+    const INGEST_BENCH_BUCKETS: usize = 10_000;
     const NPOC_BENCH_POINTS: usize = 20_000;
 
     fn empty_kline(time: u64) -> Kline {
@@ -709,6 +700,121 @@ mod tests {
         let mut series = TimeSeries::<KlineDataPoint>::new(interval, step, &klines);
         series.insert_trades_existing_buckets(&trades);
         series
+    }
+
+    #[test]
+    #[ignore = "manual historical trade-ingestion benchmark"]
+    fn benchmark_historical_trade_bucket_ingestion() {
+        let interval = Timeframe::M1;
+        let interval_ms = interval.to_milliseconds();
+        let step = PriceStep {
+            units: Price::from_f64(0.1).units,
+        };
+        let klines = (0..INGEST_BENCH_BUCKETS)
+            .map(|index| {
+                let price = Price::from_f64(10_000.0 + (index % 500) as f64 * 0.1);
+                Kline {
+                    time: UnixMs::new(index as u64 * interval_ms),
+                    open: price,
+                    high: price,
+                    low: price,
+                    close: price,
+                    volume: Volume::empty_buy_sell(),
+                }
+            })
+            .collect::<Vec<_>>();
+        let trades = klines
+            .iter()
+            .map(|kline| Trade {
+                time: kline.time,
+                price: kline.close,
+                qty: Qty::from_f64(1.0),
+                is_sell: false,
+            })
+            .collect::<Vec<_>>();
+
+        let mut samples = Vec::new();
+        let mut populated = 0;
+        for _ in 0..5 {
+            let mut series = TimeSeries::<KlineDataPoint>::new(interval, step, &klines);
+            let started = std::time::Instant::now();
+            series.insert_trades_existing_buckets(&trades);
+            samples.push(started.elapsed());
+            populated = series
+                .datapoints
+                .values()
+                .filter(|point| !point.footprint.trades.is_empty())
+                .count();
+            std::hint::black_box(series);
+        }
+        assert_eq!(populated, INGEST_BENCH_BUCKETS, "trade buckets changed");
+        samples.sort_unstable();
+        let median = samples[samples.len() / 2];
+        println!(
+            "historical trade ingestion: trades={} buckets={} median_ms={:.3}",
+            trades.len(),
+            populated,
+            median.as_secs_f64() * 1_000.0,
+        );
+    }
+
+    #[test]
+    #[ignore = "manual large time-series construction benchmark"]
+    fn benchmark_large_series_with_trades_construction() {
+        let interval = Timeframe::M1;
+        let interval_ms = interval.to_milliseconds();
+        let step = PriceStep {
+            units: Price::from_f64(0.1).units,
+        };
+        let klines = (0..CONSTRUCTION_BENCH_BUCKETS)
+            .map(|index| {
+                let price = Price::from_f64(10_000.0 + (index % 500) as f64 * 0.1);
+                Kline {
+                    time: UnixMs::new(index as u64 * interval_ms),
+                    open: price,
+                    high: price,
+                    low: price,
+                    close: price,
+                    volume: Volume::empty_buy_sell(),
+                }
+            })
+            .collect::<Vec<_>>();
+        let trades = klines
+            .iter()
+            .step_by(4)
+            .map(|kline| Trade {
+                time: kline.time,
+                price: kline.close,
+                qty: Qty::from_f64(1.0),
+                is_sell: false,
+            })
+            .collect::<Vec<_>>();
+        let bases = (0..5)
+            .map(|_| TimeSeries::<KlineDataPoint>::new(interval, step, &klines))
+            .collect::<Vec<_>>();
+
+        let mut samples = Vec::new();
+        let mut populated = 0;
+        for base in bases {
+            let started = std::time::Instant::now();
+            let series = base.with_trades(&trades);
+            samples.push(started.elapsed());
+            populated = series
+                .datapoints
+                .values()
+                .filter(|point| !point.footprint.trades.is_empty())
+                .count();
+            std::hint::black_box(series);
+        }
+        assert_eq!(populated, trades.len(), "trade buckets changed");
+        samples.sort_unstable();
+        let median = samples[samples.len() / 2];
+        println!(
+            "large series with trades: klines={} trades={} median_ms={:.3}",
+            klines.len(),
+            trades.len(),
+            median.as_secs_f64() * 1_000.0,
+        );
     }
 
     #[test]

@@ -1300,9 +1300,14 @@ impl KlineIndicatorImpl for FootprintHistoryIndicator {
     }
 
     fn prepare_footprint_history(&mut self, source: TickerInfo, cutoff: UnixMs) {
-        // A live print may already have established the seam before the first
-        // history-planner tick. Never move that boundary forward.
-        self.history_cutoffs.entry(source.ticker).or_insert(cutoff);
+        // The first planner pass can run before the trade WebSocket connects,
+        // making this a provisional boundary. Once the first live execution
+        // is known, the planner advances `cutoff` to immediately before it so
+        // history can fill the startup seam without overlapping live data.
+        self.history_cutoffs
+            .entry(source.ticker)
+            .and_modify(|current| *current = (*current).max(cutoff))
+            .or_insert(cutoff);
     }
 
     fn load_cached_footprint_day(
@@ -2410,6 +2415,40 @@ mod tests {
             actual.display_day_at(day).stats,
             expected.display_day_at(day).stats
         );
+    }
+
+    #[test]
+    fn delayed_live_start_advances_the_history_seam() {
+        let source = TickerInfo::new(
+            Ticker::new("BTCUSDT", Exchange::BinanceLinear),
+            0.1,
+            0.001,
+            None,
+        );
+        let day = day_start(UnixMs::now());
+        let provisional_cutoff = UnixMs::new(day + 10_000);
+        let first_live = UnixMs::new(day + 2 * ONE_MIN_MS + 10_000);
+        let mut indicator = FootprintHistoryIndicator::new();
+        indicator.configure_footprint_history(&[source], true);
+        indicator.prepare_footprint_history(source, provisional_cutoff);
+        indicator.on_source_trades(
+            source,
+            &[trade(first_live.as_u64(), 10.0, 20.0, false)],
+            false,
+        );
+
+        indicator.prepare_footprint_history(source, first_live.saturating_sub(1));
+        let req_id = uuid::Uuid::new_v4();
+        indicator.stage_source_trades(
+            req_id,
+            source,
+            &[trade(day + ONE_MIN_MS + 10_000, 10.0, 10.0, false)],
+        );
+        indicator.commit_staged_source_trades(req_id);
+
+        let stats = indicator.display_day_at(day).stats;
+        assert_eq!(stats.volume(), 300.0);
+        assert_eq!(stats.delta(), 300.0);
     }
 
     #[test]

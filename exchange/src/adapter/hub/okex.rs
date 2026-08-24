@@ -199,38 +199,36 @@ impl Worker {
 
 impl super::FetchCommandHandler<Vec<MarketKind>> for Worker {
     fn fetch_ticker_metadata(
-        &mut self,
+        &self,
         market_scope: Vec<MarketKind>,
     ) -> futures::future::BoxFuture<'_, Result<super::TickerMetadataMap, AdapterError>> {
-        Box::pin(async move { fetch::fetch_ticker_metadata(&mut self.hub, &market_scope).await })
+        Box::pin(async move { fetch::fetch_ticker_metadata(&self.hub, &market_scope).await })
     }
 
     fn fetch_ticker_stats(
-        &mut self,
+        &self,
         market_scope: Vec<MarketKind>,
     ) -> futures::future::BoxFuture<'_, Result<super::TickerStatsMap, AdapterError>> {
-        Box::pin(async move { fetch::fetch_ticker_stats(&mut self.hub, &market_scope).await })
+        Box::pin(async move { fetch::fetch_ticker_stats(&self.hub, &market_scope).await })
     }
 
     fn fetch_klines(
-        &mut self,
+        &self,
         ticker_info: TickerInfo,
         timeframe: Timeframe,
         range: Option<(UnixMs, UnixMs)>,
     ) -> futures::future::BoxFuture<'_, Result<Vec<Kline>, AdapterError>> {
-        Box::pin(
-            async move { fetch::fetch_klines(&mut self.hub, ticker_info, timeframe, range).await },
-        )
+        Box::pin(async move { fetch::fetch_klines(&self.hub, ticker_info, timeframe, range).await })
     }
 
     fn fetch_open_interest(
-        &mut self,
+        &self,
         ticker_info: TickerInfo,
         timeframe: Timeframe,
         range: Option<(UnixMs, UnixMs)>,
     ) -> futures::future::BoxFuture<'_, Result<Vec<OpenInterest>, AdapterError>> {
         Box::pin(async move {
-            fetch::fetch_historical_oi(&mut self.hub, ticker_info, range, timeframe).await
+            fetch::fetch_historical_oi(&self.hub, ticker_info, range, timeframe).await
         })
     }
 }

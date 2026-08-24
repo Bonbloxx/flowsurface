@@ -67,11 +67,25 @@ fn available_markets(venue: Venue) -> &'static [MarketKind] {
     }
 }
 
+fn prioritized_metadata_markets(venue: Venue) -> Vec<MarketKind> {
+    let mut markets = available_markets(venue).to_vec();
+    markets.sort_by_key(|market| match market {
+        // Saved workspaces overwhelmingly use perpetuals. Deliver their
+        // authoritative metadata first so pane restoration does not wait for
+        // unrelated spot/inverse catalogs from the same serialized worker.
+        MarketKind::LinearPerps => 0,
+        MarketKind::Spot => 1,
+        MarketKind::InversePerps => 2,
+    });
+    markets
+}
+
 pub enum Action {
     TickerSelected(TickerInfo, Option<ContentKind>),
     ErrorOccurred(data::InternalError),
     Fetch(Task<Message>),
     FocusWidget(iced::widget::Id),
+    FocusWidgetAndFetch(iced::widget::Id, Task<Message>),
 }
 
 #[derive(Debug, Clone)]
@@ -86,13 +100,14 @@ pub enum Message {
     ToggleMarketFilter(MarketKind),
     ToggleExchangeFilter(Venue),
     DebounceExchangeFetchTick,
+    MetadataPriorityYield,
     ToggleTable,
     ToggleFavorites,
     FetchStats,
-    UpdateMetadata(Venue, HashMap<Ticker, Option<TickerInfo>>),
+    UpdateMetadata(Venue, MarketKind, HashMap<Ticker, Option<TickerInfo>>, bool),
     UpdateStats(Venue, HashMap<Ticker, TickerStats>),
     RetryMetadataFetch(Venue),
-    MetadataFetchFailed(Venue, data::InternalError),
+    MetadataFetchFailed(Venue, MarketKind, bool, data::InternalError),
     StatsFetchFailed(Venue, data::InternalError),
 }
 
@@ -234,6 +249,7 @@ impl TickersTable {
                     return Some(Action::Fetch(task));
                 }
             }
+            Message::MetadataPriorityYield => {}
             Message::ToggleFavorites => {
                 self.show_favorites = !self.show_favorites;
             }
@@ -266,7 +282,11 @@ impl TickersTable {
                         );
                     }
 
-                    return Some(Action::FocusWidget("full_ticker_search_box".into()));
+                    let search_box = iced::widget::Id::from("full_ticker_search_box");
+                    if let Some(task) = self.selected_stats_fetch_task() {
+                        return Some(Action::FocusWidgetAndFetch(search_box, task));
+                    }
+                    return Some(Action::FocusWidget(search_box));
                 }
             }
             Message::FetchStats => {
@@ -299,26 +319,42 @@ impl TickersTable {
 
                 return Some(Action::ErrorOccurred(err));
             }
-            Message::UpdateMetadata(venue, info) => {
-                self.metadata_fetch_state.complete_venue(venue);
-                self.metadata_fetch_state.mark_fetched(venue);
+            Message::UpdateMetadata(venue, market, info, terminal) => {
+                let venue_complete =
+                    terminal && self.metadata_fetch_state.complete_market(venue, market);
                 self.unavailable_exchanges.remove(&venue);
 
                 for (ticker, ticker_info) in info.into_iter() {
                     self.tickers_info.insert(ticker, ticker_info);
                 }
 
-                if self.selected_exchanges.contains(&venue) {
+                if venue_complete {
+                    self.metadata_fetch_state.mark_fetched(venue);
+                }
+
+                if venue_complete && self.is_shown && self.selected_exchanges.contains(&venue) {
                     let venues = std::iter::once(venue).collect::<FxHashSet<_>>();
                     if let Some(task) = self.build_stats_fetch_task(venues) {
                         return Some(Action::Fetch(task));
                     }
                 }
             }
-            Message::MetadataFetchFailed(venue, err) => {
-                self.metadata_fetch_state.complete_venue(venue);
-                self.unavailable_exchanges.insert(venue);
-                self.stats_fetch_state.on_exchange_disabled(venue);
+            Message::MetadataFetchFailed(venue, market, terminal, err) => {
+                let venue_complete =
+                    terminal && self.metadata_fetch_state.complete_market(venue, market);
+                if venue_complete {
+                    let has_metadata = self
+                        .tickers_info
+                        .keys()
+                        .any(|ticker| ticker.exchange.venue() == venue);
+                    if has_metadata {
+                        self.metadata_fetch_state.mark_fetched(venue);
+                        self.unavailable_exchanges.remove(&venue);
+                    } else {
+                        self.unavailable_exchanges.insert(venue);
+                        self.stats_fetch_state.on_exchange_disabled(venue);
+                    }
+                }
                 return Some(Action::ErrorOccurred(err));
             }
         }
@@ -1588,21 +1624,27 @@ enum DebounceState {
 #[derive(Debug, Default)]
 struct MetadataFetchState {
     in_flight_venues: FxHashSet<Venue>,
+    pending_markets: FxHashMap<Venue, FxHashSet<MarketKind>>,
     fetched_venues: FxHashSet<Venue>,
     loading_phase: u8,
 }
 
 impl MetadataFetchState {
     fn with_pending(venues: impl IntoIterator<Item = Venue>) -> Self {
-        Self {
-            in_flight_venues: venues.into_iter().collect(),
-            fetched_venues: FxHashSet::default(),
-            loading_phase: 0,
+        let mut state = Self::default();
+        for venue in venues {
+            state.begin_venue(venue);
         }
+        state
     }
 
     fn begin_venue(&mut self, venue: Venue) -> bool {
-        self.in_flight_venues.insert(venue)
+        if !self.in_flight_venues.insert(venue) {
+            return false;
+        }
+        self.pending_markets
+            .insert(venue, available_markets(venue).iter().copied().collect());
+        true
     }
 
     fn mark_fetched(&mut self, venue: Venue) {
@@ -1613,11 +1655,21 @@ impl MetadataFetchState {
         self.fetched_venues.contains(&venue)
     }
 
-    fn complete_venue(&mut self, venue: Venue) {
+    fn complete_market(&mut self, venue: Venue, market: MarketKind) -> bool {
+        let Some(pending) = self.pending_markets.get_mut(&venue) else {
+            return false;
+        };
+        pending.remove(&market);
+        if !pending.is_empty() {
+            return false;
+        }
+
+        self.pending_markets.remove(&venue);
         self.in_flight_venues.remove(&venue);
         if self.in_flight_venues.is_empty() {
             self.loading_phase = 0;
         }
+        true
     }
 
     fn is_in_flight(&self, venue: Venue) -> bool {
@@ -1685,17 +1737,69 @@ fn fetch_ticker_stats_task(
 }
 
 fn fetch_metadata_task(handles: &AdapterHandles, venue: Venue) -> Task<Message> {
-    let markets_to_fetch = available_markets(venue);
+    let mut markets = prioritized_metadata_markets(venue).into_iter();
+    let Some(priority_market) = markets.next() else {
+        return Task::none();
+    };
+    let priority_is_partial =
+        venue == Venue::Hyperliquid && priority_market == MarketKind::LinearPerps;
+    let priority =
+        fetch_metadata_market_task(handles, venue, priority_market, true, !priority_is_partial);
+    let mut remainder_tasks = Vec::new();
+    if priority_is_partial {
+        remainder_tasks.push(fetch_metadata_market_task(
+            handles,
+            venue,
+            priority_market,
+            false,
+            true,
+        ));
+    }
+    remainder_tasks.extend(
+        markets.map(|market| fetch_metadata_market_task(handles, venue, market, false, true)),
+    );
+    let remainder = Task::batch(remainder_tasks);
+    let let_saved_panes_enqueue = Task::perform(
+        async { tokio::time::sleep(Duration::from_millis(200)).await },
+        |_| Message::MetadataPriorityYield,
+    );
+
+    priority.chain(let_saved_panes_enqueue).chain(remainder)
+}
+
+fn fetch_metadata_market_task(
+    handles: &AdapterHandles,
+    venue: Venue,
+    market: MarketKind,
+    priority: bool,
+    terminal: bool,
+) -> Task<Message> {
     let handles = handles.clone();
-    let fetch = async move { handles.fetch_ticker_metadata(venue, markets_to_fetch).await };
+    let started_at = Instant::now();
+    let fetch = async move {
+        if priority {
+            handles.fetch_priority_ticker_metadata(venue, market).await
+        } else {
+            handles.fetch_ticker_metadata(venue, &[market]).await
+        }
+    };
 
     Task::perform(fetch, move |result| match result {
-        Ok(ticker_info) => Message::UpdateMetadata(venue, ticker_info),
+        Ok(ticker_info) => {
+            log::debug!(
+                "metadata_load venue={venue:?} market={market:?} elapsed_ms={} tickers={}",
+                started_at.elapsed().as_millis(),
+                ticker_info.len()
+            );
+            Message::UpdateMetadata(venue, market, ticker_info, terminal)
+        }
         Err(err) => {
-            log::error!("Ticker metadata fetch failed for {venue:?}: {err}");
+            log::error!("Ticker metadata fetch failed for {venue:?} {market:?}: {err}");
             Message::MetadataFetchFailed(
                 venue,
-                InternalError::Fetch(format!("{venue:?}: {}", err.ui_message())),
+                market,
+                terminal,
+                InternalError::Fetch(format!("{venue:?} {market:?}: {}", err.ui_message())),
             )
         }
     })
@@ -1825,5 +1929,38 @@ impl StatsFetchState {
             1 => "..",
             _ => "...",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn saved_perpetual_metadata_is_requested_first() {
+        assert_eq!(
+            prioritized_metadata_markets(Venue::Binance),
+            vec![
+                MarketKind::LinearPerps,
+                MarketKind::Spot,
+                MarketKind::InversePerps,
+            ]
+        );
+        assert_eq!(
+            prioritized_metadata_markets(Venue::Mexc),
+            vec![MarketKind::LinearPerps, MarketKind::InversePerps]
+        );
+    }
+
+    #[test]
+    fn metadata_venue_stays_loading_until_every_market_finishes() {
+        let mut state = MetadataFetchState::with_pending([Venue::Binance]);
+
+        assert!(state.is_in_flight(Venue::Binance));
+        assert!(!state.complete_market(Venue::Binance, MarketKind::LinearPerps));
+        assert!(!state.complete_market(Venue::Binance, MarketKind::Spot));
+        assert!(state.complete_market(Venue::Binance, MarketKind::InversePerps));
+        assert!(!state.is_in_flight(Venue::Binance));
+        assert!(!state.has_any_in_flight());
     }
 }

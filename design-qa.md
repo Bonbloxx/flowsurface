@@ -47,4 +47,28 @@
 
 - No blocking polish remains. A future optional enhancement could add the reference platform's profile statistics table without changing the TPO calculation model.
 
+## Structural Composite Update
+
+**Evidence**
+
+- Source visual truth: `C:/Users/verne/AppData/Local/Temp/codex-clipboard-824ca44e-3f63-4493-9548-5302413e13a0.png` (1595 x 863).
+- User correction: `C:/Users/verne/AppData/Local/Temp/codex-clipboard-abdbc7d9-9bf3-412e-b5c3-ea27df5e9cc0.png` (1257 x 527).
+- Before capture: `target/design-qa/structural-composite-before-native.png`.
+- Final native capture: `target/design-qa/structural-composite-final-native.png` (2576 x 1408).
+- Combined comparisons: `target/design-qa/comparison-structural-composite-final.png` and `target/design-qa/focus-structural-composite-final.png`.
+- State: BTCUSDT perpetual aggregate TPO, daily profiles, 30-minute brackets, 1000 ticks per row, structural three-profile composite enabled.
+
+**Findings**
+
+- No actionable P0, P1, or P2 findings remain.
+- The structural composite now renders only as a faint theme-derived background band between composite VAH and VAL.
+- The band is painted behind normal profile glyphs and does not dim member profiles, suppress single prints, or add CVAH/CVAL/CPOC rails and labels.
+- The band begins at the oldest member profile in the active composite, clips at the visible left edge only when that profile is offscreen, and projects to the visible right edge.
+
+**Comparison History**
+
+1. The previous renderer dimmed composite members and added three structural rails and labels. It was replaced by one low-alpha VAH-to-VAL background band behind otherwise unchanged TPO profiles.
+2. The first background-band implementation began at the chart's visible-left boundary, spilling into unrelated empty history. The final implementation derives its left edge from the oldest composite member profile and preserves rightward projection.
+3. The final combined comparison confirms the requested faint background treatment, the corrected left anchor, unchanged palette use, and no overlapping composite annotation ink.
+
 final result: passed

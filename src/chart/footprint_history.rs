@@ -141,15 +141,19 @@ impl FootprintHistory {
         source: TickerInfo,
         values: &[OpenInterest],
         req_id: Option<uuid::Uuid>,
+        terminal: bool,
     ) -> bool {
-        let Some(req_id) = req_id.filter(|id| self.oi_requests.remove(id)) else {
+        let Some(req_id) = req_id.filter(|id| self.oi_requests.contains(id)) else {
             return false;
         };
         self.indicator.on_source_open_interest(source, values);
-        if values.is_empty() {
-            self.request_handler.mark_no_data(req_id);
-        } else {
-            self.request_handler.mark_completed(req_id);
+        if terminal {
+            self.oi_requests.remove(&req_id);
+            if values.is_empty() {
+                self.request_handler.mark_no_data(req_id);
+            } else {
+                self.request_handler.mark_completed(req_id);
+            }
         }
         true
     }

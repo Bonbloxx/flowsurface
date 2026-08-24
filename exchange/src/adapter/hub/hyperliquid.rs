@@ -78,7 +78,13 @@ impl HyperliquidConfig {
 
 pub type HyperliquidLimiter = crate::adapter::limiter::FixedWindowRateLimiter;
 
-type HyperliquidCommand = super::FetchCommand<MarketKind>;
+#[derive(Debug, Clone, Copy)]
+enum HyperliquidMarketScope {
+    All(MarketKind),
+    Primary(MarketKind),
+}
+
+type HyperliquidCommand = super::FetchCommand<HyperliquidMarketScope>;
 
 #[derive(Clone)]
 pub struct HyperliquidHandle {
@@ -106,7 +112,19 @@ impl HyperliquidHandle {
     ) -> Result<super::TickerMetadataMap, AdapterError> {
         self.request_port
             .request(move |reply| HyperliquidCommand::TickerMetadata {
-                market_scope: market,
+                market_scope: HyperliquidMarketScope::All(market),
+                reply,
+            })
+            .await
+    }
+
+    pub async fn fetch_primary_ticker_metadata(
+        &self,
+        market: MarketKind,
+    ) -> Result<super::TickerMetadataMap, AdapterError> {
+        self.request_port
+            .request(move |reply| HyperliquidCommand::TickerMetadata {
+                market_scope: HyperliquidMarketScope::Primary(market),
                 reply,
             })
             .await
@@ -118,7 +136,7 @@ impl HyperliquidHandle {
     ) -> Result<super::TickerStatsMap, AdapterError> {
         self.request_port
             .request(move |reply| HyperliquidCommand::TickerStats {
-                market_scope: market,
+                market_scope: HyperliquidMarketScope::All(market),
                 reply,
             })
             .await
@@ -207,47 +225,65 @@ impl Worker {
     }
 }
 
-impl super::FetchCommandHandler<MarketKind> for Worker {
+impl super::FetchCommandHandler<HyperliquidMarketScope> for Worker {
+    const MAX_IN_FLIGHT_REQUESTS: usize = 16;
+
     fn fetch_ticker_metadata(
-        &mut self,
-        market_scope: MarketKind,
+        &self,
+        market_scope: HyperliquidMarketScope,
     ) -> futures::future::BoxFuture<'_, Result<super::TickerMetadataMap, AdapterError>> {
-        Box::pin(async move { fetch::fetch_ticker_metadata(&mut self.hub, market_scope).await })
+        Box::pin(async move {
+            match market_scope {
+                HyperliquidMarketScope::All(market) => {
+                    fetch::fetch_ticker_metadata(&self.hub, market).await
+                }
+                HyperliquidMarketScope::Primary(market) => {
+                    fetch::fetch_primary_ticker_metadata(&self.hub, market).await
+                }
+            }
+        })
     }
 
     fn fetch_ticker_stats(
-        &mut self,
-        market_scope: MarketKind,
+        &self,
+        market_scope: HyperliquidMarketScope,
     ) -> futures::future::BoxFuture<'_, Result<super::TickerStatsMap, AdapterError>> {
-        Box::pin(async move { fetch::fetch_ticker_stats(&mut self.hub, market_scope).await })
+        Box::pin(async move {
+            match market_scope {
+                HyperliquidMarketScope::All(market) => {
+                    fetch::fetch_ticker_stats(&self.hub, market).await
+                }
+                HyperliquidMarketScope::Primary(_) => Err(AdapterError::InvalidRequest(
+                    "Primary-only Hyperliquid metadata cannot fetch ticker stats".to_string(),
+                )),
+            }
+        })
     }
 
     fn fetch_klines(
-        &mut self,
+        &self,
         ticker_info: TickerInfo,
         timeframe: Timeframe,
         range: Option<(UnixMs, UnixMs)>,
     ) -> futures::future::BoxFuture<'_, Result<Vec<Kline>, AdapterError>> {
-        Box::pin(
-            async move { fetch::fetch_klines(&mut self.hub, ticker_info, timeframe, range).await },
-        )
+        Box::pin(async move { fetch::fetch_klines(&self.hub, ticker_info, timeframe, range).await })
     }
 
     fn fetch_open_interest(
-        &mut self,
+        &self,
         ticker_info: TickerInfo,
         timeframe: Timeframe,
         range: Option<(UnixMs, UnixMs)>,
     ) -> futures::future::BoxFuture<'_, Result<Vec<OpenInterest>, AdapterError>> {
         Box::pin(async move {
-            fetch::fetch_open_interest(&mut self.hub, ticker_info, timeframe, range).await
+            fetch::fetch_open_interest(&self.hub, ticker_info, timeframe, range).await
         })
     }
 
     fn fetch_depth_snapshot(
-        &mut self,
+        &self,
         ticker: crate::Ticker,
     ) -> futures::future::BoxFuture<'_, Result<DepthPayload, AdapterError>> {
-        Box::pin(async move { fetch::fetch_depth_snapshot(&mut self.hub, ticker).await })
+        Box::pin(async move { fetch::fetch_depth_snapshot(&self.hub, ticker).await })
     }
 }

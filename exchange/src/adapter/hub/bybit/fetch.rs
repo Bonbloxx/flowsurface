@@ -57,7 +57,7 @@ fn parse_kline_field<T: std::str::FromStr>(field: Option<&str>) -> Result<T, Ada
 }
 
 pub(super) async fn fetch_ticker_metadata(
-    hub: &mut HttpHub<BybitLimiter>,
+    hub: &HttpHub<BybitLimiter>,
     market_type: MarketKind,
 ) -> Result<TickerMetadataMap, AdapterError> {
     let exchange = exchange_from_market_type(market_type);
@@ -128,7 +128,7 @@ pub(super) async fn fetch_ticker_metadata(
 }
 
 pub(super) async fn fetch_ticker_stats(
-    hub: &mut HttpHub<BybitLimiter>,
+    hub: &HttpHub<BybitLimiter>,
     market_type: MarketKind,
 ) -> Result<super::super::TickerStatsMap, AdapterError> {
     let exchange = exchange_from_market_type(market_type);
@@ -185,7 +185,7 @@ pub(super) async fn fetch_ticker_stats(
 }
 
 pub(super) async fn fetch_klines(
-    hub: &mut HttpHub<BybitLimiter>,
+    hub: &HttpHub<BybitLimiter>,
     ticker_info: TickerInfo,
     timeframe: Timeframe,
     range: Option<(UnixMs, UnixMs)>,
@@ -218,7 +218,7 @@ pub(super) async fn fetch_klines(
         let start = start.as_u64();
         let end = end.as_u64();
         let interval_ms = timeframe.to_milliseconds();
-        let num_intervals = ((end - start) / interval_ms).min(1000);
+        let num_intervals = ((end - start) / interval_ms).saturating_add(1).min(1000);
 
         url.push_str(&format!("&start={start}&end={end}&limit={num_intervals}"));
     }
@@ -275,7 +275,7 @@ fn oi_range_reaches_live_edge(
 }
 
 async fn fetch_mark_price_closes(
-    hub: &mut HttpHub<BybitLimiter>,
+    hub: &HttpHub<BybitLimiter>,
     ticker_info: TickerInfo,
     period: Timeframe,
     range: Option<(UnixMs, UnixMs)>,
@@ -324,7 +324,7 @@ async fn fetch_mark_price_closes(
 }
 
 async fn fetch_current_oi(
-    hub: &mut HttpHub<BybitLimiter>,
+    hub: &HttpHub<BybitLimiter>,
     ticker_info: TickerInfo,
 ) -> Result<OpenInterest, AdapterError> {
     let (ticker_str, market) = ticker_info.ticker.to_full_symbol_and_type();
@@ -388,7 +388,7 @@ fn current_oi_usd_value(item: &Value, market: MarketKind) -> Option<f64> {
 }
 
 pub(super) async fn fetch_historical_oi(
-    hub: &mut HttpHub<BybitLimiter>,
+    hub: &HttpHub<BybitLimiter>,
     ticker_info: TickerInfo,
     range: Option<(UnixMs, UnixMs)>,
     period: Timeframe,
@@ -531,7 +531,7 @@ pub(super) async fn fetch_historical_oi(
 const MAX_ARCHIVE_TRADES_PER_FETCH: usize = 2_000_000;
 
 async fn fetch_recent_trades(
-    hub: &mut HttpHub<BybitLimiter>,
+    hub: &HttpHub<BybitLimiter>,
     ticker_info: TickerInfo,
     from_time: UnixMs,
     to_time: Option<UnixMs>,
@@ -698,7 +698,7 @@ async fn fetch_archive_trades(
 }
 
 pub(super) async fn fetch_trades(
-    hub: &mut HttpHub<BybitLimiter>,
+    hub: &HttpHub<BybitLimiter>,
     ticker_info: TickerInfo,
     from_time: UnixMs,
     to_time: Option<UnixMs>,

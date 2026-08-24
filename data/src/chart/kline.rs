@@ -7,6 +7,7 @@ use exchange::{
 
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 
 /// Smallest on-screen height of one TPO price row when zoomed fully out.
 const TPO_MIN_ROW_HEIGHT_PX: f32 = 1.5;
@@ -233,14 +234,7 @@ impl KlineTrades {
     /// raw map: live/history inserts can land on a finer grid than the
     /// selected tick multiplier, and those rows paint on top of each other.
     pub fn grouped_to_step(&self, step: PriceStep) -> Self {
-        if step.units <= 1 || self.trades.is_empty() {
-            return self.clone();
-        }
-        if self
-            .trades
-            .keys()
-            .all(|price| price.units.rem_euclid(step.units) == 0)
-        {
+        if self.is_grouped_to_step(step) {
             return self.clone();
         }
 
@@ -258,6 +252,26 @@ impl KlineTrades {
             dst.status = src.status;
         }
         grouped
+    }
+
+    /// Render-oriented grouping view. Tick-based footprints and multiplier-1
+    /// time footprints are already stored on their display grid, so borrow
+    /// those maps instead of cloning every visible price level on pan/zoom.
+    pub fn grouped_to_step_cow(&self, step: PriceStep) -> Cow<'_, Self> {
+        if self.is_grouped_to_step(step) {
+            Cow::Borrowed(self)
+        } else {
+            Cow::Owned(self.grouped_to_step(step))
+        }
+    }
+
+    fn is_grouped_to_step(&self, step: PriceStep) -> bool {
+        step.units <= 1
+            || self.trades.is_empty()
+            || self
+                .trades
+                .keys()
+                .all(|price| price.units.rem_euclid(step.units) == 0)
     }
 
     /// Max of some extracted qty across price levels within [`lowest`, `highest`].
@@ -305,7 +319,7 @@ impl KlineTrades {
         lowest: Price,
         group_step: PriceStep,
     ) -> Qty {
-        if group_step.units <= 1 {
+        if self.is_grouped_to_step(group_step) {
             return self.max_qty_by(highest, lowest, |group| group.max_cluster_qty(cluster_kind));
         }
 
@@ -465,7 +479,7 @@ impl KlineChartKind {
         match self {
             // Footprint must stay readable when many bars are on screen;
             // labels/candles clamp to minimum screen sizes instead.
-            KlineChartKind::Footprint { .. } => 0.25,
+            KlineChartKind::Footprint { .. } => 0.1,
             KlineChartKind::Tpo { .. } => 0.4,
             KlineChartKind::Candles | KlineChartKind::Renko { .. } => 0.6,
         }
@@ -475,14 +489,14 @@ impl KlineChartKind {
         match self {
             // TPO needs deeper overall zoom so letter cells can reach readable px.
             KlineChartKind::Tpo { .. } => 2.5,
-            KlineChartKind::Footprint { .. } => 1.2,
+            KlineChartKind::Footprint { .. } => 16.0,
             KlineChartKind::Candles | KlineChartKind::Renko { .. } => 2.5,
         }
     }
 
     pub fn max_cell_width(&self) -> f32 {
         match self {
-            KlineChartKind::Footprint { .. } => 360.0,
+            KlineChartKind::Footprint { .. } => 1_440.0,
             // Allow a single day profile to fill most of the pane when zoomed in.
             KlineChartKind::Tpo { .. } => 520.0,
             KlineChartKind::Candles => 16.0,
@@ -494,7 +508,7 @@ impl KlineChartKind {
         match self {
             // Compact columns so a useful number of footprints fits on
             // screen; text hides itself below readable sizes instead.
-            KlineChartKind::Footprint { .. } => 44.0,
+            KlineChartKind::Footprint { .. } => 24.0,
             KlineChartKind::Tpo { .. } => 18.0,
             KlineChartKind::Candles => 1.0,
             KlineChartKind::Renko { .. } => 3.0,
@@ -503,7 +517,7 @@ impl KlineChartKind {
 
     pub fn max_cell_height(&self) -> f32 {
         match self {
-            KlineChartKind::Footprint { .. } => 90.0,
+            KlineChartKind::Footprint { .. } => 360.0,
             // Per-tick height; visual TPO row = cell_height * ticks_per_row.
             // Higher cap so Y zoom can produce readable letter rows.
             KlineChartKind::Tpo { .. } => 28.0,
@@ -513,7 +527,7 @@ impl KlineChartKind {
 
     pub fn min_cell_height(&self) -> f32 {
         match self {
-            KlineChartKind::Footprint { .. } => 6.0,
+            KlineChartKind::Footprint { .. } => 1.0,
             // Per-tick height; visual TPO row = cell_height * ticks_per_row.
             // Bound the *visual* row (~1.5 px at scale 1) instead of the raw
             // per-tick height, or large ticks-per-row values make further
@@ -527,7 +541,7 @@ impl KlineChartKind {
 
     pub fn default_cell_width(&self) -> f32 {
         match self {
-            KlineChartKind::Footprint { .. } => 64.0,
+            KlineChartKind::Footprint { clusters, .. } => clusters.min_footprint_width(),
             // Give each daily profile a wide time slot so neighboring Market
             // Profiles remain visually distinct, as on reference TPO charts.
             KlineChartKind::Tpo { config }
@@ -612,7 +626,9 @@ impl ClusterKind {
     pub fn min_footprint_width(self) -> f32 {
         match self {
             ClusterKind::VolumeProfile | ClusterKind::DeltaProfile => 80.0,
-            ClusterKind::BidAsk => 120.0,
+            // Reference Bid x Ask columns repeat every ~104 px: a 10 px
+            // candle lane followed by two touching ~44 px histogram halves.
+            ClusterKind::BidAsk => 104.0,
             ClusterKind::Table => 100.0,
         }
     }
@@ -852,6 +868,9 @@ mod footprint_rebin_tests {
         unit::{MinTicksize, Price, Qty},
     };
 
+    const GROUPED_RENDER_BENCH_BARS: usize = 240;
+    const GROUPED_RENDER_BENCH_LEVELS: usize = 400;
+
     fn trade(price: f64, qty: f64, is_sell: bool) -> Trade {
         Trade {
             time: UnixMs::new(1_000),
@@ -894,6 +913,25 @@ mod footprint_rebin_tests {
         let group = grouped.trades.values().next().expect("grouped level");
         assert_eq!(group.sell_qty.to_f64(), 4.0);
         assert_eq!(group.buy_qty.to_f64(), 2.0);
+    }
+
+    #[test]
+    fn render_grouping_borrows_aligned_rows_and_owns_regrouped_rows() {
+        let base: PriceStep = MinTicksize::new(-1).into();
+        let coarse = TickMultiplier(100).multiply_step(base);
+        let mut aligned = KlineTrades::new();
+        aligned.add_trade_to_nearest_bin(&trade(77_500.0, 1.0, false), coarse);
+        assert!(matches!(
+            aligned.grouped_to_step_cow(coarse),
+            Cow::Borrowed(_)
+        ));
+
+        let mut unaligned = KlineTrades::new();
+        unaligned.add_trade_to_nearest_bin(&trade(77_500.1, 1.0, false), base);
+        assert!(matches!(
+            unaligned.grouped_to_step_cow(coarse),
+            Cow::Owned(_)
+        ));
     }
 
     /// Storage sits on the feed's base tick; switching the display
@@ -960,6 +998,58 @@ mod footprint_rebin_tests {
         let group = footprint.trades.values().next().expect("price group");
         assert_eq!(group.first_time, UnixMs::new(1_000));
         assert_eq!(group.last_time, UnixMs::new(3_000));
+    }
+
+    #[test]
+    #[ignore = "manual grouped Footprint render-preparation benchmark"]
+    fn benchmark_already_grouped_footprint_render_preparation() {
+        let base: PriceStep = MinTicksize::new(-1).into();
+        let display_step = TickMultiplier(100).multiply_step(base);
+        let mut footprint = KlineTrades::new();
+        for level in 0..GROUPED_RENDER_BENCH_LEVELS {
+            footprint.add_trade_to_nearest_bin(
+                &trade(70_000.0 + level as f64 * 10.0, 1.0, level % 2 == 0),
+                display_step,
+            );
+        }
+        footprint.calculate_poc();
+        let footprints = vec![footprint; GROUPED_RENDER_BENCH_BARS];
+        let highest = Price::from_f64(100_000.0);
+        let lowest = Price::from_f64(0.0);
+
+        let mut samples = Vec::new();
+        let mut checksum = 0usize;
+        for _ in 0..7 {
+            let started = std::time::Instant::now();
+            checksum = footprints
+                .iter()
+                .map(|footprint| {
+                    let grouped = footprint.grouped_to_step_cow(display_step);
+                    let max = footprint.max_cluster_qty_grouped(
+                        ClusterKind::Table,
+                        highest,
+                        lowest,
+                        display_step,
+                    );
+                    std::hint::black_box((&grouped, max));
+                    grouped.trades.len()
+                })
+                .sum();
+            samples.push(started.elapsed());
+        }
+        assert_eq!(
+            checksum,
+            GROUPED_RENDER_BENCH_BARS * GROUPED_RENDER_BENCH_LEVELS,
+            "display rows changed"
+        );
+        samples.sort_unstable();
+        let median = samples[samples.len() / 2];
+        println!(
+            "grouped Footprint render prep: bars={} levels={} median_ms={:.3} checksum={checksum}",
+            GROUPED_RENDER_BENCH_BARS,
+            GROUPED_RENDER_BENCH_LEVELS,
+            median.as_secs_f64() * 1_000.0,
+        );
     }
 }
 

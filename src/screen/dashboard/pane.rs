@@ -1046,16 +1046,17 @@ impl State {
         source: TickerInfo,
         req_id: Option<uuid::Uuid>,
         oi: &[OpenInterest],
+        terminal: bool,
     ) {
         match &mut self.content {
             Content::Kline { chart, .. } => {
                 let Some(chart) = chart else {
                     panic!("Kline chart wasn't initialized when inserting open interest");
                 };
-                chart.insert_open_interest(source, req_id, oi);
+                chart.insert_open_interest(source, req_id, oi, terminal);
             }
             Content::FootprintHistory(Some(history)) => {
-                history.insert_open_interest(source, oi, req_id);
+                history.insert_open_interest(source, oi, req_id, terminal);
             }
             _ => {
                 log::error!("pane content not candlestick");
@@ -4825,5 +4826,25 @@ mod tests {
 
         state.content = Content::placeholder(ContentKind::CandlestickChart);
         assert_eq!(state.tick_subscription_interval_ms(), Some(100));
+    }
+
+    #[test]
+    #[ignore = "manual Previous Value Area history scheduling benchmark"]
+    fn benchmark_previous_value_area_backfill_cadence() {
+        let binance = ticker_info(Exchange::BinanceLinear, "BTCUSDT", 0.1);
+        let mut state = State::default();
+        state.set_content_and_streams(vec![binance], ContentKind::CandlestickChart);
+        state.update(Event::ToggleIndicator(
+            UiIndicator::Kline(KlineIndicator::PreviousValueArea),
+            vec![binance],
+        ));
+
+        let interval_ms = state
+            .tick_subscription_interval_ms()
+            .expect("PVA chart uses timed maintenance");
+        let scheduling_slots_per_minute = 60_000 / interval_ms;
+        println!(
+            "PVA backfill cadence: interval_ms={interval_ms} scheduling_slots_per_minute={scheduling_slots_per_minute}"
+        );
     }
 }

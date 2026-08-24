@@ -267,21 +267,21 @@ impl Worker {
 
 impl super::FetchCommandHandler<MexcMarketScope> for Worker {
     fn fetch_ticker_metadata(
-        &mut self,
+        &self,
         market_scope: MexcMarketScope,
     ) -> futures::future::BoxFuture<'_, Result<super::TickerMetadataMap, AdapterError>> {
         Box::pin(
-            async move { fetch::fetch_ticker_metadata(&mut self.hub, &market_scope.markets).await },
+            async move { fetch::fetch_ticker_metadata(&self.hub, &market_scope.markets).await },
         )
     }
 
     fn fetch_ticker_stats(
-        &mut self,
+        &self,
         market_scope: MexcMarketScope,
     ) -> futures::future::BoxFuture<'_, Result<super::TickerStatsMap, AdapterError>> {
         Box::pin(async move {
             fetch::fetch_ticker_stats(
-                &mut self.hub,
+                &self.hub,
                 &market_scope.markets,
                 market_scope.contract_sizes.as_ref(),
             )
@@ -290,20 +290,18 @@ impl super::FetchCommandHandler<MexcMarketScope> for Worker {
     }
 
     fn fetch_klines(
-        &mut self,
+        &self,
         ticker_info: TickerInfo,
         timeframe: Timeframe,
         range: Option<(UnixMs, UnixMs)>,
     ) -> futures::future::BoxFuture<'_, Result<Vec<Kline>, AdapterError>> {
-        Box::pin(
-            async move { fetch::fetch_klines(&mut self.hub, ticker_info, timeframe, range).await },
-        )
+        Box::pin(async move { fetch::fetch_klines(&self.hub, ticker_info, timeframe, range).await })
     }
 
     fn fetch_depth_snapshot(
-        &mut self,
+        &self,
         ticker: Ticker,
     ) -> futures::future::BoxFuture<'_, Result<DepthPayload, AdapterError>> {
-        Box::pin(async move { fetch::fetch_depth_snapshot(&mut self.hub, ticker).await })
+        Box::pin(async move { fetch::fetch_depth_snapshot(&self.hub, ticker).await })
     }
 }

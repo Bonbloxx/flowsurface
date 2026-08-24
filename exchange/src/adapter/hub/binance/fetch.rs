@@ -101,7 +101,7 @@ struct FetchedSpotDepth {
 }
 
 pub(super) async fn fetch_depth_snapshot(
-    hub: &mut HttpHub<BinanceLimiter>,
+    hub: &HttpHub<BinanceLimiter>,
     ticker: Ticker,
 ) -> Result<DepthPayload, AdapterError> {
     let (symbol_str, market_type) = ticker.to_full_symbol_and_type();
@@ -206,7 +206,7 @@ pub(super) async fn fetch_depth_snapshot(
 }
 
 pub(super) async fn fetch_ticker_metadata(
-    hub: &mut HttpHub<BinanceLimiter>,
+    hub: &HttpHub<BinanceLimiter>,
     market: MarketKind,
 ) -> Result<super::super::TickerMetadataMap, AdapterError> {
     let (url, weight) = match market {
@@ -293,7 +293,7 @@ pub(super) async fn fetch_ticker_metadata(
 }
 
 pub(super) async fn fetch_ticker_stats(
-    hub: &mut HttpHub<BinanceLimiter>,
+    hub: &HttpHub<BinanceLimiter>,
     market: MarketKind,
     contract_sizes: Option<&HashMap<Ticker, crate::unit::ContractSize>>,
 ) -> Result<super::super::TickerStatsMap, AdapterError> {
@@ -367,7 +367,7 @@ pub(super) async fn fetch_ticker_stats(
 }
 
 pub(super) async fn fetch_klines(
-    hub: &mut HttpHub<BinanceLimiter>,
+    hub: &HttpHub<BinanceLimiter>,
     ticker_info: TickerInfo,
     timeframe: Timeframe,
     range: Option<(UnixMs, UnixMs)>,
@@ -389,7 +389,9 @@ pub(super) async fn fetch_klines(
         let start = start.as_u64();
         let end = end.as_u64();
         let interval_ms = timeframe.to_milliseconds();
-        let num_intervals = ((end - start) / interval_ms).min(1000);
+        // Both boundaries are inclusive. Count the first candle as well so a
+        // final partial page does not permanently omit its lower boundary.
+        let num_intervals = ((end - start) / interval_ms).saturating_add(1).min(1000);
 
         if num_intervals < 3 {
             let new_start = start - (interval_ms * 5);
@@ -488,7 +490,7 @@ fn oi_range_reaches_live_edge(
 }
 
 async fn fetch_current_oi(
-    hub: &mut HttpHub<BinanceLimiter>,
+    hub: &HttpHub<BinanceLimiter>,
     ticker_info: TickerInfo,
 ) -> Result<OpenInterest, AdapterError> {
     let (ticker_str, market) = ticker_info.ticker.to_full_symbol_and_type();
@@ -537,7 +539,7 @@ async fn fetch_current_oi(
 }
 
 pub(super) async fn fetch_historical_oi(
-    hub: &mut HttpHub<BinanceLimiter>,
+    hub: &HttpHub<BinanceLimiter>,
     ticker_info: TickerInfo,
     range: Option<(UnixMs, UnixMs)>,
     period: Timeframe,
@@ -724,7 +726,7 @@ fn map_de_trades(
 }
 
 async fn fetch_intraday_trades(
-    hub: &mut HttpHub<BinanceLimiter>,
+    hub: &HttpHub<BinanceLimiter>,
     ticker_info: TickerInfo,
     from: UnixMs,
     to: Option<UnixMs>,
@@ -942,7 +944,7 @@ async fn fetch_intraday_trades_parallel(
 /// bound the parallel slicer is used; without one the single-cursor page is
 /// returned so callers can keep advancing.
 async fn fetch_intraday_range(
-    hub: &mut HttpHub<BinanceLimiter>,
+    hub: &HttpHub<BinanceLimiter>,
     ticker_info: TickerInfo,
     from: UnixMs,
     to: Option<UnixMs>,
@@ -1124,7 +1126,7 @@ async fn get_hist_trades_with_client(
 }
 
 pub(super) async fn fetch_trades(
-    hub: &mut HttpHub<BinanceLimiter>,
+    hub: &HttpHub<BinanceLimiter>,
     ticker_info: TickerInfo,
     from_time: UnixMs,
     to_time: Option<UnixMs>,

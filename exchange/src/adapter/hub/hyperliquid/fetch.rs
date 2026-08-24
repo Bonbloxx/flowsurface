@@ -53,7 +53,7 @@ struct HyperliquidAssetContext {
 }
 
 pub(super) async fn fetch_open_interest(
-    hub: &mut HttpHub<HyperliquidLimiter>,
+    hub: &HttpHub<HyperliquidLimiter>,
     ticker_info: TickerInfo,
     timeframe: Timeframe,
     range: Option<(UnixMs, UnixMs)>,
@@ -167,7 +167,7 @@ type TickerMetadata = (
 );
 
 async fn post_info<T: DeserializeOwned>(
-    hub: &mut HttpHub<HyperliquidLimiter>,
+    hub: &HttpHub<HyperliquidLimiter>,
     body: &Value,
 ) -> Result<T, AdapterError> {
     let url = format!("{}/info", API_DOMAIN);
@@ -179,7 +179,7 @@ async fn post_info<T: DeserializeOwned>(
 }
 
 async fn fetch_metadata(
-    hub: &mut HttpHub<HyperliquidLimiter>,
+    hub: &HttpHub<HyperliquidLimiter>,
     market: MarketKind,
 ) -> Result<TickerMetadata, AdapterError> {
     match market {
@@ -192,7 +192,7 @@ async fn fetch_metadata(
 }
 
 async fn fetch_meta_for_dex(
-    hub: &mut HttpHub<HyperliquidLimiter>,
+    hub: &HttpHub<HyperliquidLimiter>,
     dex_name: Option<&str>,
     spot_token_names_by_index: Option<&HashMap<u32, String>>,
 ) -> Result<TickerMetadata, AdapterError> {
@@ -220,7 +220,7 @@ async fn fetch_meta_for_dex(
 }
 
 async fn fetch_perps_metadata(
-    hub: &mut HttpHub<HyperliquidLimiter>,
+    hub: &HttpHub<HyperliquidLimiter>,
 ) -> Result<TickerMetadata, AdapterError> {
     let dexes_json: Value = post_info(hub, &json!({ "type": "perpDexs" })).await?;
 
@@ -271,7 +271,7 @@ async fn fetch_perps_metadata(
 }
 
 async fn fetch_spot_token_names_by_index(
-    hub: &mut HttpHub<HyperliquidLimiter>,
+    hub: &HttpHub<HyperliquidLimiter>,
 ) -> Result<HashMap<u32, String>, AdapterError> {
     let body = json!({"type": "spotMetaAndAssetCtxs"});
     let response_json: Value = post_info(hub, &body).await?;
@@ -291,7 +291,7 @@ async fn fetch_spot_token_names_by_index(
 }
 
 async fn fetch_spot_metadata(
-    hub: &mut HttpHub<HyperliquidLimiter>,
+    hub: &HttpHub<HyperliquidLimiter>,
 ) -> Result<TickerMetadata, AdapterError> {
     let body = json!({"type": "spotMetaAndAssetCtxs"});
     let response_json: Value = post_info(hub, &body).await?;
@@ -503,7 +503,7 @@ fn compute_tick_size(price: f64, sz_decimals: u32, market: MarketKind) -> f32 {
 }
 
 pub(super) async fn fetch_depth_snapshot(
-    hub: &mut HttpHub<HyperliquidLimiter>,
+    hub: &HttpHub<HyperliquidLimiter>,
     ticker: Ticker,
 ) -> Result<DepthPayload, AdapterError> {
     let (symbol_str, market_type) = ticker.to_full_symbol_and_type();
@@ -550,15 +550,32 @@ pub(super) async fn fetch_depth_snapshot(
 }
 
 pub(super) async fn fetch_ticker_metadata(
-    hub: &mut HttpHub<HyperliquidLimiter>,
+    hub: &HttpHub<HyperliquidLimiter>,
     market: MarketKind,
 ) -> Result<super::super::TickerMetadataMap, AdapterError> {
     let (ticker_info_map, _) = fetch_metadata(hub, market).await?;
     Ok(ticker_info_map)
 }
 
+pub(super) async fn fetch_primary_ticker_metadata(
+    hub: &HttpHub<HyperliquidLimiter>,
+    market: MarketKind,
+) -> Result<super::super::TickerMetadataMap, AdapterError> {
+    if market != MarketKind::LinearPerps {
+        return fetch_ticker_metadata(hub, market).await;
+    }
+
+    // Resolve the default Hyperliquid perpetual venue in one request. Its raw
+    // market identity, price and size precision are authoritative and enough
+    // to restore panes immediately. The full catalog task that follows adds
+    // collateral display aliases and every HIP-3 DEX without holding startup
+    // behind those presentation/catalog requests.
+    let (ticker_info_map, _) = fetch_meta_for_dex(hub, None, None).await?;
+    Ok(ticker_info_map)
+}
+
 pub(super) async fn fetch_ticker_stats(
-    hub: &mut HttpHub<HyperliquidLimiter>,
+    hub: &HttpHub<HyperliquidLimiter>,
     market: MarketKind,
 ) -> Result<super::super::TickerStatsMap, AdapterError> {
     let (_, ticker_stats_map) = fetch_metadata(hub, market).await?;
@@ -566,7 +583,7 @@ pub(super) async fn fetch_ticker_stats(
 }
 
 pub(super) async fn fetch_klines(
-    hub: &mut HttpHub<HyperliquidLimiter>,
+    hub: &HttpHub<HyperliquidLimiter>,
     ticker_info: TickerInfo,
     timeframe: Timeframe,
     range: Option<(UnixMs, UnixMs)>,

@@ -1,7 +1,7 @@
 use super::KlineIndicatorImpl;
 use super::footprint_history::{
     DAY_MS, DayStats, DisplayDay, FootprintHistoryIndicator, LevelStats, day_start, draw_text,
-    group_levels, utc_days_covering,
+    group_levels, trade_notional, utc_days_covering,
 };
 use crate::chart::{Message, ViewState};
 
@@ -17,6 +17,7 @@ use exchange::{SizeUnit, Trade, UnixMs, adapter::MarketKind};
 use iced::theme::palette::Extended;
 use iced::widget::canvas::{self, Path, Stroke};
 use iced::{Alignment, Color, Element, Point, Rectangle, Size};
+use rustc_hash::FxHashSet;
 
 /// Daily dollar-delta profile overlay. Reuses Footprint History's UTC-day
 /// trade book and venue aggregation; only the chart drawing is new.
@@ -32,6 +33,7 @@ pub struct DailyDeltaIndicator {
     /// (sources, aggregation config, basis, tick size, full rebuilds).
     full_rev: u64,
     cache: RefCell<Option<OverlayCache>>,
+    loaded_cache_days: FxHashSet<(exchange::Ticker, u64)>,
 }
 
 struct OverlayCache {
@@ -39,6 +41,7 @@ struct OverlayCache {
     group_step_units: i64,
     lookback_days: usize,
     today: u64,
+    qty_is_quote: bool,
     /// Days at/after this UTC-day start are stale and must be rebuilt
     /// before the next draw.
     dirty_from_day: Option<u64>,
@@ -49,9 +52,22 @@ struct CachedDayProfile {
     day_ts: u64,
     grouped: BTreeMap<i64, LevelStats>,
     max_abs: f64,
+    max_abs_price: Option<i64>,
     poc: Option<i64>,
+    trade_high: Option<i64>,
+    trade_low: Option<i64>,
+    kline_high: Option<i64>,
+    kline_low: Option<i64>,
     profile_high: Option<i64>,
     profile_low: Option<i64>,
+    from_footprint_fallback: bool,
+}
+
+impl CachedDayProfile {
+    fn refresh_price_span(&mut self) {
+        self.profile_high = self.trade_high.into_iter().chain(self.kline_high).max();
+        self.profile_low = self.trade_low.into_iter().chain(self.kline_low).min();
+    }
 }
 
 /// Directional colors shared by Delta History and other profile-style charts.
@@ -75,6 +91,7 @@ impl DailyDeltaIndicator {
             lookback_days: 4,
             full_rev: 0,
             cache: RefCell::new(None),
+            loaded_cache_days: FxHashSet::default(),
         }
     }
 
@@ -103,11 +120,130 @@ impl DailyDeltaIndicator {
         qty_is_quote: bool,
     ) -> CachedDayProfile {
         let mut day = self.inner.display_day_at(day_ts);
+        let from_footprint_fallback = day.stats.levels.is_empty();
+        let trade_high = day.stats.high.map(|price| Price::from_f64(price).units);
+        let trade_low = day.stats.low.map(|price| Price::from_f64(price).units);
+        let (kline_high, kline_low) = kline_day_price_range(data_source, day_ts);
         apply_kline_day(&mut day, data_source, day_ts, group_step, qty_is_quote);
-        CachedDayProfile {
+        let mut profile = CachedDayProfile {
             day_ts,
+            trade_high,
+            trade_low,
+            kline_high,
+            kline_low,
+            from_footprint_fallback,
             ..build_cached_profile(&day.stats, group_step)
+        };
+        profile.refresh_price_span();
+        profile
+    }
+
+    /// Apply live executions directly to the already-grouped current-day
+    /// profile. The authoritative venue day books are still updated first;
+    /// this only avoids cloning and regrouping the whole multi-venue day on
+    /// every 33 ms WebSocket batch.
+    fn apply_live_trades_to_cache(&mut self, trades: &[Trade]) -> bool {
+        let mut cache = self.cache.borrow_mut();
+        let Some(cache) = cache.as_mut() else {
+            return false;
+        };
+        let step_units = cache.group_step_units;
+        if step_units <= 0 {
+            return false;
         }
+        let today = cache.today;
+        let qty_is_quote = cache.qty_is_quote;
+        let Some(profile) = cache
+            .days
+            .iter_mut()
+            .find(|profile| profile.day_ts == today)
+        else {
+            return false;
+        };
+        // The first cache can be built from candle footprints before the
+        // shared history book hydrates. Rebuild once when that fallback hands
+        // over to the authoritative day book instead of double-counting it.
+        if profile.from_footprint_fallback {
+            return false;
+        }
+
+        let mut changed = false;
+        for trade in trades {
+            if day_start(trade.time) != today {
+                continue;
+            }
+            let bucket = trade.price.units.div_euclid(step_units) * step_units;
+            let notional = trade_notional(*trade, qty_is_quote);
+            let (old_abs, new_abs, new_volume) = {
+                let level = profile.grouped.entry(bucket).or_default();
+                let old_abs = level.delta().abs();
+                level.add_notional(trade.is_sell, notional);
+                (old_abs, level.delta().abs(), level.volume())
+            };
+
+            if new_abs >= profile.max_abs {
+                profile.max_abs = new_abs;
+                profile.max_abs_price = Some(bucket);
+            } else if profile.max_abs_price == Some(bucket) && new_abs < old_abs {
+                let replacement = profile
+                    .grouped
+                    .iter()
+                    .max_by(|left, right| left.1.delta().abs().total_cmp(&right.1.delta().abs()))
+                    .map(|(price, level)| (*price, level.delta().abs()));
+                profile.max_abs_price = replacement.map(|(price, _)| price);
+                profile.max_abs = replacement.map_or(0.0, |(_, delta)| delta);
+            }
+
+            let poc_volume = profile
+                .poc
+                .and_then(|price| profile.grouped.get(&price))
+                .map_or(0.0, |level| level.volume());
+            if profile.poc.is_none() || new_volume > poc_volume {
+                profile.poc = Some(bucket);
+            }
+
+            profile.trade_high = Some(
+                profile
+                    .trade_high
+                    .map_or(trade.price.units, |high| high.max(trade.price.units)),
+            );
+            profile.trade_low = Some(
+                profile
+                    .trade_low
+                    .map_or(trade.price.units, |low| low.min(trade.price.units)),
+            );
+            profile.refresh_price_span();
+            changed = true;
+        }
+        changed
+    }
+
+    fn apply_klines_to_cache(
+        &mut self,
+        klines: &[exchange::Kline],
+        source: &PlotData<KlineDataPoint>,
+    ) -> bool {
+        let mut cache = self.cache.borrow_mut();
+        let Some(cache) = cache.as_mut() else {
+            return false;
+        };
+        let touched_days = klines
+            .iter()
+            .map(|kline| day_start(kline.time))
+            .collect::<FxHashSet<_>>();
+        for day in touched_days {
+            let Some(profile) = cache.days.iter_mut().find(|profile| profile.day_ts == day) else {
+                continue;
+            };
+            // With no authoritative levels yet, candle footprints are also
+            // the volume source and must be reabsorbed by the full builder.
+            if profile.from_footprint_fallback && matches!(source, PlotData::TickBased(_)) {
+                return false;
+            }
+            (profile.kline_high, profile.kline_low) = kline_day_price_range(source, day);
+            profile.refresh_price_span();
+        }
+        true
     }
 }
 
@@ -142,6 +278,7 @@ impl KlineIndicatorImpl for DailyDeltaIndicator {
 
     fn reset_trade_history_backfill(&mut self) {
         self.inner.reset_trade_history_backfill();
+        self.loaded_cache_days.clear();
         self.mark_all_changed();
     }
 
@@ -155,7 +292,11 @@ impl KlineIndicatorImpl for DailyDeltaIndicator {
         day_start: UnixMs,
     ) -> Option<UnixMs> {
         let loaded = self.inner.load_cached_footprint_day(source, day_start);
-        if loaded.is_some() {
+        if loaded.is_some()
+            && self
+                .loaded_cache_days
+                .insert((source.ticker, day_start.as_u64()))
+        {
             self.mark_days_dirty(day_start.as_u64());
         }
         loaded
@@ -179,7 +320,10 @@ impl KlineIndicatorImpl for DailyDeltaIndicator {
     ) {
         self.inner.on_source_trades(source, trades, historical);
         if let Some(earliest) = trades.iter().map(|trade| trade.time.as_u64()).min() {
-            self.mark_days_dirty(earliest);
+            let applied_incrementally = !historical && self.apply_live_trades_to_cache(trades);
+            if !applied_incrementally {
+                self.mark_days_dirty(earliest);
+            }
         }
     }
 
@@ -201,21 +345,23 @@ impl KlineIndicatorImpl for DailyDeltaIndicator {
         self.inner.discard_staged_source_trades(req_id);
     }
 
-    fn on_insert_klines(&mut self, klines: &[exchange::Kline], _source: &PlotData<KlineDataPoint>) {
-        if let Some(earliest) = klines.iter().map(|kline| kline.time.as_u64()).min() {
+    fn on_insert_klines(&mut self, klines: &[exchange::Kline], source: &PlotData<KlineDataPoint>) {
+        if let Some(earliest) = klines.iter().map(|kline| kline.time.as_u64()).min()
+            && !self.apply_klines_to_cache(klines, source)
+        {
             self.mark_days_dirty(earliest);
         }
     }
 
     fn on_insert_trades(
         &mut self,
-        trades: &[Trade],
+        _trades: &[Trade],
         _old_dp_len: usize,
         _source: &PlotData<KlineDataPoint>,
     ) {
-        if let Some(earliest) = trades.iter().map(|trade| trade.time.as_u64()).min() {
-            self.mark_days_dirty(earliest);
-        }
+        // Live executions already enter through `on_source_trades` above.
+        // Marking the day dirty again here defeated the incremental update and
+        // forced a complete multi-venue regroup on every market batch.
     }
 
     fn rebuild_from_source(&mut self, _source: &PlotData<KlineDataPoint>) {
@@ -290,6 +436,7 @@ impl KlineIndicatorImpl for DailyDeltaIndicator {
                     group_step_units: group_step.units,
                     lookback_days: self.lookback_days,
                     today,
+                    qty_is_quote,
                     dirty_from_day: None,
                     days,
                 });
@@ -337,7 +484,14 @@ impl KlineIndicatorImpl for DailyDeltaIndicator {
             };
             let poc_line =
                 poc_line_range(chart, data_source, region, x, profile.day_ts, is_current);
-            if !profile_intersects_region(region, x, profile_w) && poc_line.is_none() {
+            let profile_visible = profile_intersects_region(region, x, profile_w);
+            if !profile_visible && poc_line.is_none() {
+                continue;
+            }
+            if !profile_visible {
+                if let Some(line) = poc_line {
+                    draw_profile_poc(frame, chart, profile, group_step, line, buy, scaling);
+                }
                 continue;
             }
 
@@ -441,6 +595,38 @@ fn poc_line_range(
     (end > start).then_some((start, end))
 }
 
+fn kline_day_price_range(
+    data_source: &PlotData<KlineDataPoint>,
+    day_ts: u64,
+) -> (Option<i64>, Option<i64>) {
+    let day_end = day_ts.saturating_add(DAY_MS);
+    let mut high = None::<Price>;
+    let mut low = None::<Price>;
+    let mut visit = |kline: &exchange::Kline| {
+        high = Some(high.map_or(kline.high, |current| current.max(kline.high)));
+        low = Some(low.map_or(kline.low, |current| current.min(kline.low)));
+    };
+    match data_source {
+        PlotData::TimeBased(series) => {
+            for (_, datapoint) in series
+                .datapoints
+                .range(UnixMs::new(day_ts)..UnixMs::new(day_end))
+            {
+                visit(&datapoint.kline);
+            }
+        }
+        PlotData::TickBased(tick_aggr) => {
+            for datapoint in &tick_aggr.datapoints {
+                let time = datapoint.kline.time.as_u64();
+                if time >= day_ts && time < day_end {
+                    visit(&datapoint.kline);
+                }
+            }
+        }
+    }
+    (high.map(|price| price.units), low.map(|price| price.units))
+}
+
 fn apply_kline_day(
     day: &mut DisplayDay,
     data_source: &PlotData<KlineDataPoint>,
@@ -534,10 +720,11 @@ fn absorb_footprint(
 /// grouped levels, delta scale, POC and the profile's price span.
 fn build_cached_profile(stats: &DayStats, step: PriceStep) -> CachedDayProfile {
     let grouped = group_levels(stats, step);
-    let max_abs = grouped
-        .values()
-        .map(|level| level.delta().abs())
-        .fold(0.0_f64, f64::max);
+    let max_abs_entry = grouped
+        .iter()
+        .max_by(|left, right| left.1.delta().abs().total_cmp(&right.1.delta().abs()));
+    let max_abs = max_abs_entry.map_or(0.0, |(_, level)| level.delta().abs());
+    let max_abs_price = max_abs_entry.map(|(price, _)| *price);
     let poc = grouped
         .iter()
         .max_by(|left, right| left.1.volume().total_cmp(&right.1.volume()))
@@ -555,9 +742,15 @@ fn build_cached_profile(stats: &DayStats, step: PriceStep) -> CachedDayProfile {
         day_ts: 0,
         grouped,
         max_abs,
+        max_abs_price,
         poc,
+        trade_high: profile_high,
+        trade_low: profile_low,
+        kline_high: None,
+        kline_low: None,
         profile_high,
         profile_low,
+        from_footprint_fallback: false,
     }
 }
 
@@ -582,7 +775,6 @@ fn draw_day_profile(
     let CachedDayProfile {
         grouped,
         max_abs,
-        poc,
         profile_high,
         profile_low,
         ..
@@ -612,13 +804,36 @@ fn draw_day_profile(
     let divider = Color::from_rgba(0.0, 0.0, 0.0, 0.45);
     let divider_h = (0.8 / scaling).clamp(0.4, 1.1);
 
-    for (price_units, level) in grouped {
-        let delta = level.delta();
-        if delta == 0.0 || *max_abs <= 0.0 {
+    // When configured price rows are smaller than one screen pixel, drawing
+    // every row creates thousands of fully-overlapping rectangles during a
+    // pan/zoom. Merge only for presentation at the current pixel resolution;
+    // the cached source levels remain exact and are revealed again on zoom-in.
+    let configured_row_px =
+        (step_u as f32 / chart.effective_tick_units() as f32) * chart.cell_height * scaling;
+    let rows_per_pixel = if configured_row_px.is_finite() && configured_row_px > 0.0 {
+        (1.0 / configured_row_px).ceil().max(1.0) as i64
+    } else {
+        1
+    };
+    let visible_low = lowest.units.min(highest.units);
+    let visible_high = lowest.units.max(highest.units);
+    let (render_step_u, render_rows) =
+        delta_rows_for_view(grouped, step_u, rows_per_pixel, visible_low, visible_high);
+    let render_max_abs = if rows_per_pixel == 1 {
+        *max_abs
+    } else {
+        render_rows
+            .iter()
+            .map(|(_, delta)| delta.abs())
+            .fold(0.0_f64, f64::max)
+    };
+
+    for (price_units, delta) in render_rows {
+        if delta == 0.0 || render_max_abs <= 0.0 {
             continue;
         }
-        let price = Price::from_units(*price_units);
-        let next = Price::from_units(price_units.saturating_add(step_u));
+        let price = Price::from_units(price_units);
+        let next = Price::from_units(price_units.saturating_add(render_step_u));
         if next < lowest || price > highest {
             continue;
         }
@@ -629,7 +844,7 @@ fn draw_day_profile(
             continue;
         }
         let y = y_top.min(y_bot);
-        let width = ((delta.abs() / max_abs) as f32 * profile_w).max(4.0 / scaling);
+        let width = ((delta.abs() / render_max_abs) as f32 * profile_w).max(4.0 / scaling);
         let color = if delta >= 0.0 { buy } else { sell };
         frame.fill_rectangle(Point::new(x - width, y), Size::new(width, bar_h), color);
         let line_h = divider_h.min(bar_h * 0.2);
@@ -651,22 +866,8 @@ fn draw_day_profile(
         }
     }
 
-    if let (Some(poc_units), Some((line_start, line_end))) = (poc, poc_line) {
-        let poc_y = {
-            let price = Price::from_units(*poc_units);
-            let next = Price::from_units(poc_units.saturating_add(step_u));
-            (chart.price_to_y(price) + chart.price_to_y(next)) * 0.5
-        };
-        frame.stroke(
-            &Path::line(Point::new(line_start, poc_y), Point::new(line_end, poc_y)),
-            Stroke::with_color(
-                Stroke {
-                    width: 2.0 / scaling,
-                    ..Stroke::default()
-                },
-                buy,
-            ),
-        );
+    if let Some(line) = poc_line {
+        draw_profile_poc(frame, chart, profile, group_step, line, buy, scaling);
     }
 
     if is_current {
@@ -679,6 +880,62 @@ fn draw_day_profile(
             Alignment::End,
         );
     }
+}
+
+fn draw_profile_poc(
+    frame: &mut canvas::Frame,
+    chart: &ViewState,
+    profile: &CachedDayProfile,
+    group_step: PriceStep,
+    (line_start, line_end): (f32, f32),
+    color: Color,
+    scaling: f32,
+) {
+    let Some(poc_units) = profile.poc else {
+        return;
+    };
+    let step_units = group_step.units.max(1);
+    let price = Price::from_units(poc_units);
+    let next = Price::from_units(poc_units.saturating_add(step_units));
+    let poc_y = (chart.price_to_y(price) + chart.price_to_y(next)) * 0.5;
+    frame.stroke(
+        &Path::line(Point::new(line_start, poc_y), Point::new(line_end, poc_y)),
+        Stroke::with_color(
+            Stroke {
+                width: 2.0 / scaling,
+                ..Stroke::default()
+            },
+            color,
+        ),
+    );
+}
+
+fn delta_rows_for_view(
+    grouped: &BTreeMap<i64, LevelStats>,
+    step_units: i64,
+    rows_per_pixel: i64,
+    visible_low: i64,
+    visible_high: i64,
+) -> (i64, Vec<(i64, f64)>) {
+    let step_units = step_units.max(1);
+    let render_step = step_units
+        .saturating_mul(rows_per_pixel.max(1))
+        .max(step_units);
+    let range_low = visible_low.div_euclid(render_step) * render_step;
+    let range_high = visible_high.saturating_add(render_step);
+    let mut rows = Vec::<(i64, f64)>::new();
+    for (price_units, level) in grouped.range(range_low..=range_high) {
+        let bucket = price_units.div_euclid(render_step) * render_step;
+        let delta = level.delta();
+        if let Some((last_bucket, last_delta)) = rows.last_mut()
+            && *last_bucket == bucket
+        {
+            *last_delta += delta;
+        } else {
+            rows.push((bucket, delta));
+        }
+    }
+    (render_step, rows)
 }
 
 fn delta_label_fits_row(bar_height: f32, minimum_text_height: f32) -> bool {
@@ -887,5 +1144,123 @@ mod tests {
 
         assert_eq!(base_stats.levels[&price.units].volume(), 200.0);
         assert_eq!(quote_stats.levels[&price.units].volume(), 200.0);
+    }
+
+    #[test]
+    fn live_incremental_profile_matches_authoritative_full_rebuild() {
+        let source = source();
+        let today = day_start(UnixMs::now());
+        let group_step = PriceStep {
+            units: Price::from_f64(1.0).units,
+        };
+        let data_source = PlotData::TimeBased(TimeSeries::<KlineDataPoint>::new(
+            Timeframe::M1,
+            PriceStep::from(source.min_ticksize),
+            &[],
+        ));
+        let mut indicator = DailyDeltaIndicator::new();
+        indicator.configure_footprint_history(&[source], true);
+        indicator.on_source_trades(
+            source,
+            &[
+                trade(today + 1_000, 100.0, 10.0, false),
+                trade(today + 2_000, 101.0, 5.0, false),
+            ],
+            true,
+        );
+        let initial = indicator.build_day_profile(&data_source, today, group_step, false);
+        indicator.cache = RefCell::new(Some(OverlayCache {
+            full_rev: indicator.full_rev,
+            group_step_units: group_step.units,
+            lookback_days: indicator.lookback_days,
+            today,
+            qty_is_quote: false,
+            dirty_from_day: None,
+            days: vec![initial],
+        }));
+
+        // Opposite-side volume reduces the previous maximum-delta row, which
+        // exercises the precise max rescan as well as the direct bucket update.
+        indicator.on_source_trades(source, &[trade(today + 3_000, 100.0, 8.0, true)], false);
+
+        let expected = indicator.build_day_profile(&data_source, today, group_step, false);
+        let cache = indicator.cache.borrow();
+        let actual = &cache.as_ref().expect("incremental cache").days[0];
+        assert_eq!(actual.grouped, expected.grouped);
+        assert_eq!(actual.max_abs, expected.max_abs);
+        assert_eq!(actual.max_abs_price, expected.max_abs_price);
+        assert_eq!(actual.poc, expected.poc);
+        assert_eq!(actual.profile_high, expected.profile_high);
+        assert_eq!(actual.profile_low, expected.profile_low);
+        assert_eq!(cache.as_ref().unwrap().dirty_from_day, None);
+    }
+
+    #[test]
+    fn kline_correction_retracts_cached_day_extrema_without_regrouping_trades() {
+        let source = source();
+        let today = day_start(UnixMs::now());
+        let step = PriceStep::from(source.min_ticksize);
+        let group_step = PriceStep {
+            units: Price::from_f64(1.0).units,
+        };
+        let make_kline = |high: f64, low: f64| Kline {
+            time: UnixMs::new(today),
+            open: Price::from_f64(100.0),
+            high: Price::from_f64(high),
+            low: Price::from_f64(low),
+            close: Price::from_f64(100.0),
+            volume: Volume::empty_buy_sell(),
+        };
+        let mut data_source = PlotData::TimeBased(TimeSeries::<KlineDataPoint>::new(
+            Timeframe::M1,
+            step,
+            &[make_kline(110.0, 90.0)],
+        ));
+        let mut indicator = DailyDeltaIndicator::new();
+        indicator.configure_footprint_history(&[source], true);
+        indicator.on_source_trades(source, &[trade(today + 1_000, 100.0, 10.0, false)], true);
+        let initial = indicator.build_day_profile(&data_source, today, group_step, false);
+        indicator.cache = RefCell::new(Some(OverlayCache {
+            full_rev: indicator.full_rev,
+            group_step_units: group_step.units,
+            lookback_days: indicator.lookback_days,
+            today,
+            qty_is_quote: false,
+            dirty_from_day: None,
+            days: vec![initial],
+        }));
+
+        let corrected = make_kline(105.0, 95.0);
+        let PlotData::TimeBased(series) = &mut data_source else {
+            unreachable!();
+        };
+        series.insert_klines(&[corrected]);
+        indicator.on_insert_klines(&[corrected], &data_source);
+
+        let expected = indicator.build_day_profile(&data_source, today, group_step, false);
+        let cache = indicator.cache.borrow();
+        let actual = &cache.as_ref().expect("corrected cache").days[0];
+        assert_eq!(actual.profile_high, expected.profile_high);
+        assert_eq!(actual.profile_low, expected.profile_low);
+        assert_eq!(actual.grouped, expected.grouped);
+        assert_eq!(cache.as_ref().unwrap().dirty_from_day, None);
+    }
+
+    #[test]
+    fn subpixel_lod_preserves_visible_delta_exactly() {
+        let mut grouped = BTreeMap::new();
+        for row in 0..2_400_i64 {
+            grouped
+                .entry(row * 10)
+                .or_insert_with(LevelStats::default)
+                .add_notional(row % 3 == 0, 100.0 + row as f64);
+        }
+        let source_sum = grouped.values().map(|level| level.delta()).sum::<f64>();
+        let (render_step, rows) = delta_rows_for_view(&grouped, 10, 6, 0, 23_990);
+        let rendered_sum = rows.iter().map(|(_, delta)| *delta).sum::<f64>();
+
+        assert_eq!(render_step, 60);
+        assert_eq!(rows.len(), 400);
+        assert_eq!(rendered_sum, source_sum);
     }
 }

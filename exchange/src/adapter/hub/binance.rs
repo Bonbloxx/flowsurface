@@ -260,18 +260,20 @@ impl Worker {
         })
     }
 
-    fn hub_for_market(&mut self, market: MarketKind) -> &mut HttpHub<BinanceLimiter> {
+    fn hub_for_market(&self, market: MarketKind) -> &HttpHub<BinanceLimiter> {
         match market {
-            MarketKind::Spot => &mut self.spot_hub,
-            MarketKind::LinearPerps => &mut self.linear_hub,
-            MarketKind::InversePerps => &mut self.inverse_hub,
+            MarketKind::Spot => &self.spot_hub,
+            MarketKind::LinearPerps => &self.linear_hub,
+            MarketKind::InversePerps => &self.inverse_hub,
         }
     }
 }
 
 impl super::FetchCommandHandler<BinanceMarketScope> for Worker {
+    const MAX_IN_FLIGHT_REQUESTS: usize = 16;
+
     fn fetch_ticker_metadata(
-        &mut self,
+        &self,
         market_scope: BinanceMarketScope,
     ) -> futures::future::BoxFuture<'_, Result<super::TickerMetadataMap, AdapterError>> {
         let market = market_scope.market;
@@ -281,7 +283,7 @@ impl super::FetchCommandHandler<BinanceMarketScope> for Worker {
     }
 
     fn fetch_ticker_stats(
-        &mut self,
+        &self,
         market_scope: BinanceMarketScope,
     ) -> futures::future::BoxFuture<'_, Result<super::TickerStatsMap, AdapterError>> {
         let market = market_scope.market;
@@ -296,7 +298,7 @@ impl super::FetchCommandHandler<BinanceMarketScope> for Worker {
     }
 
     fn fetch_klines(
-        &mut self,
+        &self,
         ticker_info: TickerInfo,
         timeframe: Timeframe,
         range: Option<(UnixMs, UnixMs)>,
@@ -308,7 +310,7 @@ impl super::FetchCommandHandler<BinanceMarketScope> for Worker {
     }
 
     fn fetch_open_interest(
-        &mut self,
+        &self,
         ticker_info: TickerInfo,
         timeframe: Timeframe,
         range: Option<(UnixMs, UnixMs)>,
@@ -321,7 +323,7 @@ impl super::FetchCommandHandler<BinanceMarketScope> for Worker {
     }
 
     fn fetch_depth_snapshot(
-        &mut self,
+        &self,
         ticker: Ticker,
     ) -> futures::future::BoxFuture<'_, Result<DepthPayload, AdapterError>> {
         let market = ticker.market_type();
@@ -331,7 +333,7 @@ impl super::FetchCommandHandler<BinanceMarketScope> for Worker {
     }
 
     fn fetch_trades(
-        &mut self,
+        &self,
         ticker_info: TickerInfo,
         from_time: UnixMs,
         to_time: Option<UnixMs>,

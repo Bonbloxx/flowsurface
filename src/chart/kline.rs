@@ -58,6 +58,10 @@ const LIVE_REDRAW_INTERVAL: Duration = Duration::from_millis(LIVE_REDRAW_INTERVA
 /// window of 1m closes, requested one page per seed tick so a liquid
 /// symbol cannot stall the UI with a giant rebuild.
 const RENKO_HISTORY_MS: u64 = 31 * 24 * 60 * 60 * 1_000;
+/// Keep several independent venue pages in flight during cold startup. The
+/// exchange limiter remains authoritative; this only removes the artificial
+/// response-before-next-request dependency between non-overlapping ranges.
+const KLINE_SEED_PAGES_PER_SOURCE: usize = 16;
 
 fn renko_seed_page_bars(source: TickerInfo) -> u64 {
     match source.exchange().venue() {
@@ -65,6 +69,46 @@ fn renko_seed_page_bars(source: TickerInfo) -> u64 {
         Venue::Okex => 300,
         _ => 1_000,
     }
+}
+
+fn request_backward_kline_pages(
+    request_handler: &mut RequestHandler,
+    source: TickerInfo,
+    timeframe: Timeframe,
+    need_earliest: UnixMs,
+    mut page_end: UnixMs,
+    page_bars: u64,
+) -> Option<Action> {
+    let interval_ms = timeframe.to_milliseconds();
+    let page_span_ms = interval_ms.saturating_mul(page_bars.saturating_sub(1));
+    let stream = StreamKind::Kline {
+        ticker_info: source,
+        timeframe,
+    };
+    let mut specs = Vec::new();
+
+    for _ in 0..KLINE_SEED_PAGES_PER_SOURCE {
+        if page_end <= need_earliest {
+            break;
+        }
+        let page_start = page_end.saturating_sub(page_span_ms).max(need_earliest);
+        let range = FetchRange::Kline(page_start, page_end);
+        if let Ok(Some(req_id)) = request_handler.add_request(range, Some(stream)) {
+            specs.push(FetchSpec {
+                req_id,
+                fetch: range,
+                stream: Some(stream),
+            });
+        }
+        if page_start <= need_earliest {
+            break;
+        }
+        // Stay on candle boundaries. Subtracting one millisecond per page
+        // makes out-of-order completions produce shifted near-duplicates.
+        page_end = page_start.saturating_sub(interval_ms);
+    }
+
+    (!specs.is_empty()).then_some(Action::RequestFetch(specs))
 }
 
 fn tpo_history_earliest(config: TpoConfig, now: UnixMs) -> UnixMs {
@@ -259,7 +303,10 @@ impl Chart for KlineChart {
     }
 
     fn allows_vertical_navigation_from_fit(&self) -> bool {
-        matches!(self.kind, KlineChartKind::Tpo { .. })
+        matches!(
+            self.kind,
+            KlineChartKind::Footprint { .. } | KlineChartKind::Tpo { .. }
+        )
     }
 
     fn is_empty(&self) -> bool {
@@ -1101,12 +1148,25 @@ impl KlineChart {
         &self.kind
     }
 
-    /// True while Renko/TPO still has historical seed pages to request.
+    /// True while a chart still has paged kline history to request.
+    ///
+    /// This drives the existing initialization-rate maintenance timer. PVA
+    /// previously fell through to the one-second idle timer, imposing roughly
+    /// one second of artificial latency per 1,000-bar page.
     pub fn needs_seed_backfill(&self) -> bool {
-        matches!(
+        let chart_seed_incomplete = matches!(
             &self.kind,
             KlineChartKind::Renko { .. } | KlineChartKind::Tpo { .. }
-        ) && !self.trade_history_loaded
+        ) && !self.trade_history_loaded;
+        let pva_seed_incomplete = self.indicators[KlineIndicator::PreviousValueArea].is_some()
+            && !self
+                .pva_klines
+                .all_sources_complete(value_area_history_earliest(
+                    self.visual_config.previous_value_area_tpo_config(),
+                    UnixMs::now(),
+                ));
+
+        chart_seed_incomplete || pva_seed_incomplete
     }
 
     fn fetch_seed_klines(&mut self) -> Option<Action> {
@@ -1117,7 +1177,7 @@ impl KlineChart {
 
         if is_renko && !self.trade_history_loaded {
             let source = self.feed.primary();
-            let latest = UnixMs::now();
+            let latest = UnixMs::now().floor_to(RENKO_SEED_TIMEFRAME);
             let need_earliest = latest.saturating_sub(RENKO_HISTORY_MS);
 
             if self.tpo_klines.source_is_complete(source, need_earliest) {
@@ -1130,23 +1190,17 @@ impl KlineChart {
                 let page_end = self
                     .tpo_klines
                     .earliest(source)
-                    .map(|time| time.saturating_sub(1))
+                    .map(|time| time.saturating_sub(RENKO_SEED_TIMEFRAME.to_milliseconds()))
                     .unwrap_or(latest);
-                if page_end > need_earliest {
-                    let page_ms = RENKO_SEED_TIMEFRAME
-                        .to_milliseconds()
-                        .saturating_mul(renko_seed_page_bars(source));
-                    let page_start = page_end.saturating_sub(page_ms).max(need_earliest);
-                    let range = FetchRange::Kline(page_start, page_end);
-                    let stream = StreamKind::Kline {
-                        ticker_info: source,
-                        timeframe: RENKO_SEED_TIMEFRAME,
-                    };
-                    if let Some(action) =
-                        request_fetch_with_stream(&mut self.request_handler, range, Some(stream))
-                    {
-                        return Some(action);
-                    }
+                if let Some(action) = request_backward_kline_pages(
+                    &mut self.request_handler,
+                    source,
+                    RENKO_SEED_TIMEFRAME,
+                    need_earliest,
+                    page_end,
+                    renko_seed_page_bars(source),
+                ) {
+                    return Some(action);
                 }
             }
         }
@@ -1158,10 +1212,8 @@ impl KlineChart {
             && let KlineChartKind::Tpo { config } = &self.kind
         {
             let letter_tf = config.letter_timeframe();
-            let latest = UnixMs::now();
+            let latest = UnixMs::now().floor_to(letter_tf);
             let need_earliest = tpo_history_earliest(*config, latest);
-            let page_ms = letter_tf.to_milliseconds().saturating_mul(1_000);
-
             for source in self.feed.sources().iter().copied() {
                 if self.tpo_klines.source_is_complete(source, need_earliest) {
                     continue;
@@ -1173,21 +1225,20 @@ impl KlineChart {
                 let page_end = self
                     .tpo_klines
                     .earliest(source)
-                    .map(|time| time.saturating_sub(1))
+                    .map(|time| time.saturating_sub(letter_tf.to_milliseconds()))
                     .unwrap_or(latest);
                 if page_end <= need_earliest {
                     continue;
                 }
 
-                let page_start = page_end.saturating_sub(page_ms).max(need_earliest);
-                let range = FetchRange::Kline(page_start, page_end);
-                let stream = StreamKind::Kline {
-                    ticker_info: source,
-                    timeframe: letter_tf,
-                };
-                if let Some(action) =
-                    request_fetch_with_stream(&mut self.request_handler, range, Some(stream))
-                {
+                if let Some(action) = request_backward_kline_pages(
+                    &mut self.request_handler,
+                    source,
+                    letter_tf,
+                    need_earliest,
+                    page_end,
+                    1_000,
+                ) {
                     return Some(action);
                 }
             }
@@ -1207,31 +1258,67 @@ impl KlineChart {
             return Some(action);
         }
 
+        // A chart needs its primary visible series before secondary history can
+        // derive a truthful viewport or indicator range.
+        if let PlotData::TimeBased(timeseries) = &self.data_source
+            && timeseries.datapoints.is_empty()
+        {
+            // Keep a pending page's identity stable for the whole candle. The
+            // maintenance timer can run every 100 ms during initialization;
+            // using raw wall-clock milliseconds here previously bypassed the
+            // request deduper and flooded the venue queue with duplicates.
+            let interval = timeseries.interval;
+            let latest = UnixMs::now().floor_to(interval);
+            let earliest = latest.saturating_sub(450 * interval.to_milliseconds());
+            let range = FetchRange::Kline(earliest, latest);
+            let mut initial_specs = Vec::new();
+            Self::append_fetch_specs(
+                &mut initial_specs,
+                request_fetch(&mut self.request_handler, range),
+            );
+
+            // OI history is independent of candle payloads. Start it beside
+            // the primary page instead of waiting for the venue's serialized
+            // kline request and a later maintenance turn.
+            const MAX_OI_BOOTSTRAP_MS: u64 = 90 * 24 * 60 * 60 * 1_000;
+            let oi_span = interval
+                .to_milliseconds()
+                .saturating_mul(1_000)
+                .min(MAX_OI_BOOTSTRAP_MS);
+            Self::append_fetch_specs(
+                &mut initial_specs,
+                self.fetch_open_interest_bootstrap(
+                    latest.saturating_sub(oi_span),
+                    latest,
+                    interval,
+                ),
+            );
+            if !initial_specs.is_empty() {
+                return Some(Action::RequestFetch(initial_specs));
+            }
+        }
+
+        // These stores are independent consumers. Dispatch them together so a
+        // long PVA/TPO seed cannot suppress cached or remote trade history for
+        // CVD, Large Trades, Daily Delta, or Footprint History. Venue workers
+        // remain bounded and rate-limited, so this does not bypass exchange
+        // limits or compromise history completeness.
+        let mut background_specs = Vec::new();
         let can_fetch_footprint_history = match &self.data_source {
             PlotData::TimeBased(timeseries) => !timeseries.datapoints.is_empty(),
             PlotData::TickBased(_) => true,
         };
-        if can_fetch_footprint_history && let Some(action) = self.fetch_footprint_history() {
-            return Some(action);
+        Self::append_fetch_specs(&mut background_specs, self.fetch_pva_seed_klines());
+        Self::append_fetch_specs(&mut background_specs, self.fetch_open_interest_history());
+        if can_fetch_footprint_history {
+            Self::append_fetch_specs(&mut background_specs, self.fetch_footprint_history());
         }
-
-        // Previous Value Areas letter-timeframe bar seeding.
-        if let Some(action) = self.fetch_pva_seed_klines() {
-            return Some(action);
+        if !background_specs.is_empty() {
+            return Some(Action::RequestFetch(background_specs));
         }
 
         if let PlotData::TimeBased(timeseries) = &self.data_source {
             let timeframe_ms = timeseries.interval.to_milliseconds();
-
-            if timeseries.datapoints.is_empty() {
-                let latest = chrono::Utc::now().timestamp_millis() as u64;
-                let earliest = latest.saturating_sub(450 * timeframe_ms);
-
-                let range = FetchRange::Kline(UnixMs::new(earliest), UnixMs::new(latest));
-                if let Some(action) = request_fetch(&mut self.request_handler, range) {
-                    return Some(action);
-                }
-            }
 
             let (visible_earliest, visible_latest) = self.visible_timerange()?;
             let (kline_earliest, kline_latest) = timeseries.timerange();
@@ -1297,8 +1384,7 @@ impl KlineChart {
                 }
             }
 
-            // priority 3, indicators
-            // (e.g. open interest needs external fetch as it's not derived from klines)
+            // priority 3, indicators derived from the primary stream.
             let ctx = indicator::kline::FetchCtx {
                 main_chart: &self.chart,
                 timeframe: interval,
@@ -1306,33 +1392,6 @@ impl KlineChart {
                 kline_latest,
                 prefetch_earliest: UnixMs::new(prefetch_earliest),
             };
-            if let Some(indi) = self.indicators[KlineIndicator::OpenInterest].as_mut()
-                && let Some(range) = indi.fetch_range(&ctx)
-            {
-                let mut specs = Vec::new();
-                for source in indi.open_interest_sources().iter().copied() {
-                    let fetch_timeframe = crate::chart::indicator::kline::open_interest::OpenInterestIndicator::fetch_timeframe_for(
-                        source.exchange(),
-                        interval,
-                    );
-                    let stream = StreamKind::Kline {
-                        ticker_info: source,
-                        timeframe: fetch_timeframe,
-                    };
-                    if let Ok(Some(req_id)) = self.request_handler.add_request(range, Some(stream))
-                    {
-                        specs.push(FetchSpec {
-                            req_id,
-                            fetch: range,
-                            stream: Some(stream),
-                        });
-                    }
-                }
-                if !specs.is_empty() {
-                    return Some(Action::RequestFetch(specs));
-                }
-            }
-
             for indi in self
                 .indicators
                 .values_mut()
@@ -1369,6 +1428,84 @@ impl KlineChart {
         None
     }
 
+    fn append_fetch_specs(into: &mut Vec<FetchSpec>, action: Option<Action>) {
+        if let Some(Action::RequestFetch(mut specs)) = action {
+            into.append(&mut specs);
+        }
+    }
+
+    fn fetch_open_interest_bootstrap(
+        &mut self,
+        earliest: UnixMs,
+        latest: UnixMs,
+        interval: Timeframe,
+    ) -> Option<Action> {
+        let ctx = indicator::kline::FetchCtx {
+            main_chart: &self.chart,
+            timeframe: interval,
+            visible_earliest: earliest,
+            kline_latest: latest,
+            prefetch_earliest: earliest,
+        };
+        let range = self.indicators[KlineIndicator::OpenInterest]
+            .as_mut()?
+            .fetch_range(&ctx)?;
+        self.request_open_interest_range(range, interval)
+    }
+
+    fn fetch_open_interest_history(&mut self) -> Option<Action> {
+        let (visible_earliest, visible_latest) = self.visible_timerange()?;
+        let PlotData::TimeBased(timeseries) = &self.data_source else {
+            return None;
+        };
+        let interval = timeseries.interval;
+        let (_, kline_latest) = timeseries.timerange();
+        let visible_earliest_ms = UnixMs::new(visible_earliest);
+        let visible_span = visible_latest.saturating_sub(visible_earliest);
+        let prefetch_earliest = UnixMs::new(visible_earliest.saturating_sub(visible_span));
+        let ctx = indicator::kline::FetchCtx {
+            main_chart: &self.chart,
+            timeframe: interval,
+            visible_earliest: visible_earliest_ms,
+            kline_latest,
+            prefetch_earliest,
+        };
+        let range = self.indicators[KlineIndicator::OpenInterest]
+            .as_mut()?
+            .fetch_range(&ctx)?;
+        self.request_open_interest_range(range, interval)
+    }
+
+    fn request_open_interest_range(
+        &mut self,
+        range: FetchRange,
+        interval: Timeframe,
+    ) -> Option<Action> {
+        let sources = self.indicators[KlineIndicator::OpenInterest]
+            .as_ref()?
+            .open_interest_sources()
+            .to_vec();
+        let mut specs = Vec::new();
+        for source in sources {
+            let fetch_timeframe = crate::chart::indicator::kline::open_interest::OpenInterestIndicator::fetch_timeframe_for(
+                source.exchange(),
+                interval,
+            );
+            let stream = StreamKind::Kline {
+                ticker_info: source,
+                timeframe: fetch_timeframe,
+            };
+            if let Ok(Some(req_id)) = self.request_handler.add_request(range, Some(stream)) {
+                specs.push(FetchSpec {
+                    req_id,
+                    fetch: range,
+                    stream: Some(stream),
+                });
+            }
+        }
+        (!specs.is_empty()).then_some(Action::RequestFetch(specs))
+    }
+
     /// Page letter-timeframe OHLC bars for the Previous Value Areas overlay.
     ///
     /// Mirrors the TPO seeding loop: one backward page per tick per source
@@ -1379,6 +1516,7 @@ impl KlineChart {
         let config = self.visual_config.previous_value_area_tpo_config();
         let letter_tf = config.letter_timeframe();
         let now = UnixMs::now();
+        let page_now = now.floor_to(letter_tf);
 
         // Re-anchor once per UTC day so completed periods keep tracking `now`.
         let today = day_start(now);
@@ -1394,23 +1532,38 @@ impl KlineChart {
         }
 
         let need_earliest = value_area_history_earliest(config, now);
-        let page_ms = letter_tf.to_milliseconds().saturating_mul(1_000);
+        let bar_ms = letter_tf.to_milliseconds();
+        let page_ms = bar_ms.saturating_mul(1_000);
 
         for source in self.pva_klines.sources().to_vec() {
             match self.pva_klines.latest(source) {
-                Some(latest) if latest.as_u64().saturating_add(page_ms) > now.as_u64() => {
+                None => {
+                    // Do not also plan a raw-wall-clock backward page while
+                    // this source's first stable page is still pending.
+                    if let Some(action) = request_backward_kline_pages(
+                        &mut self.request_handler,
+                        source,
+                        letter_tf,
+                        need_earliest,
+                        page_now,
+                        1_000,
+                    ) {
+                        return Some(action);
+                    }
+                    continue;
+                }
+                Some(latest) if latest.as_u64().saturating_add(bar_ms) > now.as_u64() => {
                     // Newest bar is fresh; only older pages may be missing.
                 }
-                latest => {
-                    // Top-up (or first page) ending at the newest missing bar.
-                    let page_end = latest
-                        .map(|time| time.saturating_add(1))
-                        .unwrap_or(now)
-                        .min(now);
-                    if page_end <= need_earliest {
+                Some(latest) => {
+                    // Fill forward from the newest stored bar. The old range
+                    // ended at `latest + 1` and therefore re-fetched older
+                    // bars instead of covering the newly elapsed period.
+                    let page_start = latest.saturating_add(1);
+                    let page_end = page_start.saturating_add(page_ms).min(page_now);
+                    if page_end <= page_start || page_end <= need_earliest {
                         continue;
                     }
-                    let page_start = page_end.saturating_sub(page_ms).max(need_earliest);
                     let range = FetchRange::Kline(page_start, page_end);
                     let stream = StreamKind::Kline {
                         ticker_info: source,
@@ -1426,23 +1579,24 @@ impl KlineChart {
 
             if !self.pva_klines.source_is_complete(source, need_earliest) {
                 // Backward paging toward the previous year's start.
-                let page_end = self
+                let Some(page_end) = self
                     .pva_klines
                     .earliest(source)
-                    .map(|time| time.saturating_sub(1))
-                    .unwrap_or(now);
+                    .map(|time| time.saturating_sub(letter_tf.to_milliseconds()))
+                else {
+                    continue;
+                };
                 if page_end <= need_earliest {
                     continue;
                 }
-                let page_start = page_end.saturating_sub(page_ms).max(need_earliest);
-                let range = FetchRange::Kline(page_start, page_end);
-                let stream = StreamKind::Kline {
-                    ticker_info: source,
-                    timeframe: letter_tf,
-                };
-                if let Some(action) =
-                    request_fetch_with_stream(&mut self.request_handler, range, Some(stream))
-                {
+                if let Some(action) = request_backward_kline_pages(
+                    &mut self.request_handler,
+                    source,
+                    letter_tf,
+                    need_earliest,
+                    page_end,
+                    1_000,
+                ) {
                     return Some(action);
                 }
             }
@@ -2444,12 +2598,14 @@ impl KlineChart {
         source: TickerInfo,
         req_id: Option<uuid::Uuid>,
         oi_data: &[OIData],
+        terminal: bool,
     ) {
         if req_id.is_some_and(|id| self.footprint_history.oi_requests.contains(&id)) {
             if let Some(indicator) = self.indicators[KlineIndicator::FootprintHistory].as_mut() {
                 indicator.on_source_open_interest(source, oi_data);
             }
-            if let Some(req_id) = req_id {
+            if terminal && let Some(req_id) = req_id {
+                self.footprint_history.oi_requests.remove(&req_id);
                 if oi_data.is_empty() {
                     self.request_handler.mark_no_data(req_id);
                 } else {
@@ -2466,7 +2622,7 @@ impl KlineChart {
         if !indi.open_interest_sources().contains(&source) {
             return;
         }
-        if let Some(req_id) = req_id {
+        if terminal && let Some(req_id) = req_id {
             if oi_data.is_empty() {
                 self.request_handler.mark_no_data(req_id);
             } else {
@@ -2894,7 +3050,6 @@ impl canvas::Program<Message> for KlineChart {
 
             let price_to_y = |price| chart.price_to_y(price);
             let interval_to_x = |interval| chart.interval_to_x(interval);
-
             match &self.kind {
                 KlineChartKind::Footprint {
                     clusters,
@@ -2960,7 +3115,7 @@ impl canvas::Program<Message> for KlineChart {
                         latest,
                         interval_to_x,
                         |frame, x_position, kline, trades| {
-                            let grouped = trades.grouped_to_step(self.tick_size());
+                            let grouped = trades.grouped_to_step_cow(self.tick_size());
                             let visible_max_notional = if qty_is_quote {
                                 max_cluster_qty
                             } else {
@@ -3055,12 +3210,12 @@ impl canvas::Program<Message> for KlineChart {
                         row_step,
                         visible_high,
                         visible_low,
+                        region.x,
                         region.x + region.width,
                         self.tpo_structural_composite.as_deref(),
                     );
                 }
             }
-
             if let Some(indicator) = self.indicators[KlineIndicator::DailyDelta].as_ref() {
                 let ticks = self.visual_config.daily_delta_ticks.max(1);
                 let active_sources = self.active_footprint_history_sources();
@@ -3075,7 +3230,6 @@ impl canvas::Program<Message> for KlineChart {
                     group_step,
                 );
             }
-
             if let Some(indicator) = self.indicators[KlineIndicator::PreviousValueArea].as_ref() {
                 let group_step = previous_value_area_price_step(
                     self.active_footprint_history_sources(),
@@ -3091,7 +3245,6 @@ impl canvas::Program<Message> for KlineChart {
                     group_step,
                 );
             }
-
             if let Some(indicator) = self.indicators[KlineIndicator::LargeTrades].as_ref() {
                 indicator.draw_overlay(
                     frame,
@@ -3102,7 +3255,6 @@ impl canvas::Program<Message> for KlineChart {
                     chart.tick_size,
                 );
             }
-
             if let Some(indicator) = self.indicators[KlineIndicator::VisibleRangeProfile].as_ref() {
                 let group_step = self.vpvr_group_step();
                 indicator.draw_overlay(
@@ -3114,7 +3266,6 @@ impl canvas::Program<Message> for KlineChart {
                     group_step,
                 );
             }
-
             chart.draw_last_price_line(frame, palette, region);
         });
 
@@ -3220,6 +3371,7 @@ fn draw_tpo_profiles(
     row_step: PriceStep,
     visible_high: Price,
     visible_low: Price,
+    visible_left: f32,
     visible_right: f32,
     structural_composite: Option<&StructuralComposite>,
 ) {
@@ -3249,21 +3401,35 @@ fn draw_tpo_profiles(
         row_step,
         visible_high,
         visible_low,
-        structural_composite,
     );
+
+    // The active composite is a background zone only. Paint it before the
+    // profile glyphs so it never dims, recolors, or obscures market-profile
+    // content drawn on top.
+    if let Some(composite) = structural_composite {
+        draw_structural_composite_band(
+            frame,
+            &interval_to_x,
+            &price_to_y,
+            &tick_aggr.datapoints,
+            cell_width,
+            visible_left,
+            visible_right,
+            composite,
+            palette,
+        );
+    }
 
     // Paint extensions first so every profile and its labels remain legible on
     // top. Tick-chart indices are offsets from the newest profile, while the
     // backing vector is oldest-to-newest; the helper below performs that
     // conversion before looking for the first future tag.
     if config.show_single_prints {
-        let scale = scaling.max(0.1);
-        let min_chart_px = 1.0 / scale;
-        let row_body_h = (cell_height * 0.94).max(min_chart_px);
+        let row_body_h = tpo_single_print_highlight_height(cell_height, scaling);
         let half_body = row_body_h * 0.5;
-        let line_width = min_chart_px.max(0.5);
-        let extension_fill = palette.warning.base.color.scale_alpha(0.14);
-        let extension_line = palette.warning.base.color.scale_alpha(0.42);
+        let extension_fill = delta_history_colors(palette)
+            .0
+            .scale_alpha(TPO_SINGLE_PRINT_HIGHLIGHT_ALPHA);
 
         for prepared in &visible_profiles {
             let profile_right = interval_to_x(prepared.offset as u64) + prepared.half_width;
@@ -3289,16 +3455,6 @@ fn draw_tpo_profiles(
                     Size::new(width, row_body_h),
                     extension_fill,
                 );
-                frame.stroke(
-                    &Path::line(Point::new(profile_right, y), Point::new(tag_x, y)),
-                    Stroke::with_color(
-                        Stroke {
-                            width: line_width,
-                            ..Default::default()
-                        },
-                        extension_line,
-                    ),
-                );
             }
         }
     }
@@ -3321,22 +3477,6 @@ fn draw_tpo_profiles(
             visible_high,
             visible_low,
             prepared.opacity,
-        );
-    }
-
-    if let Some(composite) = structural_composite {
-        draw_structural_composite(
-            frame,
-            &interval_to_x,
-            &price_to_y,
-            &tick_aggr.datapoints,
-            composite,
-            cell_width,
-            cell_height,
-            scaling,
-            palette,
-            visible_high,
-            visible_low,
         );
     }
 }
@@ -3375,152 +3515,75 @@ struct PreparedTpoProfile<'a> {
     opacity: f32,
 }
 
-#[allow(clippy::too_many_arguments)]
-fn draw_structural_composite(
+const STRUCTURAL_COMPOSITE_BAND_ALPHA: f32 = 0.06;
+const _: () = assert!(STRUCTURAL_COMPOSITE_BAND_ALPHA <= 0.06);
+const TPO_SINGLE_PRINT_HIGHLIGHT_ALPHA: f32 = 0.22;
+const TPO_SINGLE_PRINT_INK_ALPHA: f32 = 0.92;
+
+fn tpo_single_print_highlight_height(cell_height: f32, scaling: f32) -> f32 {
+    let one_screen_pixel = 1.0 / scaling.max(0.1);
+    cell_height.max(one_screen_pixel)
+}
+
+fn draw_structural_composite_band(
     frame: &mut canvas::Frame,
     interval_to_x: &impl Fn(u64) -> f32,
     price_to_y: &impl Fn(Price) -> f32,
     datapoints: &[data::aggr::ticks::TickAccumulation],
-    composite: &StructuralComposite,
     cell_width: f32,
-    cell_height: f32,
-    scaling: f32,
+    visible_left: f32,
+    visible_right: f32,
+    composite: &StructuralComposite,
     palette: &Extended,
-    visible_high: Price,
-    visible_low: Price,
 ) {
-    let offset_for = |matches: &dyn Fn(&TpoProfile) -> bool| {
-        datapoints
-            .iter()
-            .position(|datapoint| datapoint.tpo.as_ref().is_some_and(matches))
-            .and_then(|raw| datapoints.len().checked_sub(raw.saturating_add(1)))
-    };
-    let Some(oldest_offset) = offset_for(&|profile| profile.start == composite.start) else {
+    let Some(start_offset) = structural_composite_start_offset(datapoints, composite) else {
         return;
     };
-    let Some(newest_offset) = offset_for(&|profile| profile.end == composite.end) else {
-        return;
-    };
-
-    let oldest_x = interval_to_x(oldest_offset as u64);
-    let newest_x = interval_to_x(newest_offset as u64);
-    let left = oldest_x.min(newest_x) - cell_width * 0.48;
-    let right = oldest_x.max(newest_x) + cell_width * 0.48;
-    let width = right - left;
-    if !left.is_finite() || !right.is_finite() || width <= 0.0 {
+    let left = (interval_to_x(start_offset as u64) - cell_width * 0.48).max(visible_left);
+    let (high, low) = structural_composite_band(composite);
+    let high_y = price_to_y(high);
+    let low_y = price_to_y(low);
+    let top = high_y.min(low_y);
+    let height = (high_y - low_y).abs();
+    let width = visible_right - left;
+    if !left.is_finite()
+        || !visible_right.is_finite()
+        || !top.is_finite()
+        || !height.is_finite()
+        || width <= 0.0
+        || height <= 0.0
+    {
         return;
     }
 
-    let scale = scaling.max(0.1);
-    let min_chart_px = 1.0 / scale;
-    let balance_high_y = price_to_y(composite.balance_high);
-    let balance_low_y = price_to_y(composite.balance_low);
-    let top = balance_high_y.min(balance_low_y);
-    let bottom = balance_high_y.max(balance_low_y);
-    let height = bottom - top;
-    let color = palette.primary.base.color;
-    if top.is_finite() && bottom.is_finite() && height > 0.0 {
-        frame.fill_rectangle(
-            Point::new(left, top),
-            Size::new(width, height),
-            color.scale_alpha(0.045),
-        );
-        frame.stroke(
-            &Path::rectangle(Point::new(left, top), Size::new(width, height)),
-            Stroke::with_color(
-                Stroke {
-                    width: min_chart_px,
-                    ..Default::default()
-                },
-                color.scale_alpha(0.55),
-            ),
-        );
-    }
+    frame.fill_rectangle(
+        Point::new(left, top),
+        Size::new(width, height),
+        palette
+            .primary
+            .base
+            .color
+            .scale_alpha(STRUCTURAL_COMPOSITE_BAND_ALPHA),
+    );
+}
 
-    let max_count = composite.rows.values().copied().max().unwrap_or(1).max(1);
-    let histogram_left = left + width * 0.04;
-    let histogram_width = width * 0.92;
-    let row_height = (cell_height * 0.84).max(min_chart_px);
-    let (visible_low, visible_high) = if visible_low <= visible_high {
-        (visible_low, visible_high)
-    } else {
-        (visible_high, visible_low)
-    };
-    for (price, count) in &composite.rows {
-        if *price < visible_low || *price > visible_high {
-            continue;
-        }
-        let y = price_to_y(*price);
-        if !y.is_finite() {
-            continue;
-        }
-        let bar_width = (histogram_width * (*count as f32 / max_count as f32)).max(min_chart_px);
-        let in_value_area =
-            *price >= composite.value_area_low && *price <= composite.value_area_high;
-        let alpha = if *price == composite.poc {
-            0.82
-        } else if in_value_area {
-            0.52
-        } else {
-            0.22
-        };
-        frame.fill_rectangle(
-            Point::new(histogram_left, y - row_height * 0.5),
-            Size::new(bar_width, row_height),
-            color.scale_alpha(alpha),
-        );
-    }
+fn structural_composite_start_offset(
+    datapoints: &[data::aggr::ticks::TickAccumulation],
+    composite: &StructuralComposite,
+) -> Option<usize> {
+    datapoints
+        .iter()
+        .position(|datapoint| {
+            datapoint
+                .tpo
+                .as_ref()
+                .is_some_and(|profile| profile.start == composite.start)
+        })
+        .and_then(|raw| datapoints.len().checked_sub(raw.saturating_add(1)))
+}
 
-    let line = |alpha: f32, extra_width: f32| {
-        Stroke::with_color(
-            Stroke {
-                width: min_chart_px + extra_width / scale,
-                ..Default::default()
-            },
-            color.scale_alpha(alpha),
-        )
-    };
-    for (price, label) in [
-        (composite.value_area_high, "CVAH"),
-        (composite.value_area_low, "CVAL"),
-    ] {
-        let y = price_to_y(price);
-        if y.is_finite() {
-            frame.stroke(
-                &Path::line(Point::new(left, y), Point::new(right, y)),
-                line(0.82, 1.0),
-            );
-            if width * scale >= 100.0 {
-                draw_cluster_text(
-                    frame,
-                    label,
-                    Point::new(right - 3.0 / scale, y),
-                    10.0 / scale,
-                    color,
-                    Alignment::End,
-                    Alignment::Center,
-                );
-            }
-        }
-    }
-    let poc_y = price_to_y(composite.poc);
-    if poc_y.is_finite() {
-        frame.stroke(
-            &Path::line(Point::new(left, poc_y), Point::new(right, poc_y)),
-            line(0.95, 0.0),
-        );
-    }
-    if top.is_finite() && width * scale >= 120.0 {
-        draw_cluster_text(
-            frame,
-            &format!("3D BAL · {}D", composite.profile_count),
-            Point::new(left + 4.0 / scale, top + 4.0 / scale),
-            11.0 / scale,
-            color,
-            Alignment::Start,
-            Alignment::Start,
-        );
-    }
+fn structural_composite_band(composite: &StructuralComposite) -> (Price, Price) {
+    (composite.value_area_high, composite.value_area_low)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3534,7 +3597,6 @@ fn prepare_tpo_render<'a>(
     row_step: PriceStep,
     visible_high: Price,
     visible_low: Price,
-    structural_composite: Option<&StructuralComposite>,
 ) -> Vec<PreparedTpoProfile<'a>> {
     if end_idx < start_idx {
         return Vec::new();
@@ -3564,13 +3626,11 @@ fn prepare_tpo_render<'a>(
         let Some(profile) = datapoint.tpo.as_ref() else {
             continue;
         };
-        let in_structural_composite =
-            structural_composite.is_some_and(|composite| composite.contains_profile(profile));
         let max_row_count = tpo_profile_max_row_count(profile);
         let half_width = 0.5 * tpo_profile_width(config, max_row_count, cell_width, scaling);
 
         if offset >= start_idx {
-            let single_print_bounds = if config.show_single_prints && !in_structural_composite {
+            let single_print_bounds = if config.show_single_prints {
                 profile.single_print_bounds()
             } else {
                 None
@@ -3601,7 +3661,7 @@ fn prepare_tpo_render<'a>(
                 half_width,
                 single_print_bounds,
                 extensions,
-                opacity: if in_structural_composite { 0.20 } else { 1.0 },
+                opacity: 1.0,
             });
         }
 
@@ -3745,10 +3805,12 @@ fn draw_tpo_profile(
         mix_color(base_profile_color, palette.background.base.text, 0.82).scale_alpha(opacity);
     let profile_muted =
         mix_color(base_profile_color, palette.background.base.color, 0.32).scale_alpha(opacity);
-    // Warning is the theme's yellow/orange semantic color. Keep the single
-    // print ink and its full-row band deliberately faint while remaining
-    // independent of bullish/bearish profile direction.
-    let single_print_color = |alpha: f32| palette.warning.base.color.scale_alpha(alpha * opacity);
+    // Single prints share the TPO chart's blue profile ink, regardless of the
+    // profile direction. Their full-row highlight has no padding or stroke, so
+    // consecutive singles read as one borderless region.
+    let single_print_color = |alpha: f32| buy_color.scale_alpha(alpha * opacity);
+    let single_print_highlight_height = tpo_single_print_highlight_height(cell_height, scaling);
+    let single_print_highlight_half = single_print_highlight_height * 0.5;
     let y_pad = (cell_height * 2.0).max(4.0 / scale);
 
     let y_hi = price_to_y(visible_high);
@@ -3783,19 +3845,19 @@ fn draw_tpo_profile(
             );
         }
 
-        // Faint full-width band behind single prints so un-auctioned territory
-        // stands out even when letters collapse into bars.
+        // Full-width borderless band behind single prints so un-auctioned
+        // territory stays visible and adjacent single rows merge continuously.
         if is_single {
             frame.fill_rectangle(
-                Point::new(left, y - half_body),
-                Size::new(profile_width, half_body * 2.0),
-                single_print_color(0.14),
+                Point::new(left, y - single_print_highlight_half),
+                Size::new(profile_width, single_print_highlight_height),
+                single_print_color(TPO_SINGLE_PRINT_HIGHLIGHT_ALPHA),
             );
         }
 
         if compact_row_bars {
             let color = if is_single {
-                single_print_color(0.72)
+                single_print_color(TPO_SINGLE_PRINT_INK_ALPHA)
             } else if is_poc && config.show_poc {
                 profile_strong
             } else if config.show_value_area && in_value_area {
@@ -3816,7 +3878,7 @@ fn draw_tpo_profile(
         for (ordinal, block) in row.blocks.iter().enumerate() {
             let x = left + (ordinal as f32 + 0.5) * block_width;
             let base_color = if is_single {
-                single_print_color(0.72)
+                single_print_color(TPO_SINGLE_PRINT_INK_ALPHA)
             } else if is_poc && config.show_poc {
                 profile_strong
             } else if config.show_value_area && in_value_area {
@@ -3973,6 +4035,7 @@ fn draw_footprint_kline(
     price_to_y: impl Fn(Price) -> f32,
     x_position: f32,
     candle_width: f32,
+    scaling: f32,
     kline: &Kline,
     palette: &Extended,
 ) {
@@ -3994,7 +4057,9 @@ fn draw_footprint_kline(
     };
 
     let body_h = (y_open - y_close).abs().max(candle_width * 0.18);
-    let wick_w = (candle_width * 0.34).max(1.0);
+    // Footprint bodies grow with the column, but the reference wick stays a
+    // crisp hairline at every canvas zoom level.
+    let wick_w = footprint_wick_width(scaling);
     frame.fill_rectangle(
         Point::new(x_position - wick_w / 2.0, y_high.min(y_low)),
         Size::new(wick_w, (y_high - y_low).abs()),
@@ -4005,6 +4070,10 @@ fn draw_footprint_kline(
         Size::new(candle_width, body_h),
         body_color,
     );
+}
+
+fn footprint_wick_width(scaling: f32) -> f32 {
+    1.0 / scaling.max(0.1)
 }
 
 fn draw_candle_dp(
@@ -4280,14 +4349,18 @@ fn cluster_label_size(available_w: f32, cell_h: f32, scaling: f32) -> Option<f32
     let scaling = scaling.max(0.1);
     let screen_h = cell_h * scaling;
     let screen_w = available_w.max(0.0) * scaling;
-    // Keep values visible while zoomed/panned away — shrink the font instead
-    // of dropping it, and only hide labels once they'd be a smudge.
-    if screen_h < 4.5 || screen_w < 10.0 {
+    // Never draw unreadably tiny values. Zoomed-out footprints retain their
+    // histograms, then labels return once the row and column are large enough.
+    if screen_h < 7.0 || screen_w < 22.0 {
         return None;
     }
-    // ~5-character labels ("12.3k") in a monospace chart font.
-    let size = (screen_w / 4.6).min(screen_h * 0.72).min(14.0);
-    (size >= 4.5).then_some(size / scaling)
+    // Six-character labels ("12.63m") in Azeret Mono need roughly 3.6 font
+    // units of horizontal room. Use more of each row and allow title-sized
+    // values when the user zooms in.
+    let size = (screen_w / 3.6)
+        .min(screen_h * 0.78)
+        .min(style::text_size::TITLE);
+    (size >= 7.0).then_some(size / scaling)
 }
 
 fn draw_clusters(
@@ -4333,7 +4406,7 @@ fn draw_clusters(
                 imbalance.is_some(),
             );
             let text_size = cluster_label_size(area.bars_width, layout.cell_h, scaling);
-            let bar_alpha = if text_size.is_some() { 0.25 } else { 1.0 };
+            let bar_alpha = if text_size.is_some() { 0.36 } else { 1.0 };
 
             for (price, group) in &footprint.trades {
                 if *price < draw_low || *price > draw_high {
@@ -4376,18 +4449,6 @@ fn draw_clusters(
                     }
                     ClusterKind::DeltaProfile => {
                         let delta = buy_qty - sell_qty;
-                        if let Some(text_size) = text_size {
-                            draw_cluster_text(
-                                frame,
-                                &abbr_large_numbers(delta),
-                                Point::new(area.bars_left, y),
-                                text_size,
-                                text_color,
-                                Alignment::Start,
-                                Alignment::Center,
-                            );
-                        }
-
                         let bar_width = ((delta.abs() / max_cluster_qty) as f32 * area.bars_width)
                             .clamp(0.0, area.bars_width);
                         if bar_width > 0.0 {
@@ -4400,6 +4461,18 @@ fn draw_clusters(
                                 Point::new(area.bars_left, y - (layout.cell_h / 2.0)),
                                 Size::new(bar_width, layout.cell_h),
                                 color,
+                            );
+                        }
+
+                        if let Some(text_size) = text_size {
+                            draw_cluster_text(
+                                frame,
+                                &abbr_large_numbers(delta),
+                                Point::new(area.bars_left, y),
+                                text_size,
+                                text_color,
+                                Alignment::Start,
+                                Alignment::Center,
                             );
                         }
                     }
@@ -4438,6 +4511,7 @@ fn draw_clusters(
                 &price_to_y,
                 area.candle_center_x,
                 layout.candle_w,
+                scaling,
                 kline,
                 layout.pal,
             );
@@ -4450,7 +4524,15 @@ fn draw_clusters(
                 layout.gaps,
                 imbalance.is_some(),
             );
-            let area = TableArea::new(frame, &price_to_y, &tl, layout.candle_w, kline, layout.pal);
+            let area = TableArea::new(
+                frame,
+                &price_to_y,
+                &tl,
+                layout.candle_w,
+                scaling,
+                kline,
+                layout.pal,
+            );
             table_layout = Some(tl);
             let table_width = area.width();
             let half_width = table_width / 2.0;
@@ -4603,7 +4685,13 @@ fn draw_clusters(
                 layout.cell_h,
                 scaling,
             );
-            let bar_alpha = if text_size.is_some() { 0.25 } else { 1.0 };
+            // Width now carries the volume hierarchy, so retain the original
+            // subdued theme colors behind readable labels.
+            let bar_alpha = if text_size.is_some() { 0.36 } else { 1.0 };
+            let bar_border = bid_ask_bar_border_width(scaling);
+            let row_border = 1.0 / scaling.max(0.1);
+            let text_midpoint_padding = bid_ask_text_padding(scaling);
+            let poc_outline_padding = bid_ask_poc_outline_padding(scaling);
 
             for (price, group) in &footprint.trades {
                 if *price < draw_low || *price > draw_high {
@@ -4614,50 +4702,90 @@ fn draw_clusters(
                 let buy_qty = usd_notional(*price, buy_base, qty_is_quote);
                 let sell_qty = usd_notional(*price, sell_base, qty_is_quote);
                 let y = price_to_y(*price);
+                let row_top = y - (layout.cell_h / 2.0);
 
                 if buy_qty > 0.0 && right_area_width > 0.0 {
-                    if let Some(text_size) = text_size {
-                        draw_cluster_text(
-                            frame,
-                            &abbr_large_numbers(buy_qty),
-                            Point::new(area.bid_area_left, y),
-                            text_size,
-                            text_color,
-                            Alignment::Start,
-                            Alignment::Center,
-                        );
-                    }
-
-                    let bar_width = ((buy_qty / max_cluster_qty) as f32 * right_area_width)
-                        .clamp(0.0, right_area_width);
+                    let bar_width =
+                        bid_ask_bar_width(buy_qty, max_cluster_qty, right_area_width, scaling);
                     if bar_width > 0.0 {
                         frame.fill_rectangle(
-                            Point::new(area.bid_area_left, y - (layout.cell_h / 2.0)),
+                            Point::new(area.bid_area_left, row_top),
                             Size::new(bar_width, layout.cell_h),
                             layout.pal.success.base.color.scale_alpha(bar_alpha),
+                        );
+                        frame.stroke(
+                            &Path::rectangle(
+                                Point::new(area.bid_area_left, row_top),
+                                Size::new(bar_width, layout.cell_h),
+                            ),
+                            Stroke::default()
+                                .with_color(Color::BLACK.scale_alpha(0.8))
+                                .with_width(bar_border),
                         );
                     }
                 }
                 if sell_qty > 0.0 && left_area_width > 0.0 {
-                    if let Some(text_size) = text_size {
+                    let bar_width =
+                        bid_ask_bar_width(sell_qty, max_cluster_qty, left_area_width, scaling);
+                    if bar_width > 0.0 {
+                        frame.fill_rectangle(
+                            Point::new(area.ask_area_right - bar_width, row_top),
+                            Size::new(bar_width, layout.cell_h),
+                            layout.pal.danger.base.color.scale_alpha(bar_alpha),
+                        );
+                        frame.stroke(
+                            &Path::rectangle(
+                                Point::new(area.ask_area_right - bar_width, row_top),
+                                Size::new(bar_width, layout.cell_h),
+                            ),
+                            Stroke::default()
+                                .with_color(Color::BLACK.scale_alpha(0.8))
+                                .with_width(bar_border),
+                        );
+                    }
+                }
+
+                if footprint
+                    .poc
+                    .as_ref()
+                    .is_some_and(|poc| poc.price == *price)
+                {
+                    frame.stroke(
+                        &Path::rectangle(
+                            Point::new(area.ask_area_left - poc_outline_padding, row_top),
+                            Size::new(
+                                area.bid_area_right - area.ask_area_left
+                                    + (2.0 * poc_outline_padding),
+                                layout.cell_h,
+                            ),
+                        ),
+                        Stroke::default()
+                            .with_color(layout.pal.primary.strong.color)
+                            .with_width(row_border),
+                    );
+                }
+
+                if let Some(text_size) = text_size {
+                    if sell_qty > 0.0 && left_area_width > 0.0 {
                         draw_cluster_text(
                             frame,
                             &abbr_large_numbers(sell_qty),
-                            Point::new(area.ask_area_right, y),
+                            Point::new(area.ask_area_right - text_midpoint_padding, y),
                             text_size,
                             text_color,
                             Alignment::End,
                             Alignment::Center,
                         );
                     }
-
-                    let bar_width = ((sell_qty / max_cluster_qty) as f32 * left_area_width)
-                        .clamp(0.0, left_area_width);
-                    if bar_width > 0.0 {
-                        frame.fill_rectangle(
-                            Point::new(area.ask_area_right - bar_width, y - (layout.cell_h / 2.0)),
-                            Size::new(bar_width, layout.cell_h),
-                            layout.pal.danger.base.color.scale_alpha(bar_alpha),
+                    if buy_qty > 0.0 && right_area_width > 0.0 {
+                        draw_cluster_text(
+                            frame,
+                            &abbr_large_numbers(buy_qty),
+                            Point::new(area.bid_area_left + text_midpoint_padding, y),
+                            text_size,
+                            text_color,
+                            Alignment::Start,
+                            Alignment::Center,
                         );
                     }
                 }
@@ -4696,6 +4824,7 @@ fn draw_clusters(
                 &price_to_y,
                 area.candle_center_x,
                 layout.candle_w,
+                scaling,
                 kline,
                 layout.pal,
             );
@@ -4769,6 +4898,34 @@ fn usd_notional(price: Price, qty: f64, qty_is_quote: bool) -> f64 {
     } else {
         price.to_f64() * qty
     }
+}
+
+fn bid_ask_bar_width(qty: f64, max_qty: f64, area_width: f32, scaling: f32) -> f32 {
+    if qty <= 0.0 || max_qty <= 0.0 || area_width <= 0.0 {
+        return 0.0;
+    }
+
+    // A linear profile makes every row below the candle maximum look almost
+    // empty (for example, 3M beside a 33M maximum only uses 9% of the lane).
+    // The reference footprint uses a much stronger visual hierarchy. A smooth
+    // square-root curve expands low, medium, and high-volume rows while
+    // remaining monotonic and keeping the candle maximum at full width. `sqrt`
+    // also keeps this per-row render path materially cheaper than `powf`.
+    let ratio = (qty / max_qty).clamp(0.0, 1.0) as f32;
+    let emphasized = ratio.sqrt() * area_width;
+    emphasized.max(2.0 / scaling.max(0.1)).min(area_width)
+}
+
+fn bid_ask_text_padding(scaling: f32) -> f32 {
+    3.0 / scaling.max(0.1)
+}
+
+fn bid_ask_bar_border_width(scaling: f32) -> f32 {
+    0.75 / scaling.max(0.1)
+}
+
+fn bid_ask_poc_outline_padding(scaling: f32) -> f32 {
+    3.0 / scaling.max(0.1)
 }
 
 fn max_cluster_notional(footprint: &KlineTrades, cluster: ClusterKind, qty_is_quote: bool) -> f64 {
@@ -5189,10 +5346,12 @@ struct ContentGaps {
     marker_to_candle: f32,
     /// Space between candle body and clusters
     candle_to_cluster: f32,
+    /// Leading breathing room before the Bid x Ask candle
+    candle_leading: f32,
+    /// Extra breathing room between the Bid x Ask candle and its ladder
+    candle_to_ladder: f32,
     /// Inner space reserved between imb. markers and clusters (used for BidAsk)
     marker_to_bars: f32,
-    /// Gutter between the sell and buy halves in BidAsk mode
-    bid_to_ask: f32,
 }
 
 impl ContentGaps {
@@ -5202,8 +5361,9 @@ impl ContentGaps {
         Self {
             marker_to_candle: base,
             candle_to_cluster: base,
+            candle_leading: px(2.0),
+            candle_to_ladder: base + px(5.0),
             marker_to_bars: px(2.0),
-            bid_to_ask: px(8.0),
         }
     }
 }
@@ -5267,19 +5427,19 @@ struct BidAskArea {
 
 impl BidAskArea {
     fn new(content_left: f32, content_right: f32, candle_width: f32, spacing: ContentGaps) -> Self {
-        // Candle lives in its own lane on the left edge of the cell, both
-        // histograms sit to its right (reference footprint layout).
-        let candle_center_x = content_left + candle_width / 2.0;
-        let hist_left =
-            (content_left + candle_width + spacing.candle_to_cluster).min(content_right);
+        // Candle lives in its own padded lane on the left edge of the cell,
+        // with a small separator from both the previous and current ladders.
+        let candle_left = content_left + spacing.candle_leading;
+        let candle_center_x = candle_left + candle_width / 2.0;
+        let hist_left = (candle_left + candle_width + spacing.candle_to_ladder).min(content_right);
         let half_width = ((content_right - hist_left) / 2.0).max(0.0);
 
-        // Keep a readable gutter between the sell and buy halves.
+        // Bid and ask share one exact midpoint, matching the compact ladder in
+        // the reference instead of leaving an artificial middle gutter.
         let mid = hist_left + half_width;
-        let gutter = spacing.bid_to_ask.min(half_width);
         let ask_area_left = hist_left;
-        let ask_area_right = (mid - gutter / 2.0).max(hist_left);
-        let bid_area_left = (mid + gutter / 2.0).min(content_right);
+        let ask_area_right = mid;
+        let bid_area_left = mid;
         let bid_area_right = content_right;
 
         Self {
@@ -5337,6 +5497,7 @@ impl TableArea {
         price_to_y: &impl Fn(Price) -> f32,
         table_layout: &TableLayout,
         candle_width: f32,
+        scaling: f32,
         kline: &Kline,
         palette: &Extended,
     ) -> Self {
@@ -5345,6 +5506,7 @@ impl TableArea {
             price_to_y,
             table_layout.candle_center_x,
             candle_width,
+            scaling,
             kline,
             palette,
         );
@@ -5508,6 +5670,16 @@ mod tests {
     }
 
     #[test]
+    fn tpo_single_print_highlights_fill_adjacent_rows_without_gaps() {
+        let cell_height = 12.0;
+        let scaling = 2.0;
+        let highlight_height = tpo_single_print_highlight_height(cell_height, scaling);
+
+        assert_eq!(highlight_height, cell_height);
+        assert_eq!(tpo_single_print_highlight_height(0.2, scaling), 0.5);
+    }
+
+    #[test]
     fn tpo_single_print_extension_stops_at_first_future_tag() {
         let config = TpoConfig {
             ticks_per_row: 1,
@@ -5568,7 +5740,6 @@ mod tests {
             step,
             Price::from_f64(1_000.0),
             Price::from_f64(0.0),
-            None,
         );
 
         let mut extension_count = 0usize;
@@ -5616,7 +5787,6 @@ mod tests {
             step,
             Price::from_f64(241.0),
             Price::from_f64(240.0),
-            None,
         );
         let padded_low = Price::from_units(Price::from_f64(240.0).units - step.units);
         let padded_high = Price::from_units(Price::from_f64(241.0).units + step.units);
@@ -5634,7 +5804,7 @@ mod tests {
     }
 
     #[test]
-    fn structural_composite_render_plan_dims_only_completed_member_profiles() {
+    fn structural_composite_render_plan_preserves_member_profiles() {
         let config = TpoConfig {
             ticks_per_row: 1,
             profiles_to_load: 4,
@@ -5657,24 +5827,40 @@ mod tests {
             step,
             Price::from_f64(1_000.0),
             Price::from_f64(0.0),
-            Some(&composite),
         );
         let member_profiles = prepared
             .iter()
-            .filter(|profile| profile.opacity < 1.0)
+            .filter(|profile| composite.contains_profile(profile.profile))
             .collect::<Vec<_>>();
         assert_eq!(member_profiles.len(), 3);
-        assert!(member_profiles.iter().all(|profile| {
-            profile.extensions.is_empty()
-                && composite.contains_profile(profile.profile)
-                && (profile.opacity - 0.20).abs() < f32::EPSILON
-        }));
-        assert_eq!(
+        assert!(
             prepared
                 .iter()
-                .filter(|profile| profile.opacity == 1.0)
-                .count(),
-            1
+                .all(|profile| (profile.opacity - 1.0).abs() < f32::EPSILON),
+            "the composite band must not dim member profiles"
+        );
+    }
+
+    #[test]
+    fn structural_composite_band_uses_only_value_area_high_and_low() {
+        let config = TpoConfig {
+            ticks_per_row: 1,
+            profiles_to_load: 4,
+            show_three_day_composite: true,
+            ..TpoConfig::default()
+        };
+        let (_, tick_aggr) = tpo_single_print_fixture(config, 4);
+        let now = UnixMs::new(3 * TpoProfilePeriod::Day.millis() + 1);
+        let composite = structural_composite_for_render(&tick_aggr.datapoints, config, now)
+            .expect("three completed days form the fixture balance");
+
+        assert_eq!(
+            structural_composite_band(&composite),
+            (composite.value_area_high, composite.value_area_low)
+        );
+        assert_eq!(
+            structural_composite_start_offset(&tick_aggr.datapoints, &composite),
+            Some(3)
         );
     }
 
@@ -5760,7 +5946,6 @@ mod tests {
                 step,
                 Price::from_f64(1_000_000.0),
                 Price::from_f64(-1_000_000.0),
-                None,
             );
             let checksum = prepared
                 .iter()
@@ -5830,7 +6015,6 @@ mod tests {
                 step,
                 Price::from_f64(1_000_000.0),
                 Price::from_f64(-1_000_000.0),
-                Some(&composite),
             );
             checksum = composite
                 .rows
@@ -6018,6 +6202,115 @@ mod tests {
 
         chart.configure_footprint_history(vec![bybit, binance], false);
         assert_eq!(chart.pva_klines.sources(), &[bybit]);
+    }
+
+    #[test]
+    fn previous_value_area_first_pages_are_stable_and_not_duplicated() {
+        let binance = TickerInfo::new(
+            Ticker::new("BTCUSDT", Exchange::BinanceLinear),
+            0.1,
+            0.001,
+            None,
+        );
+        let bybit = TickerInfo::new(
+            Ticker::new("BTCUSDT", Exchange::BybitLinear),
+            0.1,
+            0.001,
+            None,
+        );
+        let mut chart = KlineChart::new(
+            ViewConfig::default(),
+            Basis::Time(Timeframe::M15),
+            PriceStep::from(binance.min_ticksize),
+            &[],
+            Vec::new(),
+            &[KlineIndicator::PreviousValueArea],
+            binance,
+            &KlineChartKind::Candles,
+            None,
+        );
+        chart.configure_footprint_history(vec![binance, bybit], true);
+        let letter_tf = chart
+            .visual_config
+            .previous_value_area_tpo_config()
+            .letter_timeframe();
+
+        let Action::RequestFetch(first) = chart
+            .fetch_pva_seed_klines()
+            .expect("the first source needs an initial PVA page")
+        else {
+            panic!("PVA seed should request klines");
+        };
+        let Action::RequestFetch(second) = chart
+            .fetch_pva_seed_klines()
+            .expect("the pending first source must allow the second source to start")
+        else {
+            panic!("PVA seed should request klines");
+        };
+        let FetchRange::Kline(_, first_end) = first[0].fetch else {
+            panic!("PVA seed should request klines");
+        };
+        let FetchRange::Kline(_, second_end) = second[0].fetch else {
+            panic!("PVA seed should request klines");
+        };
+
+        assert_eq!(
+            first[0].stream.expect("explicit source").ticker_info(),
+            binance
+        );
+        assert_eq!(
+            second[0].stream.expect("explicit source").ticker_info(),
+            bybit
+        );
+        assert_eq!(first_end, first_end.floor_to(letter_tf));
+        assert_eq!(second_end, second_end.floor_to(letter_tf));
+        assert!(
+            chart.fetch_pva_seed_klines().is_none(),
+            "pending stable pages must suppress duplicate requests"
+        );
+    }
+
+    #[test]
+    fn previous_value_area_top_up_fetches_forward_from_latest_bar() {
+        let source = TickerInfo::new(
+            Ticker::new("BTCUSDT", Exchange::BinanceLinear),
+            0.1,
+            0.001,
+            None,
+        );
+        let mut chart = KlineChart::new(
+            ViewConfig::default(),
+            Basis::Time(Timeframe::M15),
+            PriceStep::from(source.min_ticksize),
+            &[],
+            Vec::new(),
+            &[KlineIndicator::PreviousValueArea],
+            source,
+            &KlineChartKind::Candles,
+            None,
+        );
+        let letter_tf = chart
+            .visual_config
+            .previous_value_area_tpo_config()
+            .letter_timeframe();
+        let page_now = UnixMs::now().floor_to(letter_tf);
+        let stale = page_now.saturating_sub(2 * letter_tf.to_milliseconds());
+        chart
+            .pva_klines
+            .insert(source, &[seed_kline(stale, 68_000.0)]);
+
+        let Action::RequestFetch(specs) = chart
+            .fetch_pva_seed_klines()
+            .expect("stale PVA history needs a forward top-up")
+        else {
+            panic!("PVA top-up should request klines");
+        };
+        let FetchRange::Kline(from, to) = specs[0].fetch else {
+            panic!("PVA top-up should request klines");
+        };
+
+        assert_eq!(from, stale.saturating_add(1));
+        assert!(to > from, "top-up must cover bars newer than the cache");
     }
 
     #[test]
@@ -6459,9 +6752,150 @@ mod tests {
 
     #[test]
     fn cluster_labels_hide_when_the_cell_is_too_small() {
-        assert!(cluster_label_size(40.0, 16.0, 1.0).is_some());
+        assert!(cluster_label_size(40.0, 16.0, 1.0).is_some_and(|size| size >= 10.0));
         assert!(cluster_label_size(10.0, 16.0, 1.0).is_none());
         assert!(cluster_label_size(80.0, 4.0, 1.0).is_none());
+    }
+
+    #[test]
+    fn bid_ask_defaults_provide_readable_histograms_and_values() {
+        let kind = KlineChartKind::Footprint {
+            clusters: ClusterKind::BidAsk,
+            scaling: ClusterScaling::default(),
+            studies: vec![],
+        };
+        let cell_width = kind.default_cell_width();
+        let scaling = 1.0;
+        let candle_width = cell_width * 0.1;
+        let inset = cell_width * 0.02;
+        let content_left = -(cell_width / 2.0) + inset;
+        let content_right = cell_width / 2.0 - inset;
+        let area = BidAskArea::new(
+            content_left,
+            content_right,
+            candle_width,
+            ContentGaps::from_view(candle_width, scaling),
+        );
+        let right_width = area.bid_area_right - area.bid_area_left;
+        let left_width = area.ask_area_right - area.ask_area_left;
+        let candle_left = area.candle_center_x - candle_width / 2.0;
+        let candle_leading = candle_left - content_left;
+        let candle_right = area.candle_center_x + candle_width / 2.0;
+        let candle_to_ladder = area.ask_area_left - candle_right;
+        let candle_to_poc_outline =
+            area.ask_area_left - bid_ask_poc_outline_padding(scaling) - candle_right;
+        let label_size = cluster_label_size(left_width.min(right_width), 18.0, scaling)
+            .expect("default Bid x Ask labels should be readable");
+
+        assert_eq!(cell_width, 104.0);
+        assert_eq!(cell_width, ClusterKind::BidAsk.min_footprint_width());
+        assert!(
+            (area.ask_area_right - area.bid_area_left).abs() < f32::EPSILON,
+            "Bid x Ask midpoint had a gap"
+        );
+        assert!(
+            (left_width - right_width).abs() < 0.001,
+            "Bid x Ask halves were not symmetric"
+        );
+        assert!(
+            candle_leading >= 2.0,
+            "leading candle gap was {candle_leading}"
+        );
+        assert!(
+            candle_to_ladder >= 7.0,
+            "candle-to-ladder gap was {candle_to_ladder}"
+        );
+        assert!(
+            candle_to_poc_outline >= 4.0,
+            "candle-to-POC-outline gap was {candle_to_poc_outline}"
+        );
+        assert!(left_width >= 40.0, "left histogram width was {left_width}");
+        assert!(
+            right_width >= 40.0,
+            "right histogram width was {right_width}"
+        );
+        assert!(label_size >= 11.0, "label size was {label_size}");
+    }
+
+    #[test]
+    fn footprint_wick_and_small_histograms_stay_visible_in_screen_pixels() {
+        for scaling in [0.25, 1.0, 4.0, 16.0] {
+            assert!((footprint_wick_width(scaling) * scaling - 1.0).abs() < f32::EPSILON);
+            assert!((bid_ask_text_padding(scaling) * scaling - 3.0).abs() < f32::EPSILON);
+            assert!((bid_ask_bar_border_width(scaling) * scaling - 0.75).abs() < f32::EPSILON);
+            assert!((bid_ask_poc_outline_padding(scaling) * scaling - 3.0).abs() < f32::EPSILON);
+            let gaps = ContentGaps::from_view(10.4 / scaling, scaling);
+            assert!((gaps.candle_leading * scaling - 2.0).abs() < f32::EPSILON);
+            assert!(gaps.candle_to_ladder * scaling >= 7.0);
+            assert!(bid_ask_bar_width(1.0, 1_000.0, 40.0, scaling) * scaling >= 2.0);
+        }
+
+        assert_eq!(bid_ask_bar_width(1_000.0, 1_000.0, 40.0, 1.0), 40.0);
+        assert_eq!(bid_ask_bar_width(0.0, 1_000.0, 40.0, 1.0), 0.0);
+    }
+
+    #[test]
+    fn bid_ask_histograms_emphasize_medium_and_high_volume_rows() {
+        let lane_width = 42.0;
+        let max_qty = 33.0;
+        let low = bid_ask_bar_width(3.0, max_qty, lane_width, 1.0);
+        let medium = bid_ask_bar_width(15.0, max_qty, lane_width, 1.0);
+        let high = bid_ask_bar_width(25.0, max_qty, lane_width, 1.0);
+        let maximum = bid_ask_bar_width(max_qty, max_qty, lane_width, 1.0);
+
+        assert!(low >= 12.5, "3M row was still visually negligible: {low}");
+        assert!(
+            medium >= 28.0,
+            "15M row did not receive enough emphasis: {medium}"
+        );
+        assert!(
+            high >= 36.5,
+            "25M row did not receive enough emphasis: {high}"
+        );
+        assert!(low < medium && medium < high && high < maximum);
+        assert_eq!(maximum, lane_width);
+    }
+
+    #[test]
+    fn footprint_can_pan_and_zoom_beyond_the_old_limits() {
+        let source = TickerInfo::new(
+            Ticker::new("BTCUSDT", Exchange::BinanceLinear),
+            0.1,
+            0.001,
+            None,
+        );
+        let kind = KlineChartKind::Footprint {
+            clusters: ClusterKind::BidAsk,
+            scaling: ClusterScaling::default(),
+            studies: vec![],
+        };
+        let mut chart = KlineChart::new(
+            ViewConfig::default(),
+            Basis::Time(Timeframe::M1),
+            PriceStep::from(source.min_ticksize),
+            &[],
+            Vec::new(),
+            &[],
+            source,
+            &kind,
+            None,
+        );
+
+        chart.chart.layout.autoscale = Some(Autoscale::FitToVisible);
+        crate::chart::update(&mut chart, &Message::Translated(Vector::new(25.0, 125.0)));
+        assert_eq!(chart.chart.translation, Vector::new(25.0, 125.0));
+        assert_eq!(chart.chart.layout.autoscale, None);
+
+        chart.chart.cell_width = 360.0;
+        crate::chart::update(&mut chart, &Message::XScaling(300.0, 0.0, true));
+        assert!(chart.chart.cell_width > 360.0);
+
+        chart.chart.cell_height = 90.0;
+        crate::chart::update(&mut chart, &Message::YScaling(300.0, 0.0, true));
+        assert!(chart.chart.cell_height > 90.0);
+
+        assert!(kind.min_scaling() < 0.25);
+        assert!(kind.max_scaling() > 1.2);
     }
 
     #[test]
@@ -6785,6 +7219,84 @@ mod tests {
     }
 
     #[test]
+    fn initial_kline_page_uses_a_stable_candle_boundary() {
+        let source = TickerInfo::new(
+            Ticker::new("BTCUSDT", Exchange::BinanceLinear),
+            0.1,
+            0.001,
+            None,
+        );
+        let timeframe = Timeframe::M5;
+        let mut chart = KlineChart::new(
+            ViewConfig::default(),
+            Basis::Time(timeframe),
+            PriceStep::from(source.min_ticksize),
+            &[],
+            Vec::new(),
+            &[],
+            source,
+            &KlineChartKind::Candles,
+            None,
+        );
+
+        let Action::RequestFetch(specs) = chart
+            .fetch_missing_data()
+            .expect("an empty chart should request its initial kline page")
+        else {
+            panic!("initial chart load should request klines");
+        };
+        let FetchRange::Kline(_, page_end) = specs[0].fetch else {
+            panic!("initial chart load requested the wrong data kind");
+        };
+
+        assert_eq!(page_end, page_end.floor_to(timeframe));
+        assert!(
+            chart.fetch_missing_data().is_none(),
+            "the pending candle-aligned page must suppress maintenance-tick duplicates"
+        );
+    }
+
+    #[test]
+    fn initial_open_interest_starts_with_the_primary_kline_page() {
+        let source = TickerInfo::new(
+            Ticker::new("BTCUSDT", Exchange::BinanceLinear),
+            0.1,
+            0.001,
+            None,
+        );
+        let mut chart = KlineChart::new(
+            ViewConfig::default(),
+            Basis::Time(Timeframe::M1),
+            PriceStep::from(source.min_ticksize),
+            &[],
+            Vec::new(),
+            &[KlineIndicator::OpenInterest],
+            source,
+            &KlineChartKind::Candles,
+            None,
+        );
+
+        let Action::RequestFetch(specs) = chart
+            .fetch_missing_data()
+            .expect("initial candle and OI history should be scheduled together")
+        else {
+            panic!("initial load should request history");
+        };
+
+        assert!(
+            specs
+                .iter()
+                .any(|spec| matches!(spec.fetch, FetchRange::Kline(..)))
+        );
+        assert!(
+            specs
+                .iter()
+                .any(|spec| matches!(spec.fetch, FetchRange::OpenInterest(..))),
+            "OI must not wait for the primary kline response"
+        );
+    }
+
+    #[test]
     fn renko_seed_pages_backward_after_the_first_minute_page() {
         let source = TickerInfo::new(
             Ticker::new("BTCUSDT", Exchange::BinanceLinear),
@@ -6803,13 +7315,13 @@ mod tests {
         let FetchRange::Kline(first_start, first_end) = first[0].fetch else {
             panic!("renko seed should request klines, got {:?}", first[0].fetch);
         };
-        assert!(
-            first_end.as_u64() - first_start.as_u64() >= 1_000 * 60_000,
-            "first page should cover a venue-sized 1m window, got {first_start:?}..{first_end:?}"
-        );
-
+        assert_eq!(first_end, first_end.floor_to(RENKO_SEED_TIMEFRAME));
         let minute_ms = RENKO_SEED_TIMEFRAME.to_milliseconds();
-        let page_bars = ((first_end.as_u64() - first_start.as_u64()) / minute_ms) as usize;
+        let page_bars = ((first_end.as_u64() - first_start.as_u64()) / minute_ms + 1) as usize;
+        assert_eq!(
+            page_bars, 1_000,
+            "first page should cover exactly one venue-sized 1m window"
+        );
         let klines: Vec<Kline> = (0..page_bars)
             .map(|i| seed_kline(first_start.saturating_add(i as u64 * minute_ms), 68_000.0))
             .collect();
@@ -6832,6 +7344,37 @@ mod tests {
             "second page {second_start:?}..{second_end:?} should be older than first {first_start:?}..{first_end:?}"
         );
         assert!(chart.needs_seed_backfill());
+    }
+
+    #[test]
+    fn batched_renko_seed_reaches_its_exact_lower_boundary() {
+        let source = TickerInfo::new(
+            Ticker::new("BTCUSDT", Exchange::BinanceLinear),
+            0.1,
+            0.001,
+            None,
+        );
+        let mut chart = renko_chart(source, &[]);
+
+        for _ in 0..10 {
+            if !chart.needs_seed_backfill() {
+                break;
+            }
+            let Some(Action::RequestFetch(specs)) = chart.fetch_missing_data() else {
+                continue;
+            };
+            for spec in specs {
+                let FetchRange::Kline(start, _) = spec.fetch else {
+                    continue;
+                };
+                chart.insert_hist_klines(spec.req_id, source, &[seed_kline(start, 68_000.0)]);
+            }
+        }
+
+        assert!(
+            !chart.needs_seed_backfill(),
+            "a complete aligned final page must close the seed chain"
+        );
     }
 
     #[test]
@@ -6859,6 +7402,124 @@ mod tests {
             matches!(specs[0].fetch, FetchRange::Kline(..)),
             "chart seed must win over CVD trade backfill, got {:?}",
             specs[0].fetch
+        );
+        crate::connector::fetcher::set_trade_fetch_mode(TradeFetchMode::Off);
+    }
+
+    #[test]
+    fn previous_value_area_and_open_interest_start_in_the_same_maintenance_turn() {
+        let source = TickerInfo::new(
+            Ticker::new("BTCUSDT", Exchange::BinanceLinear),
+            0.1,
+            0.001,
+            None,
+        );
+        let interval = Timeframe::M1;
+        let interval_ms = interval.to_milliseconds();
+        let latest = UnixMs::now().floor_to(interval);
+        let klines = (0..450_u64)
+            .map(|offset| {
+                seed_kline(
+                    latest.saturating_sub((449 - offset) * interval_ms),
+                    68_000.0,
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut chart = KlineChart::new(
+            ViewConfig::default(),
+            Basis::Time(interval),
+            PriceStep::from(source.min_ticksize),
+            &klines,
+            Vec::new(),
+            &[
+                KlineIndicator::PreviousValueArea,
+                KlineIndicator::OpenInterest,
+            ],
+            source,
+            &KlineChartKind::Candles,
+            None,
+        );
+        chart.chart.bounds = Rectangle {
+            width: 1_200.0,
+            height: 800.0,
+            ..Rectangle::default()
+        };
+
+        let Action::RequestFetch(specs) = chart
+            .fetch_missing_data()
+            .expect("PVA and OI history should both be scheduled")
+        else {
+            panic!("history planner should dispatch fetch requests");
+        };
+        assert!(
+            specs
+                .iter()
+                .any(|spec| matches!(spec.fetch, FetchRange::Kline(..))),
+            "PVA kline history was not scheduled"
+        );
+        assert!(
+            specs
+                .iter()
+                .any(|spec| matches!(spec.fetch, FetchRange::OpenInterest(..))),
+            "OI must not wait for the PVA page chain to finish"
+        );
+    }
+
+    #[test]
+    fn trade_history_starts_with_paged_kline_seed() {
+        let _guard = TRADE_FETCH_MODE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::connector::fetcher::set_trade_fetch_mode(TradeFetchMode::Server);
+        let source = TickerInfo::new(
+            Ticker::new("STARTUP_HISTORY_TEST", Exchange::BinanceLinear),
+            0.1,
+            0.001,
+            None,
+        );
+        let interval = Timeframe::M1;
+        let latest = UnixMs::now().floor_to(interval);
+        let klines = (0..450_u64)
+            .map(|offset| {
+                seed_kline(
+                    latest.saturating_sub((449 - offset) * interval.to_milliseconds()),
+                    68_000.0,
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut chart = KlineChart::new(
+            ViewConfig::default(),
+            Basis::Time(interval),
+            PriceStep::from(source.min_ticksize),
+            &klines,
+            Vec::new(),
+            &[
+                KlineIndicator::PreviousValueArea,
+                KlineIndicator::CumulativeDelta,
+                KlineIndicator::LargeTrades,
+            ],
+            source,
+            &KlineChartKind::Candles,
+            None,
+        );
+        chart.configure_footprint_history(vec![source], false);
+
+        let Action::RequestFetch(specs) = chart
+            .fetch_missing_data()
+            .expect("PVA seed should be scheduled")
+        else {
+            panic!("PVA seed should request klines");
+        };
+        assert!(
+            specs
+                .iter()
+                .any(|spec| matches!(spec.fetch, FetchRange::Kline(..)))
+        );
+        assert!(
+            specs
+                .iter()
+                .any(|spec| matches!(spec.fetch, FetchRange::FootprintHistoryTrades(..))),
+            "CVD and Large Trades history must not wait for the PVA page chain"
         );
         crate::connector::fetcher::set_trade_fetch_mode(TradeFetchMode::Off);
     }
