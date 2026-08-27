@@ -18,6 +18,7 @@ pub enum KlineIndicator {
     OpenInterest,
     FootprintHistory,
     DailyDelta,
+    CmeGap,
     PreviousValueArea,
     LiquidityHeatmap,
     LargeTrades,
@@ -37,22 +38,24 @@ impl KlineIndicator {
     // Indicator togglers on UI menus depend on these arrays.
     // Every variant needs to be in either SPOT, PERPS or both.
     /// Indicators that can be used with spot market tickers
-    const FOR_SPOT: [KlineIndicator; 7] = [
+    const FOR_SPOT: [KlineIndicator; 8] = [
         KlineIndicator::Volume,
         KlineIndicator::BarAnalysis,
         KlineIndicator::CumulativeDelta,
         KlineIndicator::DailyDelta,
+        KlineIndicator::CmeGap,
         KlineIndicator::PreviousValueArea,
         KlineIndicator::LargeTrades,
         KlineIndicator::VisibleRangeProfile,
     ];
     /// Indicators that can be used with perpetual swap market tickers
-    const FOR_PERPS: [KlineIndicator; 9] = [
+    const FOR_PERPS: [KlineIndicator; 10] = [
         KlineIndicator::Volume,
         KlineIndicator::BarAnalysis,
         KlineIndicator::CumulativeDelta,
         KlineIndicator::OpenInterest,
         KlineIndicator::DailyDelta,
+        KlineIndicator::CmeGap,
         KlineIndicator::PreviousValueArea,
         KlineIndicator::LiquidityHeatmap,
         KlineIndicator::LargeTrades,
@@ -64,6 +67,7 @@ impl KlineIndicator {
         matches!(
             self,
             Self::DailyDelta
+                | Self::CmeGap
                 | Self::PreviousValueArea
                 | Self::LiquidityHeatmap
                 | Self::LargeTrades
@@ -95,6 +99,7 @@ impl Display for KlineIndicator {
             KlineIndicator::OpenInterest => write!(f, "Open Interest"),
             KlineIndicator::FootprintHistory => write!(f, "Footprint History"),
             KlineIndicator::DailyDelta => write!(f, "Daily Delta"),
+            KlineIndicator::CmeGap => write!(f, "CME Gaps"),
             KlineIndicator::PreviousValueArea => write!(f, "Previous Value Areas"),
             KlineIndicator::LiquidityHeatmap => write!(f, "Liquidity Heatmap"),
             KlineIndicator::LargeTrades => write!(f, "Large Trades"),

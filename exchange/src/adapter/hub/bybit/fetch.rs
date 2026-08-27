@@ -274,7 +274,7 @@ fn oi_range_reaches_live_edge(
     })
 }
 
-async fn fetch_mark_price_closes(
+async fn fetch_mark_price_opens(
     hub: &HttpHub<BybitLimiter>,
     ticker_info: TickerInfo,
     period: Timeframe,
@@ -317,8 +317,8 @@ async fn fetch_mark_price_closes(
         .iter()
         .map(|row| {
             let time = parse_kline_field::<u64>(row.first().and_then(Value::as_str))?;
-            let close = parse_kline_field::<f64>(row.get(4).and_then(Value::as_str))?;
-            Ok((UnixMs::new(time), close))
+            let open = parse_kline_field::<f64>(row.get(1).and_then(Value::as_str))?;
+            Ok((UnixMs::new(time), open))
         })
         .collect()
 }
@@ -361,10 +361,7 @@ async fn fetch_current_oi(
             "Invalid current Bybit OI for {ticker_str}: {value}"
         )));
     }
-    Ok(OpenInterest {
-        time: UnixMs::new(time),
-        value,
-    })
+    Ok(OpenInterest::snapshot(UnixMs::new(time), value))
 }
 
 fn current_oi_usd_value(item: &Value, market: MarketKind) -> Option<f64> {
@@ -471,7 +468,7 @@ pub(super) async fn fetch_historical_oi(
         })?;
 
     let prices = if market == MarketKind::LinearPerps {
-        fetch_mark_price_closes(hub, ticker_info, historical_period, range).await?
+        fetch_mark_price_opens(hub, ticker_info, historical_period, range).await?
     } else {
         std::collections::BTreeMap::new()
     };
@@ -480,18 +477,7 @@ pub(super) async fn fetch_historical_oi(
         .filter_map(|x| {
             let time = UnixMs::from(x.timestamp);
             let contracts = x.value;
-            let value = match market {
-                MarketKind::LinearPerps => prices
-                    .range(..=time)
-                    .next_back()
-                    .or_else(|| prices.first_key_value())
-                    .map(|(_, price)| contracts * price)?,
-                MarketKind::InversePerps => contracts,
-                MarketKind::Spot => return None,
-            };
-            // Bybit history is interval data timestamped on its right edge.
-            // Current ticker snapshots remain at their exact observation time.
-            Some(OpenInterest::completed_interval(time, value))
+            historical_oi_observation(contracts, time, market, &prices)
         })
         .collect();
 
@@ -506,16 +492,20 @@ pub(super) async fn fetch_historical_oi(
         }
     }
 
-    let mut deduplicated = BTreeMap::new();
+    let mut deduplicated = BTreeMap::<UnixMs, OpenInterest>::new();
     for point in open_interest {
         if point.value.is_finite() && point.value >= 0.0 {
-            deduplicated.insert(point.time, point.value);
+            deduplicated
+                .entry(point.time)
+                .and_modify(|current| {
+                    if point.supersedes(*current) {
+                        *current = point;
+                    }
+                })
+                .or_insert(point);
         }
     }
-    let open_interest = deduplicated
-        .into_iter()
-        .map(|(time, value)| OpenInterest { time, value })
-        .collect::<Vec<_>>();
+    let open_interest = deduplicated.into_values().collect::<Vec<_>>();
 
     if open_interest.is_empty() {
         log::warn!(
@@ -526,6 +516,23 @@ pub(super) async fn fetch_historical_oi(
     }
 
     Ok(open_interest)
+}
+
+fn historical_oi_observation(
+    contracts: f64,
+    time: UnixMs,
+    market: MarketKind,
+    mark_price_opens: &BTreeMap<UnixMs, f64>,
+) -> Option<OpenInterest> {
+    let value = match market {
+        // Bybit timestamps both the OI row and mark-price candle at the
+        // interval start. Use that candle's opening mark at the exact same
+        // timestamp; a prior/future close introduces price lookahead.
+        MarketKind::LinearPerps => contracts * mark_price_opens.get(&time)?,
+        MarketKind::InversePerps => contracts,
+        MarketKind::Spot => return None,
+    };
+    Some(OpenInterest::interval(time, value))
 }
 
 const MAX_ARCHIVE_TRADES_PER_FETCH: usize = 2_000_000;
@@ -555,6 +562,27 @@ async fn fetch_recent_trades(
     let list = response["result"]["list"]
         .as_array()
         .ok_or_else(|| AdapterError::ParseError("Bybit recent trades list is missing".into()))?;
+    let response_times = list
+        .iter()
+        .map(|item| {
+            item["time"]
+                .as_str()
+                .ok_or_else(|| AdapterError::ParseError("Bybit trade time is missing".into()))?
+                .parse::<u64>()
+                .map_err(|err| AdapterError::ParseError(format!("Invalid Bybit trade time: {err}")))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if list.len() >= limit
+        && response_times
+            .iter()
+            .min()
+            .is_some_and(|earliest| from_time.as_u64() < *earliest)
+    {
+        return Err(AdapterError::InvalidRequest(
+            "The requested range predates Bybit's bounded recent-trade window; the daily archive is not available until the UTC day closes. The range remains incomplete."
+                .into(),
+        ));
+    }
     let qty_norm = QtyNormalization::with_raw_qty_unit(
         volume_size_unit() == SizeUnit::Quote,
         ticker_info,
@@ -613,7 +641,9 @@ async fn fetch_archive_trades(
             .and_then(|modified| modified.elapsed().ok())
             .is_some_and(|age| age < std::time::Duration::from_secs(12 * 60 * 60));
         if marker_is_fresh {
-            return Ok(Vec::new());
+            return Err(AdapterError::InvalidRequest(format!(
+                "Bybit archive {filename} is not available yet; the range remains incomplete"
+            )));
         }
         let _ = std::fs::remove_file(&missing_path);
     }
@@ -632,7 +662,9 @@ async fn fetch_archive_trades(
             .map_err(AdapterError::from)?;
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             let _ = std::fs::write(&missing_path, b"");
-            return Ok(Vec::new());
+            return Err(AdapterError::InvalidRequest(format!(
+                "Bybit archive {filename} is not available yet; the range remains incomplete"
+            )));
         }
         if !response.status().is_success() {
             return Err(AdapterError::InvalidRequest(format!(
@@ -839,6 +871,36 @@ mod tests {
         assert_eq!(
             current_oi_usd_value(&single_fallback, MarketKind::LinearPerps),
             Some(3_800_000_000.0)
+        );
+    }
+
+    #[test]
+    fn historical_linear_oi_uses_the_exact_timestamp_open_without_lookahead() {
+        let timestamp = UnixMs::new(1_756_087_300_000);
+        let contracts = 47_944.810;
+        let opens = BTreeMap::from([
+            (timestamp, 79_832.7),
+            (
+                timestamp.saturating_add(Timeframe::M5.to_milliseconds()),
+                80_840.86,
+            ),
+        ]);
+
+        let observation =
+            historical_oi_observation(contracts, timestamp, MarketKind::LinearPerps, &opens)
+                .expect("matching mark-price open");
+
+        assert_eq!(observation.time, timestamp);
+        assert_eq!(observation.value, contracts * 79_832.7);
+        assert_eq!(observation.kind, crate::OpenInterestKind::Interval);
+        assert!(
+            historical_oi_observation(
+                contracts,
+                timestamp.saturating_add(1),
+                MarketKind::LinearPerps,
+                &opens,
+            )
+            .is_none()
         );
     }
 }

@@ -187,15 +187,27 @@ impl FootprintHistory {
         self.request_handler.mark_completed(req_id);
     }
 
+    pub fn finalize_partial_fetch(
+        &mut self,
+        req_id: uuid::Uuid,
+        source: TickerInfo,
+        missing_ranges: &[(UnixMs, UnixMs)],
+    ) {
+        self.indicator.commit_staged_source_trades(req_id);
+        self.indicator
+            .mark_incomplete_trade_history(source, missing_ranges);
+        self.trade_requests.remove(&req_id);
+        self.oi_requests.remove(&req_id);
+        self.request_handler.mark_completed(req_id);
+    }
+
     pub fn mark_fetch_failed(&mut self, req_id: uuid::Uuid) {
         self.indicator.discard_staged_source_trades(req_id);
         self.trade_requests.remove(&req_id);
         self.oi_requests.remove(&req_id);
         // Retry via the handler's cooldown instead of pretending the day
         // completed: a transient failure (rate-limit burst, network blip)
-        // must not permanently hole a UTC-day profile. The handler gives up
-        // after its bounded attempt count, so a permanently broken range
-        // cannot loop forever.
+        // must not permanently hole a UTC-day profile.
         self.request_handler.mark_failed(req_id);
     }
 

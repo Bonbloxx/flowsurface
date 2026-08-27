@@ -695,14 +695,40 @@ pub struct TickerStats {
     pub daily_volume: Qty,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OpenInterestKind {
+    /// A venue-reported historical interval summary.
+    Interval,
+    /// A value observed directly at the stated time.
+    Snapshot,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct OpenInterest {
     pub time: UnixMs,
     /// Notional open interest in quote USD.
     pub value: f64,
+    /// Whether this value summarizes an interval or is an exact-time snapshot.
+    pub kind: OpenInterestKind,
 }
 
 impl OpenInterest {
+    pub const fn interval(time: UnixMs, value: f64) -> Self {
+        Self {
+            time,
+            value,
+            kind: OpenInterestKind::Interval,
+        }
+    }
+
+    pub const fn snapshot(time: UnixMs, value: f64) -> Self {
+        Self {
+            time,
+            value,
+            kind: OpenInterestKind::Snapshot,
+        }
+    }
+
     /// Converts a venue history timestamp at the right edge of a completed
     /// interval into an observation inside the interval it summarizes.
     ///
@@ -713,6 +739,18 @@ impl OpenInterest {
         Self {
             time: end.saturating_sub(1),
             value,
+            kind: OpenInterestKind::Interval,
+        }
+    }
+
+    /// Returns whether this observation should replace another observation in
+    /// the same display bucket. Exact-time snapshots always outrank interval
+    /// summaries; observations of the same kind use the newest timestamp.
+    pub fn supersedes(self, current: Self) -> bool {
+        match (self.kind, current.kind) {
+            (OpenInterestKind::Snapshot, OpenInterestKind::Interval) => true,
+            (OpenInterestKind::Interval, OpenInterestKind::Snapshot) => false,
+            _ => self.time >= current.time,
         }
     }
 }
@@ -734,6 +772,16 @@ mod open_interest_tests {
             UnixMs::new(300_000)
         );
         assert_eq!(observation.value, 42.0);
+        assert_eq!(observation.kind, OpenInterestKind::Interval);
+    }
+
+    #[test]
+    fn snapshots_outrank_later_interval_summaries_in_the_same_bucket() {
+        let snapshot = OpenInterest::snapshot(UnixMs::new(556_000), 42.0);
+        let interval = OpenInterest::interval(UnixMs::new(599_999), 43.0);
+
+        assert!(snapshot.supersedes(interval));
+        assert!(!interval.supersedes(snapshot));
     }
 }
 

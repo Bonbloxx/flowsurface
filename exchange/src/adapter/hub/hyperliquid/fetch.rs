@@ -106,10 +106,10 @@ pub(super) async fn fetch_open_interest(
     else {
         return Ok(Vec::new());
     };
-    Ok(vec![OpenInterest {
+    Ok(vec![OpenInterest::snapshot(
         time,
-        value: base_open_interest * context.mark_price,
-    }])
+        base_open_interest * context.mark_price,
+    )])
 }
 
 impl HyperliquidAssetContext {

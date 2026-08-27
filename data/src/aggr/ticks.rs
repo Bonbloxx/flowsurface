@@ -128,6 +128,7 @@ enum RenkoDirection {
 struct RenkoState {
     config: RenkoConfig,
     direction: Option<RenkoDirection>,
+    last_input_time: Option<UnixMs>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -174,6 +175,7 @@ impl TickAggr {
             renko: Some(RenkoState {
                 config: config.normalized(),
                 direction: None,
+                last_input_time: None,
             }),
             tpo: None,
         };
@@ -194,6 +196,21 @@ impl TickAggr {
         let seed_cutoff = ordered_klines
             .last()
             .map(|kline| kline.time.saturating_add(minute_ms).saturating_sub(1));
+        // Live buffers are normally chronological, but delayed websocket
+        // flushes and reconnect handoffs can append an older batch. Replaying
+        // that retained tail verbatim makes Renko walk backward and forward
+        // through price at nearly one timestamp. Keep the zero-allocation fast
+        // path while restoring chronological construction when needed.
+        let reordered_raw_trades = (!raw_trades
+            .windows(2)
+            .all(|pair| pair[0].time <= pair[1].time))
+        .then(|| {
+            let mut ordered = raw_trades.to_vec();
+            ordered.sort_by_key(|trade| trade.time);
+            ordered
+        });
+        let raw_trades = reordered_raw_trades.as_deref().unwrap_or(raw_trades);
+
         for trade in raw_trades
             .iter()
             .filter(|trade| seed_cutoff.is_none_or(|cutoff| trade.time > cutoff))
@@ -447,6 +464,13 @@ impl TickAggr {
     }
 
     fn insert_renko_trades(&mut self, buffer: &[Trade]) {
+        let reordered = (!buffer.windows(2).all(|pair| pair[0].time <= pair[1].time)).then(|| {
+            let mut ordered = buffer.to_vec();
+            ordered.sort_by_key(|trade| trade.time);
+            ordered
+        });
+        let buffer = reordered.as_deref().unwrap_or(buffer);
+
         for trade in buffer {
             self.insert_renko_trade(trade);
         }
@@ -464,11 +488,24 @@ impl TickAggr {
             return;
         };
 
+        // A late websocket batch must not mutate a Renko chain that has
+        // already advanced past it. Rebuilds sort their complete retained tail
+        // above; incremental ingestion can safely discard only cross-batch
+        // regressions while preserving equal-timestamp exchange order.
+        if state
+            .last_input_time
+            .is_some_and(|last_input_time| time < last_input_time)
+        {
+            return;
+        }
+        state.last_input_time = Some(time);
+
         if self.datapoints.is_empty() {
             self.datapoints.push(trade.map_or_else(
                 || TickAccumulation::empty_at(time, price, price),
                 |trade| TickAccumulation::new(trade, self.tick_size),
             ));
+            self.renko = Some(state);
             return;
         }
 
@@ -489,6 +526,7 @@ impl TickAggr {
             .units
             .saturating_mul(i64::from(state.config.brick_size));
         if brick_units <= 0 {
+            self.renko = Some(state);
             return;
         }
 
@@ -798,6 +836,22 @@ mod tests {
         }
     }
 
+    fn renko_snapshot(aggr: &TickAggr) -> Vec<(u64, i64, i64, i64, i64, usize)> {
+        aggr.datapoints
+            .iter()
+            .map(|datapoint| {
+                (
+                    datapoint.kline.time.as_u64(),
+                    datapoint.kline.open.units,
+                    datapoint.kline.high.units,
+                    datapoint.kline.low.units,
+                    datapoint.kline.close.units,
+                    datapoint.tick_count,
+                )
+            })
+            .collect()
+    }
+
     #[test]
     #[ignore = "manual tick-history ingestion benchmark"]
     fn benchmark_tick_history_ingestion() {
@@ -1054,6 +1108,51 @@ mod tests {
         assert_eq!(aggr.datapoints[1].kline.close, Price::from_f64(120.0));
         assert_eq!(aggr.datapoints[2].kline.open, Price::from_f64(120.0));
         assert_eq!(aggr.datapoints[2].kline.close, Price::from_f64(121.0));
+    }
+
+    #[test]
+    fn renko_reorders_retained_and_buffered_trades_before_construction() {
+        let config = RenkoConfig {
+            brick_size: 10,
+            reversal: 2,
+            normalization_ms: 0,
+        };
+        let chronological = [
+            trade(0, 100.0),
+            trade(1, 111.0),
+            trade(2, 121.0),
+            trade(3, 99.0),
+        ];
+        let shuffled = [
+            chronological[0],
+            chronological[3],
+            chronological[1],
+            chronological[2],
+        ];
+        let expected = TickAggr::new_renko(config, one_dollar_step(), &chronological);
+
+        let rebuilt = TickAggr::new_renko(config, one_dollar_step(), &shuffled);
+        assert_eq!(renko_snapshot(&rebuilt), renko_snapshot(&expected));
+
+        let mut live = TickAggr::new_renko(config, one_dollar_step(), &[]);
+        live.insert_trades(&shuffled);
+        assert_eq!(renko_snapshot(&live), renko_snapshot(&expected));
+    }
+
+    #[test]
+    fn renko_ignores_a_stale_cross_batch_trade() {
+        let config = RenkoConfig {
+            brick_size: 10,
+            reversal: 2,
+            normalization_ms: 0,
+        };
+        let mut aggr = TickAggr::new_renko(config, one_dollar_step(), &[]);
+        aggr.insert_trades(&[trade(0, 100.0), trade(2, 121.0)]);
+        let before_stale_trade = renko_snapshot(&aggr);
+
+        aggr.insert_trades(&[trade(1, 99.0)]);
+
+        assert_eq!(renko_snapshot(&aggr), before_stale_trade);
     }
 
     #[test]

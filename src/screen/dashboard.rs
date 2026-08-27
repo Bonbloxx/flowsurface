@@ -50,6 +50,22 @@ use std::{
 /// Losslessly apply live market data at a frame-sized cadence. User input is a
 /// separate iced event path and remains immediate.
 const MARKET_BATCH_INTERVAL: Duration = Duration::from_micros(33_333);
+const PARTIAL_TRADE_HISTORY_NOTICE: &str = "Some requested trade history is outside the recorder's proven coverage. Verified sections remain usable; affected full-day totals and cache completion stay disabled.";
+
+#[derive(Default)]
+struct PartialTradeHistoryNotice {
+    shown: bool,
+}
+
+impl PartialTradeHistoryNotice {
+    fn take(&mut self) -> Option<&'static str> {
+        if std::mem::replace(&mut self.shown, true) {
+            None
+        } else {
+            Some(PARTIAL_TRADE_HISTORY_NOTICE)
+        }
+    }
+}
 
 fn extend_open_interest_catalog_sources(
     state: &pane::State,
@@ -174,6 +190,15 @@ pub enum Message {
     /// Trade history fetch finished successfully — clear in-flight flags and
     /// mark the request completed so further gap fills can run.
     TradeFetchCompleted(uuid::Uuid, Option<uuid::Uuid>),
+    /// Recorder-proven pages were retained, but one or more exact intervals
+    /// remain uncovered and therefore uncheckpointed.
+    TradeFetchPartial {
+        pane_id: uuid::Uuid,
+        req_id: uuid::Uuid,
+        source: TickerInfo,
+        missing_ranges: Vec<(UnixMs, UnixMs)>,
+        warning: String,
+    },
     /// Immediately schedule the next bounded trade-history range. This must
     /// not wait for the chart timeframe tick (which can be one day).
     ContinueTradeHistory(uuid::Uuid),
@@ -196,6 +221,10 @@ pub struct Dashboard {
     pub popout: HashMap<window::Id, (pane_grid::State<pane::State>, WindowSpec)>,
     pub streams: UniqueStreams,
     layout_id: uuid::Uuid,
+    /// Partial recorder coverage is durable state, not a transient failure.
+    /// Show one explanation per loaded layout instead of one toast per
+    /// venue/day/pane or every time an indicator is toggled.
+    partial_trade_history_notice: PartialTradeHistoryNotice,
 }
 
 impl Default for Dashboard {
@@ -206,6 +235,7 @@ impl Default for Dashboard {
             streams: UniqueStreams::default(),
             popout: HashMap::new(),
             layout_id: uuid::Uuid::new_v4(),
+            partial_trade_history_notice: PartialTradeHistoryNotice::default(),
         }
     }
 }
@@ -273,6 +303,7 @@ impl Dashboard {
             streams: UniqueStreams::default(),
             popout,
             layout_id,
+            partial_trade_history_notice: PartialTradeHistoryNotice::default(),
         }
     }
 
@@ -585,6 +616,51 @@ impl Dashboard {
                     }
                 }
                 return (Task::done(Message::ContinueTradeHistory(pane_id)), None);
+            }
+            Message::TradeFetchPartial {
+                pane_id,
+                req_id,
+                source,
+                missing_ranges,
+                warning,
+            } => {
+                log::warn!("{warning}");
+                let notice = self.partial_trade_history_notice.take();
+                let mut handled = false;
+                if let Some(pane_state) = self.get_mut_pane_state_by_uuid(main_window.id, pane_id) {
+                    log::debug!(
+                        "Routing partial trade history req={req_id} pane={pane_id} content={:?} initialized={}",
+                        pane_state.content.kind(),
+                        matches!(
+                            &pane_state.content,
+                            pane::Content::Kline { chart: Some(_), .. }
+                                | pane::Content::FootprintHistory(Some(_))
+                        ),
+                    );
+                    if let pane::Content::Kline {
+                        chart: Some(chart), ..
+                    } = &mut pane_state.content
+                    {
+                        chart.finalize_partial_trade_fetch(req_id, source, &missing_ranges);
+                    } else if let pane::Content::FootprintHistory(Some(history)) =
+                        &mut pane_state.content
+                    {
+                        history.finalize_partial_fetch(req_id, source, &missing_ranges);
+                    }
+                    pane_state.status = pane::Status::Ready;
+                    if let Some(notice) = notice {
+                        pane_state
+                            .notifications
+                            .push(Toast::warn(notice.to_string()));
+                    }
+                    handled = true;
+                }
+                if handled {
+                    return (Task::done(Message::ContinueTradeHistory(pane_id)), None);
+                }
+                log::error!(
+                    "Partial trade-history result targeted unknown pane {pane_id}; request {req_id} was not published"
+                );
             }
             Message::ContinueTradeHistory(pane_id) => {
                 let Some(state) = self.get_mut_pane_state_by_uuid(main_window.id, pane_id) else {
@@ -1226,6 +1302,9 @@ impl Dashboard {
         let pane_state = self
             .get_mut_pane_state_by_uuid(main_window, pane_id)
             .ok_or_else(|| {
+                log::error!(
+                    "Fetched trade page targeted unknown pane {pane_id}; request {req_id:?} was not staged"
+                );
                 DashboardError::Unknown(
                     "No matching pane state found for fetched trades".to_string(),
                 )
@@ -1713,6 +1792,19 @@ impl From<fetcher::FetchUpdate> for Message {
                 error,
                 req_id,
             } => Message::ErrorOccurred(Some(pane_id), DashboardError::Fetch(error, req_id)),
+            fetcher::FetchUpdate::PartialTrades {
+                pane_id,
+                req_id,
+                source,
+                missing_ranges,
+                warning,
+            } => Message::TradeFetchPartial {
+                pane_id,
+                req_id,
+                source,
+                missing_ranges,
+                warning,
+            },
         }
     }
 }
@@ -1728,6 +1820,15 @@ mod tests {
     use iced::futures::{StreamExt, executor::block_on};
     use std::sync::Arc;
 
+    #[test]
+    fn partial_trade_history_notice_is_emitted_once_per_loaded_layout() {
+        let mut notice = PartialTradeHistoryNotice::default();
+
+        assert_eq!(notice.take(), Some(PARTIAL_TRADE_HISTORY_NOTICE));
+        assert_eq!(notice.take(), None);
+        assert_eq!(notice.take(), None);
+    }
+
     #[derive(Debug, PartialEq, Eq)]
     enum VolumeSnapshot {
         Total(i64),
@@ -1737,6 +1838,7 @@ mod tests {
     #[derive(Debug, PartialEq, Eq)]
     enum EventSnapshot {
         Connected(Vec<StreamKind>),
+        ReplayRecovered(Vec<StreamKind>, u64),
         Disconnected(Vec<StreamKind>, String),
         Depth {
             stream: StreamKind,
@@ -1760,6 +1862,9 @@ mod tests {
     fn snapshot(event: &exchange::Event) -> EventSnapshot {
         match event {
             exchange::Event::Connected(streams) => EventSnapshot::Connected(streams.to_vec()),
+            exchange::Event::ReplayRecovered(streams, from) => {
+                EventSnapshot::ReplayRecovered(streams.to_vec(), from.as_u64())
+            }
             exchange::Event::Disconnected(streams, reason) => {
                 EventSnapshot::Disconnected(streams.to_vec(), reason.clone())
             }

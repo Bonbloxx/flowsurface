@@ -234,6 +234,7 @@ pub struct AxisLabelsX<'a> {
     pub cell_width: f32,
     pub timezone: data::UserTimezone,
     pub chart_bounds: Rectangle,
+    pub crosshair_x: Option<f32>,
     pub interval_keys: Option<&'a [TickAccumulation]>,
     pub autoscaling: Option<Autoscale>,
 }
@@ -529,7 +530,11 @@ impl canvas::Program<Message> for AxisLabelsX<'_> {
                 }
             }
 
-            if let Some(cursor_pos) = cursor.position_in(self.chart_bounds)
+            let cursor_pos = cursor
+                .position_in(self.chart_bounds)
+                .or_else(|| self.crosshair_x.map(|x| Point::new(x, 0.0)));
+
+            if let Some(cursor_pos) = cursor_pos
                 && let Some(label) = self.generate_crosshair(cursor_pos, region, bounds, palette)
             {
                 labels.push(label);

@@ -521,6 +521,10 @@ impl Exchange {
 #[derive(Debug, Clone)]
 pub enum Event {
     Connected(Arc<[StreamKind]>),
+    /// A reconnect snapshot overlapped an execution already observed on the
+    /// previous connection. Recorder consumers may bridge capture coverage
+    /// back to `from`; ordinary live consumers can ignore this metadata.
+    ReplayRecovered(Arc<[StreamKind]>, UnixMs),
     Disconnected(Arc<[StreamKind]>, String),
     DepthReceived(StreamKind, UnixMs, Arc<Depth>),
     TradesReceived(StreamKind, UnixMs, Box<[Trade]>),

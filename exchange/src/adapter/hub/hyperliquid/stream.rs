@@ -14,14 +14,17 @@ use super::{HyperliquidHandle, WS_DOMAIN, raw_qty_unit_from_market_type};
 use crate::adapter::hub::AdapterError;
 use fastwebsockets::Frame;
 use futures::Stream;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::sync::Arc;
+use std::{collections::VecDeque, sync::Arc};
 
 const SIG_FIG_LIMIT: i32 = 5;
 const ALLOWED_MANTISSA: [i32; 3] = [1, 2, 5];
 const HYPERLIQUID_PING_PAYLOAD: &[u8] = br#"{"method":"ping"}"#;
+/// Hyperliquid sends a 30-trade reconnect snapshot. Keep a much wider rolling
+/// identity window so every replayed execution remains recognizable.
+const RECENT_TRADE_ID_CAPACITY: usize = 4_096;
 
 #[derive(Clone, Copy, Debug)]
 struct DepthFeedConfig {
@@ -124,6 +127,37 @@ struct HyperliquidTrade {
     #[serde(deserialize_with = "de_string_to_number")]
     sz: f64,
     time: u64,
+    tid: u64,
+}
+
+/// Hyperliquid documents `(block_time, coin, tid)` as a globally unique trade
+/// identity. This value is already partitioned by coin, so `(time, tid)` is the
+/// exact key retained here.
+#[derive(Default)]
+struct RecentTradeIds {
+    order: VecDeque<(u64, u64)>,
+    ids: FxHashSet<(u64, u64)>,
+}
+
+impl RecentTradeIds {
+    /// Returns `true` only for a newly observed execution.
+    fn insert(&mut self, time: u64, tid: u64) -> bool {
+        let key = (time, tid);
+        if !self.ids.insert(key) {
+            return false;
+        }
+        self.order.push_back(key);
+        while self.order.len() > RECENT_TRADE_ID_CAPACITY {
+            if let Some(expired) = self.order.pop_front() {
+                self.ids.remove(&expired);
+            }
+        }
+        true
+    }
+
+    fn contains(&self, time: u64, tid: u64) -> bool {
+        self.ids.contains(&(time, tid))
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -197,6 +231,9 @@ struct TradeAdapter {
     symbol_to_ticker: FxHashMap<String, Ticker>,
     buffer: TradeBuffer,
     subscription_coins: Vec<String>,
+    stream_by_coin: FxHashMap<String, StreamKind>,
+    recent_ids: FxHashMap<String, RecentTradeIds>,
+    snapshot_pending: FxHashSet<String>,
     proxy_cfg: Option<crate::proxy::Proxy>,
 }
 
@@ -227,12 +264,53 @@ impl WsAdapter for TradeAdapter {
     }
 
     async fn on_connected(&mut self) -> Vec<Event> {
+        self.snapshot_pending = self.subscription_coins.iter().cloned().collect();
         self.buffer.flush()
     }
 
     async fn on_text(&mut self, payload: &[u8]) -> Result<Vec<Event>, String> {
         if let Ok(StreamData::Trade(trades)) = parse_websocket_message(payload) {
+            let mut replay_from = FxHashMap::<String, u64>::default();
+            let snapshot_coins = trades
+                .iter()
+                .map(|trade| trade.coin.clone())
+                .collect::<FxHashSet<_>>();
+
+            // Hyperliquid sends recent executions immediately after every
+            // subscription. First classify the whole payload against IDs from
+            // before this connection. Only an overlap proves this is a
+            // reconnect replay that bridges the previous live interval.
+            for hl_trade in &trades {
+                if self.snapshot_pending.contains(&hl_trade.coin)
+                    && self
+                        .recent_ids
+                        .get(&hl_trade.coin)
+                        .is_some_and(|recent| recent.contains(hl_trade.time, hl_trade.tid))
+                {
+                    replay_from
+                        .entry(hl_trade.coin.clone())
+                        .and_modify(|from| *from = (*from).min(hl_trade.time))
+                        .or_insert(hl_trade.time);
+                }
+            }
+
             for hl_trade in trades {
+                let is_snapshot = self.snapshot_pending.contains(&hl_trade.coin);
+                let snapshot_has_overlap = replay_from.contains_key(&hl_trade.coin);
+                let recent = self.recent_ids.entry(hl_trade.coin.clone()).or_default();
+                if !recent.insert(hl_trade.time, hl_trade.tid) {
+                    continue;
+                }
+
+                // With no overlap, this is either the initial subscription or
+                // an unproven reconnect after a long outage/process restart.
+                // Seed its IDs for later deduplication, but never publish those
+                // pre-connection rows as fresh live executions. If overlap is
+                // proven, publish only previously unseen rows: those are the
+                // executions recovered by the replay.
+                if is_snapshot && !snapshot_has_overlap {
+                    continue;
+                }
                 if let Some(ticker) = self.symbol_to_ticker.get(&hl_trade.coin)
                     && let Some((ticker_info, qty_norm)) = self.buffer.ticker_info(ticker)
                 {
@@ -256,6 +334,18 @@ impl WsAdapter for TradeAdapter {
                     );
                 }
             }
+
+            for coin in snapshot_coins {
+                self.snapshot_pending.remove(&coin);
+            }
+
+            let mut events = Vec::with_capacity(replay_from.len());
+            for (coin, from) in replay_from {
+                if let Some(stream) = self.stream_by_coin.get(&coin) {
+                    events.push(Event::ReplayRecovered(Arc::from([*stream]), from.into()));
+                }
+            }
+            return Ok(events);
         }
 
         Ok(Vec::new())
@@ -315,10 +405,25 @@ pub fn connect_trade_stream(
         .map(|ticker_info| ticker_info.ticker.to_full_symbol_and_type().0)
         .collect();
 
+    let stream_by_coin = tickers
+        .iter()
+        .map(|ticker_info| {
+            (
+                ticker_info.ticker.to_full_symbol_and_type().0,
+                StreamKind::Trades {
+                    ticker_info: *ticker_info,
+                },
+            )
+        })
+        .collect();
+
     let adapter = TradeAdapter {
         symbol_to_ticker,
         buffer: TradeBuffer::new(ticker_info_map),
         subscription_coins,
+        stream_by_coin,
+        recent_ids: FxHashMap::default(),
+        snapshot_pending: FxHashSet::default(),
         proxy_cfg,
     };
 
@@ -616,4 +721,152 @@ pub fn connect_kline_stream(
     };
 
     WsSession::with_text_ping(HYPERLIQUID_PING_PAYLOAD, stream_scope).run(adapter)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::adapter::Exchange;
+
+    fn test_trade_adapter() -> TradeAdapter {
+        let ticker_info = TickerInfo::new(
+            Ticker::new("BTC", Exchange::HyperliquidLinear),
+            1.0,
+            0.00001,
+            None,
+        );
+        let ticker = ticker_info.ticker;
+        let coin = "BTC".to_string();
+        TradeAdapter {
+            symbol_to_ticker: FxHashMap::from_iter([(coin.clone(), ticker)]),
+            buffer: TradeBuffer::new(FxHashMap::from_iter([(
+                ticker,
+                (
+                    ticker_info,
+                    QtyNormalization::with_raw_qty_unit(
+                        volume_size_unit() == SizeUnit::Quote,
+                        ticker_info,
+                        raw_qty_unit_from_market_type(MarketKind::LinearPerps),
+                    ),
+                ),
+            )])),
+            subscription_coins: vec![coin.clone()],
+            stream_by_coin: FxHashMap::from_iter([(coin, StreamKind::Trades { ticker_info })]),
+            recent_ids: FxHashMap::default(),
+            snapshot_pending: FxHashSet::default(),
+            proxy_cfg: None,
+        }
+    }
+
+    fn trade_payload(trades: &str) -> Vec<u8> {
+        format!(r#"{{"channel":"trades","data":[{trades}]}}"#).into_bytes()
+    }
+
+    fn trade_count(events: &[Event]) -> usize {
+        events
+            .iter()
+            .map(|event| match event {
+                Event::TradesReceived(_, _, trades) => trades.len(),
+                _ => 0,
+            })
+            .sum()
+    }
+
+    #[test]
+    fn recent_trade_ids_reject_replayed_execution_identity() {
+        let mut ids = RecentTradeIds::default();
+
+        assert!(ids.insert(1_000, 42));
+        assert!(!ids.insert(1_000, 42));
+        assert!(ids.insert(1_000, 43));
+        assert!(ids.insert(1_001, 42));
+    }
+
+    #[test]
+    fn recent_trade_ids_evict_only_after_bounded_window() {
+        let mut ids = RecentTradeIds::default();
+        for id in 0..=RECENT_TRADE_ID_CAPACITY as u64 {
+            assert!(ids.insert(id, id));
+        }
+
+        assert!(!ids.contains(0, 0));
+        assert!(ids.contains(1, 1));
+        assert!(ids.contains(
+            RECENT_TRADE_ID_CAPACITY as u64,
+            RECENT_TRADE_ID_CAPACITY as u64
+        ));
+    }
+
+    #[test]
+    fn trade_payload_retains_hyperliquid_tid() {
+        let payload = br#"{
+            "channel":"trades",
+            "data":[{
+                "coin":"BTC",
+                "side":"B",
+                "px":"78000",
+                "sz":"0.01",
+                "time":1234,
+                "tid":5678
+            }]
+        }"#;
+
+        let StreamData::Trade(trades) = parse_websocket_message(payload).expect("trade payload")
+        else {
+            panic!("expected trade payload");
+        };
+        assert_eq!(trades.len(), 1);
+        assert_eq!(trades[0].tid, 5_678);
+    }
+
+    #[tokio::test]
+    async fn subscription_snapshots_are_fail_closed_and_reconnect_replay_is_deduplicated() {
+        let mut adapter = test_trade_adapter();
+        adapter.on_connected().await;
+        let first = trade_payload(
+            r#"{"coin":"BTC","side":"B","px":"78000","sz":"0.01","time":1000,"tid":1},
+               {"coin":"BTC","side":"A","px":"78001","sz":"0.02","time":1001,"tid":2}"#,
+        );
+        assert!(
+            adapter
+                .on_text(&first)
+                .await
+                .expect("first snapshot")
+                .is_empty()
+        );
+        assert_eq!(trade_count(&adapter.on_tick().await), 0);
+
+        let live = trade_payload(
+            r#"{"coin":"BTC","side":"B","px":"78002","sz":"0.03","time":1002,"tid":3}"#,
+        );
+        assert!(adapter.on_text(&live).await.expect("live trade").is_empty());
+        assert_eq!(trade_count(&adapter.on_tick().await), 1);
+
+        // Duplicate identities are rejected even outside the reconnect
+        // snapshot boundary.
+        assert!(
+            adapter
+                .on_text(&live)
+                .await
+                .expect("duplicate live trade")
+                .is_empty()
+        );
+        assert_eq!(trade_count(&adapter.on_tick().await), 0);
+
+        adapter.on_connected().await;
+        let reconnect = trade_payload(
+            r#"{"coin":"BTC","side":"B","px":"78002","sz":"0.03","time":1002,"tid":3},
+               {"coin":"BTC","side":"A","px":"78003","sz":"0.04","time":1003,"tid":4}"#,
+        );
+        let recovery = adapter
+            .on_text(&reconnect)
+            .await
+            .expect("reconnect snapshot");
+        assert!(matches!(
+            recovery.as_slice(),
+            [Event::ReplayRecovered(streams, from)]
+                if streams.len() == 1 && from.as_u64() == 1_002
+        ));
+        assert_eq!(trade_count(&adapter.on_tick().await), 1);
+    }
 }

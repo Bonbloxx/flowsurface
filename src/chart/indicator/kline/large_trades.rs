@@ -400,6 +400,15 @@ impl KlineIndicatorImpl for LargeTradesIndicator {
         self.inner.commit_staged_source_trades(req_id);
     }
 
+    fn mark_incomplete_trade_history(
+        &mut self,
+        source: exchange::TickerInfo,
+        missing_ranges: &[(UnixMs, UnixMs)],
+    ) {
+        self.inner
+            .mark_incomplete_trade_history(source, missing_ranges);
+    }
+
     fn discard_staged_source_trades(&mut self, req_id: uuid::Uuid) {
         self.inner.discard_staged_source_trades(req_id);
     }
@@ -630,6 +639,9 @@ mod tests {
             &[trade(day + 60_000, 60_000.0, 20.0, true)],
             true,
         );
+        indicator
+            .inner
+            .accept_verified_day(binance(), UnixMs::new(day), cutoff);
 
         let merged = indicator
             .inner

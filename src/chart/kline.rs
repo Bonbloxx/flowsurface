@@ -1001,6 +1001,37 @@ impl KlineChart {
         }
     }
 
+    /// Merge the connector's initial kline snapshot into an already-live
+    /// time-based chart without reconstructing the chart. Rebuilding here used
+    /// to discard CVD/Footprint history that arrived concurrently and then
+    /// preserve an old live-trade cutoff, making that lost interval impossible
+    /// for the replacement indicator to backfill.
+    pub fn insert_initial_klines(
+        &mut self,
+        timeframe: Timeframe,
+        source: TickerInfo,
+        klines_raw: &[Kline],
+    ) -> bool {
+        if self.chart.basis != Basis::Time(timeframe)
+            || !source.ticker.same_market(&self.chart.ticker_info.ticker)
+        {
+            return false;
+        }
+        let PlotData::TimeBased(timeseries) = &mut self.data_source else {
+            return false;
+        };
+
+        timeseries.insert_klines(klines_raw);
+        timeseries.fill_empty_footprints_from_trades(&self.raw_trades);
+        self.sync_time_cursor();
+        self.indicators
+            .values_mut()
+            .filter_map(Option::as_mut)
+            .for_each(|indicator| indicator.on_insert_klines(klines_raw, &self.data_source));
+        self.invalidate(None);
+        true
+    }
+
     pub fn update_latest_kline(&mut self, kline: &Kline) {
         let updated = match self.data_source {
             PlotData::TimeBased(ref mut timeseries) => {
@@ -1769,6 +1800,34 @@ impl KlineChart {
         }
     }
 
+    /// Publish only the recorder-proven pages of a history request while
+    /// retaining exact gaps as in-memory truth. No durable cache checkpoint is
+    /// written, and the request is completed only for this chart generation so
+    /// it cannot immediately refetch and double-count the same partial pages.
+    pub fn finalize_partial_trade_fetch(
+        &mut self,
+        req_id: uuid::Uuid,
+        source: TickerInfo,
+        missing_ranges: &[(UnixMs, UnixMs)],
+    ) {
+        log::debug!(
+            "Finalizing partial trade history req={req_id} source={} consumers=footprint:{} daily_delta:{} cvd:{} large_trades:{}",
+            source.ticker,
+            self.indicators[KlineIndicator::FootprintHistory].is_some(),
+            self.indicators[KlineIndicator::DailyDelta].is_some(),
+            self.indicators[KlineIndicator::CumulativeDelta].is_some(),
+            self.indicators[KlineIndicator::LargeTrades].is_some(),
+        );
+        self.for_each_trade_history(|indicator| {
+            indicator.commit_staged_source_trades(req_id);
+            indicator.mark_incomplete_trade_history(source, missing_ranges);
+        });
+        self.footprint_history.trade_requests.remove(&req_id);
+        self.request_handler.mark_completed(req_id);
+        self.finish_trade_fetch(req_id);
+        self.refresh_history_overlay(true);
+    }
+
     /// Mark a fetch request as failed to unblock re-fetches of the same range.
     pub fn mark_fetch_failed(&mut self, req_id: uuid::Uuid) {
         self.for_each_trade_history(|indicator| {
@@ -1778,9 +1837,7 @@ impl KlineChart {
         self.footprint_history.oi_requests.remove(&req_id);
         // Retry after the handler's cooldown instead of pretending the
         // snapshot completed: a transient failure (rate-limit burst, network
-        // blip) must not permanently hole a UTC-day profile. RequestHandler
-        // bounds total attempts, so a permanently broken range still cannot
-        // retry forever.
+        // blip) must not permanently hole a UTC-day profile.
         self.request_handler.mark_failed(req_id);
         self.finish_trade_fetch(req_id);
     }
@@ -1930,13 +1987,7 @@ impl KlineChart {
             != visual_config.large_trades_min_usd.to_bits();
         self.visual_config = visual_config;
         if lookback_changed {
-            self.request_handler = RequestHandler::default();
-            self.footprint_history.cutoff = None;
-            self.footprint_history.trade_requests.clear();
-            self.footprint_history.fetch_handles.clear();
-            self.for_each_trade_history(|indicator| {
-                indicator.reset_trade_history_backfill();
-            });
+            self.restart_trade_history_backfill();
         } else if pva_config_changed {
             // Letter-timeframe changes invalidate every stored bar; other knob
             // changes only need a rebuild from the existing bars.
@@ -2956,26 +3007,7 @@ impl KlineChart {
                 box_indi.configure_open_interest(&self.open_interest_sources);
             }
             if indicator.needs_trade_history() {
-                self.request_handler = RequestHandler::default();
-                self.footprint_history.cutoff = None;
-                // Dropping these abort handles cancels every in-flight venue
-                // backfill. Forget their ownership records as well; otherwise
-                // `fetch_footprint_history` keeps those venues permanently
-                // marked active and never retries them for the new indicator.
-                let stale_requests = self
-                    .footprint_history
-                    .trade_requests
-                    .keys()
-                    .copied()
-                    .collect::<Vec<_>>();
-                self.for_each_trade_history(|existing| {
-                    for req_id in &stale_requests {
-                        existing.discard_staged_source_trades(*req_id);
-                    }
-                });
-                self.footprint_history.trade_requests.clear();
-                self.footprint_history.oi_requests.clear();
-                self.footprint_history.fetch_handles.clear();
+                self.restart_trade_history_backfill();
                 box_indi.configure_footprint_history(
                     &self.footprint_history.sources,
                     self.footprint_history.aggregate,
@@ -3005,6 +3037,33 @@ impl KlineChart {
                 Some(prev_indi_count),
             );
         }
+    }
+
+    /// Restart all consumers of the shared executed-trade history as one
+    /// generation. Keeping existing partial totals while resetting only the
+    /// request handler lets the same recorder pages be added twice. Keeping an
+    /// old live cutoff after clearing consumers can instead leave an
+    /// unrecoverable hole. Clear both sides together; the next live execution
+    /// establishes a fresh seam while the recorder backfill catches up.
+    fn restart_trade_history_backfill(&mut self) {
+        let stale_requests = self
+            .footprint_history
+            .trade_requests
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        self.for_each_trade_history(|indicator| {
+            for req_id in &stale_requests {
+                indicator.discard_staged_source_trades(*req_id);
+            }
+            indicator.reset_trade_history_backfill();
+        });
+        self.request_handler = RequestHandler::default();
+        self.footprint_history.cutoff = None;
+        self.footprint_history.trade_requests.clear();
+        self.footprint_history.oi_requests.clear();
+        self.footprint_history.fetch_handles.clear();
+        self.live_trade_starts.clear();
     }
 }
 
@@ -3050,6 +3109,19 @@ impl canvas::Program<Message> for KlineChart {
 
             let price_to_y = |price| chart.price_to_y(price);
             let interval_to_x = |interval| chart.interval_to_x(interval);
+            // CME gap bands are background structure. Paint them before the
+            // chart surface so candles, footprints and profile glyphs remain
+            // crisp on top of the faint highlight.
+            if let Some(indicator) = self.indicators[KlineIndicator::CmeGap].as_ref() {
+                indicator.draw_overlay(
+                    frame,
+                    chart,
+                    &self.data_source,
+                    palette,
+                    region,
+                    chart.tick_size,
+                );
+            }
             match &self.kind {
                 KlineChartKind::Footprint {
                     clusters,
@@ -3276,6 +3348,19 @@ impl canvas::Program<Message> for KlineChart {
             if let Some(cursor_position) = cursor.position_in(bounds) {
                 let (_, rounded_aggregation) =
                     chart.draw_crosshair(frame, theme, bounds_size, cursor_position, interaction);
+
+                draw_crosshair_tooltip(
+                    &self.data_source,
+                    &chart.ticker_info,
+                    frame,
+                    palette,
+                    chart.basis,
+                    Some(rounded_aggregation),
+                    visible_range,
+                );
+            } else if let Some(cursor_x) = chart.crosshair_x() {
+                let rounded_aggregation =
+                    chart.draw_vertical_crosshair(frame, theme, bounds_size, cursor_x);
 
                 draw_crosshair_tooltip(
                     &self.data_source,
@@ -4554,21 +4639,33 @@ fn draw_clusters(
                 frame.fill_rectangle(
                     Point::new(area.table_left, row_top),
                     Size::new(half_width, layout.cell_h),
-                    ImbalanceSide::Sell.volume_bg_color(sell_qty, max_cluster_qty, layout.pal),
+                    ImbalanceSide::Sell.volume_bg_color(
+                        sell_qty,
+                        buy_qty,
+                        max_cluster_qty,
+                        layout.pal,
+                    ),
                 );
                 frame.fill_rectangle(
                     Point::new(area.table_left + half_width, row_top),
                     Size::new(half_width, layout.cell_h),
-                    ImbalanceSide::Buy.volume_bg_color(buy_qty, max_cluster_qty, layout.pal),
+                    ImbalanceSide::Buy.volume_bg_color(
+                        buy_qty,
+                        sell_qty,
+                        max_cluster_qty,
+                        layout.pal,
+                    ),
                 );
                 let sell_text_color = ImbalanceSide::Sell.volume_text_color(
                     sell_qty,
+                    buy_qty,
                     max_cluster_qty,
                     text_color,
                     layout.pal,
                 );
                 let buy_text_color = ImbalanceSide::Buy.volume_text_color(
                     buy_qty,
+                    sell_qty,
                     max_cluster_qty,
                     text_color,
                     layout.pal,
@@ -4711,7 +4808,9 @@ fn draw_clusters(
                         frame.fill_rectangle(
                             Point::new(area.bid_area_left, row_top),
                             Size::new(bar_width, layout.cell_h),
-                            layout.pal.success.base.color.scale_alpha(bar_alpha),
+                            ImbalanceSide::Buy
+                                .dominance_color(buy_qty, sell_qty, layout.pal)
+                                .scale_alpha(bar_alpha),
                         );
                         frame.stroke(
                             &Path::rectangle(
@@ -4731,7 +4830,9 @@ fn draw_clusters(
                         frame.fill_rectangle(
                             Point::new(area.ask_area_right - bar_width, row_top),
                             Size::new(bar_width, layout.cell_h),
-                            layout.pal.danger.base.color.scale_alpha(bar_alpha),
+                            ImbalanceSide::Sell
+                                .dominance_color(sell_qty, buy_qty, layout.pal)
+                                .scale_alpha(bar_alpha),
                         );
                         frame.stroke(
                             &Path::rectangle(
@@ -5203,8 +5304,39 @@ enum ImbalanceSide {
     Sell,
 }
 
+const FOOTPRINT_OPPOSING_ACCENT_WEIGHT: f32 = 0.76;
+const FOOTPRINT_NEUTRAL_TEXT_WEIGHT: f32 = 0.22;
+
 impl ImbalanceSide {
-    fn volume_bg_color(self, qty: f64, max_qty: f64, palette: &Extended) -> Color {
+    fn dominance_color(self, qty: f64, opposing_qty: f64, palette: &Extended) -> Color {
+        let accent = match self {
+            ImbalanceSide::Buy => palette.success.base.color,
+            ImbalanceSide::Sell => palette.danger.base.color,
+        };
+
+        if qty < opposing_qty {
+            let neutral = mix_color(
+                palette.background.base.text,
+                palette.background.base.color,
+                FOOTPRINT_NEUTRAL_TEXT_WEIGHT,
+            );
+            // Table cells are alpha-composited later, so a very small blend is
+            // effectively lost against the chart background. This retains
+            // most of the side color while making the weaker side legible as
+            // subtly neutral at the final on-screen opacity.
+            mix_color(accent, neutral, FOOTPRINT_OPPOSING_ACCENT_WEIGHT)
+        } else {
+            accent
+        }
+    }
+
+    fn volume_bg_color(
+        self,
+        qty: f64,
+        opposing_qty: f64,
+        max_qty: f64,
+        palette: &Extended,
+    ) -> Color {
         // Strong floor so even low-volume rows read as solid cells (the
         // reference footprint look); intensity still ramps to full alpha.
         const MIN_ALPHA: f32 = 0.45;
@@ -5216,20 +5348,19 @@ impl ImbalanceSide {
         };
         let alpha = MIN_ALPHA + intensity * (1.0 - MIN_ALPHA);
 
-        match self {
-            ImbalanceSide::Buy => palette.success.base.color.scale_alpha(alpha),
-            ImbalanceSide::Sell => palette.danger.base.color.scale_alpha(alpha),
-        }
+        self.dominance_color(qty, opposing_qty, palette)
+            .scale_alpha(alpha)
     }
 
     fn volume_text_color(
         self,
         qty: f64,
+        opposing_qty: f64,
         max_qty: f64,
         default_color: Color,
         palette: &Extended,
     ) -> Color {
-        let cell_color = self.volume_bg_color(qty, max_qty, palette);
+        let cell_color = self.volume_bg_color(qty, opposing_qty, max_qty, palette);
         let cell_background = composite_color(cell_color, palette.background.base.color);
         let inverted_color = palette.background.base.color;
 
@@ -6716,6 +6847,35 @@ mod tests {
     }
 
     #[test]
+    fn footprint_only_greys_the_opposing_side() {
+        let theme = Theme::Dark;
+        let palette = theme.extended_palette();
+        let buy_accent = palette.success.base.color;
+
+        assert_eq!(
+            ImbalanceSide::Buy.dominance_color(10.0, 5.0, palette),
+            buy_accent
+        );
+        assert_eq!(
+            ImbalanceSide::Buy.dominance_color(5.0, 5.0, palette),
+            buy_accent
+        );
+
+        let opposing = ImbalanceSide::Buy.dominance_color(5.0, 10.0, palette);
+        let neutral = mix_color(
+            palette.background.base.text,
+            palette.background.base.color,
+            FOOTPRINT_NEUTRAL_TEXT_WEIGHT,
+        );
+        let distance =
+            |a: Color, b: Color| (a.r - b.r).powi(2) + (a.g - b.g).powi(2) + (a.b - b.b).powi(2);
+
+        assert_ne!(opposing, buy_accent);
+        assert!(distance(opposing, neutral) < distance(buy_accent, neutral));
+        assert!(distance(opposing, buy_accent) < distance(buy_accent, neutral));
+    }
+
+    #[test]
     fn vpvr_grouping_uses_feed_ticks_not_footprint_display_rows() {
         let source = TickerInfo::new(
             Ticker::new("BTCUSDT", Exchange::BinanceLinear),
@@ -7168,9 +7328,23 @@ mod tests {
         };
         assert_eq!(initial.len(), 2);
         assert_eq!(chart.footprint_history.trade_requests.len(), 2);
+        chart.insert_trades(
+            binance,
+            &[Trade {
+                time: UnixMs::new(kline.time.as_u64().saturating_add(1)),
+                price,
+                qty: Qty::from_f64(0.1),
+                is_sell: false,
+            }],
+        );
+        assert!(!chart.live_trade_starts.is_empty());
 
         chart.toggle_indicator(KlineIndicator::LargeTrades);
         assert!(chart.footprint_history.trade_requests.is_empty());
+        assert!(
+            chart.live_trade_starts.is_empty(),
+            "a restarted history generation must establish a fresh live seam"
+        );
 
         let Action::RequestFetch(retried) = chart
             .fetch_footprint_history()
@@ -7200,6 +7374,66 @@ mod tests {
             close: price,
             volume: Volume::TotalOnly(Qty::ZERO),
         }
+    }
+
+    #[test]
+    fn initial_kline_snapshot_preserves_live_trade_history_generation() {
+        let _guard = TRADE_FETCH_MODE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let source = TickerInfo::new(
+            Ticker::new("BTCUSDT", Exchange::BinanceLinear),
+            0.1,
+            0.001,
+            None,
+        );
+        let now = UnixMs::now();
+        let initial = seed_kline(
+            now.saturating_sub(Timeframe::M5.to_milliseconds()),
+            68_000.0,
+        );
+        let mut chart = KlineChart::new(
+            ViewConfig::default(),
+            Basis::Time(Timeframe::M5),
+            PriceStep::from(source.min_ticksize),
+            &[initial],
+            Vec::new(),
+            &[KlineIndicator::CumulativeDelta],
+            source,
+            &KlineChartKind::Candles,
+            None,
+        );
+        chart.configure_footprint_history(vec![source], false);
+        chart.insert_trades(
+            source,
+            &[Trade {
+                time: now,
+                price: Price::from_f64(68_001.0),
+                qty: Qty::from_f64(0.2),
+                is_sell: false,
+            }],
+        );
+        crate::connector::fetcher::set_trade_fetch_mode(TradeFetchMode::Server);
+        let Action::RequestFetch(specs) = chart
+            .fetch_footprint_history()
+            .expect("history generation should start")
+        else {
+            panic!("history generation should produce a request");
+        };
+        let request_ids = specs.iter().map(|spec| spec.req_id).collect::<Vec<_>>();
+        let cutoff = chart.footprint_history.cutoff;
+        let live_starts = chart.live_trade_starts.clone();
+
+        let snapshot = seed_kline(now, 68_010.0);
+        assert!(chart.insert_initial_klines(Timeframe::M5, source, &[snapshot]));
+        assert_eq!(chart.footprint_history.cutoff, cutoff);
+        assert_eq!(chart.live_trade_starts, live_starts);
+        assert!(
+            request_ids
+                .iter()
+                .all(|req_id| { chart.footprint_history.trade_requests.contains_key(req_id) })
+        );
+        crate::connector::fetcher::set_trade_fetch_mode(TradeFetchMode::Off);
     }
 
     fn renko_chart(source: TickerInfo, indicators: &[KlineIndicator]) -> KlineChart {

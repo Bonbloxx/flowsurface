@@ -19,7 +19,8 @@ use std::{
     collections::{BTreeMap, HashMap},
     io::BufReader,
     path::PathBuf,
-    time::UNIX_EPOCH,
+    sync::OnceLock,
+    time::{Duration, Instant, UNIX_EPOCH},
 };
 
 #[derive(Deserialize, Debug, Clone)]
@@ -532,10 +533,7 @@ async fn fetch_current_oi(
             "Invalid current Binance OI for {ticker_str}: {value}"
         )));
     }
-    Ok(OpenInterest {
-        time: UnixMs::new(snapshot.time),
-        value,
-    })
+    Ok(OpenInterest::snapshot(UnixMs::new(snapshot.time), value))
 }
 
 pub(super) async fn fetch_historical_oi(
@@ -678,14 +676,18 @@ pub(super) async fn fetch_historical_oi(
         }
     }
 
-    let mut deduplicated = BTreeMap::new();
+    let mut deduplicated = BTreeMap::<UnixMs, OpenInterest>::new();
     for point in open_interest {
-        deduplicated.insert(point.time, point.value);
+        deduplicated
+            .entry(point.time)
+            .and_modify(|current| {
+                if point.supersedes(*current) {
+                    *current = point;
+                }
+            })
+            .or_insert(point);
     }
-    Ok(deduplicated
-        .into_iter()
-        .map(|(time, value)| OpenInterest { time, value })
-        .collect())
+    Ok(deduplicated.into_values().collect())
 }
 
 fn aggtrades_request_weight(market: MarketKind) -> usize {
@@ -693,6 +695,23 @@ fn aggtrades_request_weight(market: MarketKind) -> usize {
         MarketKind::Spot => 4,
         MarketKind::LinearPerps | MarketKind::InversePerps => 20,
     }
+}
+
+/// Keep weighted execution-history calls well below Binance's IP-wide REST
+/// budget. Response headers describe an aligned exchange window and cannot be
+/// safely treated as a continuously decaying allowance. This process-wide
+/// gate caps perps aggTrades to roughly 1,090 weight/minute, leaving more than
+/// half of the documented budget for klines, OI, metadata and safety margin.
+async fn pace_aggtrades_request() {
+    const MIN_INTERVAL: Duration = Duration::from_millis(1_100);
+    static NEXT_REQUEST: OnceLock<tokio::sync::Mutex<Instant>> = OnceLock::new();
+    let gate = NEXT_REQUEST.get_or_init(|| tokio::sync::Mutex::new(Instant::now()));
+    let mut next = gate.lock().await;
+    let now = Instant::now();
+    if *next > now {
+        tokio::time::sleep(*next - now).await;
+    }
+    *next = Instant::now() + MIN_INTERVAL;
 }
 
 fn aggtrades_base_url(market: MarketKind) -> String {
@@ -745,6 +764,7 @@ async fn fetch_intraday_trades(
         url.push_str(&format!("&startTime={}", from.as_u64()));
     }
 
+    pace_aggtrades_request().await;
     let de_trades: Vec<DeTrade> = hub
         .http_json_with_limiter(&url, aggtrades_request_weight(market_type), None, None)
         .await?;
@@ -755,10 +775,11 @@ async fn fetch_intraday_trades(
 /// Binance caps an aggTrades page at 1000 rows; a full page means the slice
 /// may hold more trades and must be split again.
 const AGGTRADES_PAGE_LIMIT: usize = 1000;
-/// How many slice requests to keep in flight per wave. At weight 20 per
-/// aggTrades page this is 200 weight per wave — well inside the ~2300/min
-/// effective perps budget.
-const PARALLEL_SLICE_WAVE: usize = 10;
+/// Historical execution recovery is deliberately serialized. It shares the
+/// venue's IP budget with live-edge klines, metadata, open interest and other
+/// panes; even a nominally in-budget burst can trip Binance's shorter rolling
+/// windows and escalate from 429 throttles to an IP-wide 418 ban.
+const PARALLEL_SLICE_WAVE: usize = 1;
 /// Slices narrower than this are never split further — a capped page this
 /// small is kept as-is instead of recursing forever. Continuation then uses
 /// `fromId` so the burst is still fully read.
@@ -815,6 +836,7 @@ async fn fetch_intraday_page(
         to.as_u64()
     );
 
+    pace_aggtrades_request().await;
     hub.http_json_with_limiter(&url, aggtrades_request_weight(market_type), None, None)
         .await
 }
@@ -832,6 +854,7 @@ async fn fetch_intraday_page_from_id(
         aggtrades_base_url(market_type)
     );
 
+    pace_aggtrades_request().await;
     hub.http_json_with_limiter(&url, aggtrades_request_weight(market_type), None, None)
         .await
 }
@@ -880,11 +903,10 @@ async fn fetch_intraday_from_id_until(
     Ok(merged)
 }
 
-/// Fetch today's trades by fetching several time slices concurrently instead
-/// of walking a serial cursor one 1000-row page at a time. Slices whose page
-/// comes back full are split in half and requeued until either the data fits
-/// or the minimum span is reached. A full page that cannot be split is then
-/// continued with `fromId` so busy milliseconds are not silently truncated.
+/// Fetch today's trades as rate-limited time slices. Slices whose page comes
+/// back full are split in half and requeued until either the data fits or the
+/// minimum span is reached. A full page that cannot be split is then continued
+/// with `fromId` so busy milliseconds are not silently truncated.
 async fn fetch_intraday_trades_parallel(
     hub: &HttpHub<BinanceLimiter>,
     ticker_info: TickerInfo,

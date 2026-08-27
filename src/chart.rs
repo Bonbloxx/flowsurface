@@ -31,6 +31,14 @@ pub(crate) fn wheel_zoom_delta(delta: mouse::ScrollDelta) -> f32 {
     ZOOM_SENSITIVITY * (factor - 1.0)
 }
 
+fn normalize_crosshair_x(crosshair_x: Option<f32>, plot_width: f32) -> Option<f32> {
+    crosshair_x.filter(|x| x.is_finite() && *x >= 0.0 && *x <= plot_width)
+}
+
+pub(crate) fn active_crosshair_x(local_x: Option<f32>, shared_x: Option<f32>) -> Option<f32> {
+    local_x.or(shared_x)
+}
+
 #[derive(Default, Debug, Clone, Copy)]
 pub enum Interaction {
     #[default]
@@ -60,6 +68,7 @@ pub enum Message {
     JumpToLatest,
     AutoscaleToggled,
     CrosshairMoved,
+    CrosshairPosition(Option<f32>),
     YScaling(f32, f32, bool),
     XScaling(f32, f32, bool),
     BoundsChanged(Rectangle),
@@ -546,6 +555,11 @@ pub fn update<T: Chart>(chart: &mut T, message: &Message) {
             }
         }
         Message::CrosshairMoved => return chart.invalidate_crosshair(),
+        Message::CrosshairPosition(crosshair_x) => {
+            let state = chart.mut_state();
+            state.crosshair_x = normalize_crosshair_x(*crosshair_x, state.bounds.width);
+            return chart.invalidate_crosshair();
+        }
     }
     chart.invalidate_all();
 }
@@ -570,6 +584,7 @@ pub fn view<'a, T: Chart>(
         cell_width: state.cell_width,
         timezone,
         chart_bounds: state.bounds,
+        crosshair_x: state.crosshair_x,
         interval_keys: chart.interval_keys(),
         autoscaling: state.layout.autoscale,
     })
@@ -661,6 +676,10 @@ pub fn view<'a, T: Chart>(
         }
     };
 
+    let content = mouse_area(content)
+        .on_move(|position| Message::CrosshairPosition(Some(position.x)))
+        .on_exit(Message::CrosshairPosition(None));
+
     column![
         content,
         rule::horizontal(1).style(style::split_ruler),
@@ -727,6 +746,7 @@ pub struct ViewState {
     decimals: usize,
     ticker_info: TickerInfo,
     layout: ViewConfig,
+    crosshair_x: Option<f32>,
 }
 
 impl ViewState {
@@ -754,7 +774,12 @@ impl ViewState {
             decimals,
             ticker_info,
             layout,
+            crosshair_x: None,
         }
+    }
+
+    pub(crate) fn crosshair_x(&self) -> Option<f32> {
+        self.crosshair_x
     }
 
     fn effective_tick_units(&self) -> i64 {
@@ -894,6 +919,53 @@ impl ViewState {
         let ticks = y / self.cell_height;
         let delta_units = (ticks * self.effective_tick_units() as f32).round() as i64;
         Price::from_units(self.base_price_y.units - delta_units)
+    }
+
+    fn draw_vertical_crosshair(
+        &self,
+        frame: &mut Frame,
+        theme: &Theme,
+        bounds: Size,
+        cursor_x: f32,
+    ) -> u64 {
+        let region = self.visible_region(bounds);
+        let dashed_line = style::dashed_line(theme);
+
+        match self.basis {
+            Basis::Time(_) => {
+                let (rounded_timestamp, snap_ratio) =
+                    self.snap_x_to_index(cursor_x, bounds, region);
+
+                frame.stroke(
+                    &Path::line(
+                        Point::new(snap_ratio * bounds.width, 0.0),
+                        Point::new(snap_ratio * bounds.width, bounds.height),
+                    ),
+                    dashed_line,
+                );
+                rounded_timestamp
+            }
+            Basis::Tick(aggregation) => {
+                let (chart_x_min, chart_x_max) = (region.x, region.x + region.width);
+                let crosshair_pos = chart_x_min + (cursor_x / bounds.width) * region.width;
+
+                let cell_index = (crosshair_pos / self.cell_width).round();
+
+                let snapped_crosshair = cell_index * self.cell_width;
+                let snap_ratio = (snapped_crosshair - chart_x_min) / (chart_x_max - chart_x_min);
+
+                let rounded_tick = (-cell_index as u64) * u64::from(aggregation.0);
+
+                frame.stroke(
+                    &Path::line(
+                        Point::new(snap_ratio * bounds.width, 0.0),
+                        Point::new(snap_ratio * bounds.width, bounds.height),
+                    ),
+                    dashed_line,
+                );
+                rounded_tick
+            }
+        }
     }
 
     fn draw_crosshair(
@@ -1103,42 +1175,8 @@ impl ViewState {
             dashed_line,
         );
 
-        // Vertical time/tick line
-        match self.basis {
-            Basis::Time(_) => {
-                let (rounded_timestamp, snap_ratio) =
-                    self.snap_x_to_index(cursor_position.x, bounds, region);
-
-                frame.stroke(
-                    &Path::line(
-                        Point::new(snap_ratio * bounds.width, 0.0),
-                        Point::new(snap_ratio * bounds.width, bounds.height),
-                    ),
-                    dashed_line,
-                );
-                (rounded_price, rounded_timestamp)
-            }
-            Basis::Tick(aggregation) => {
-                let (chart_x_min, chart_x_max) = (region.x, region.x + region.width);
-                let crosshair_pos = chart_x_min + (cursor_position.x / bounds.width) * region.width;
-
-                let cell_index = (crosshair_pos / self.cell_width).round();
-
-                let snapped_crosshair = cell_index * self.cell_width;
-                let snap_ratio = (snapped_crosshair - chart_x_min) / (chart_x_max - chart_x_min);
-
-                let rounded_tick = (-cell_index as u64) * (u64::from(aggregation.0));
-
-                frame.stroke(
-                    &Path::line(
-                        Point::new(snap_ratio * bounds.width, 0.0),
-                        Point::new(snap_ratio * bounds.width, bounds.height),
-                    ),
-                    dashed_line,
-                );
-                (rounded_price, rounded_tick)
-            }
-        }
+        let rounded_x = self.draw_vertical_crosshair(frame, theme, bounds, cursor_position.x);
+        (rounded_price, rounded_x)
     }
 
     fn draw_last_price_line(
@@ -1332,5 +1370,28 @@ pub(crate) fn draw_volume_bar(
                 buy_color.scale_alpha(bar_color_alpha),
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{active_crosshair_x, normalize_crosshair_x};
+
+    #[test]
+    fn subplot_crosshair_uses_shared_x_when_not_locally_hovered() {
+        assert_eq!(active_crosshair_x(None, Some(42.0)), Some(42.0));
+    }
+
+    #[test]
+    fn local_crosshair_position_takes_precedence() {
+        assert_eq!(active_crosshair_x(Some(24.0), Some(42.0)), Some(24.0));
+    }
+
+    #[test]
+    fn shared_crosshair_is_limited_to_the_plot_width() {
+        assert_eq!(normalize_crosshair_x(Some(50.0), 100.0), Some(50.0));
+        assert_eq!(normalize_crosshair_x(Some(101.0), 100.0), None);
+        assert_eq!(normalize_crosshair_x(Some(-1.0), 100.0), None);
+        assert_eq!(normalize_crosshair_x(Some(f32::NAN), 100.0), None);
     }
 }

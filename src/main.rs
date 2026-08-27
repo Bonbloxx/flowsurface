@@ -780,6 +780,7 @@ impl Flowsurface {
 
         match event {
             exchange::Event::Connected(_streams) => Task::none(),
+            exchange::Event::ReplayRecovered(_streams, _from) => Task::none(),
             exchange::Event::Disconnected(_streams, reason) => {
                 log::info!("a stream disconnected from WS: {reason:?}");
                 Task::none()

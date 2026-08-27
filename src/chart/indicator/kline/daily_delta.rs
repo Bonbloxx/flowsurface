@@ -341,6 +341,16 @@ impl KlineIndicatorImpl for DailyDeltaIndicator {
         self.mark_all_changed();
     }
 
+    fn mark_incomplete_trade_history(
+        &mut self,
+        source: exchange::TickerInfo,
+        missing_ranges: &[(UnixMs, UnixMs)],
+    ) {
+        self.inner
+            .mark_incomplete_trade_history(source, missing_ranges);
+        self.mark_all_changed();
+    }
+
     fn discard_staged_source_trades(&mut self, req_id: uuid::Uuid) {
         self.inner.discard_staged_source_trades(req_id);
     }

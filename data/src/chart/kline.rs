@@ -443,6 +443,15 @@ pub enum KlineChartKind {
 
 impl KlineChartKind {
     pub fn allows_indicator(&self, indicator: KlineIndicator) -> bool {
+        // CME session edges require the chart's timestamp-keyed OHLC source.
+        // Renko/TPO are tick-indexed projections and cannot truthfully recover
+        // the exact Friday close and Sunday reopen from their synthetic bars.
+        if indicator == KlineIndicator::CmeGap {
+            return matches!(
+                self,
+                KlineChartKind::Candles | KlineChartKind::Footprint { .. }
+            );
+        }
         if matches!(
             indicator,
             KlineIndicator::DailyDelta
@@ -847,7 +856,8 @@ impl Default for PointOfControl {
 
 #[cfg(test)]
 mod config_tests {
-    use super::Config;
+    use super::{ClusterKind, ClusterScaling, Config, KlineChartKind, RenkoConfig};
+    use crate::chart::indicator::KlineIndicator;
 
     #[test]
     fn legacy_config_defaults_liquidity_order_filter() {
@@ -857,6 +867,30 @@ mod config_tests {
         .expect("legacy kline config should deserialize");
 
         assert_eq!(config.liquidity_heatmap_order_size_filter, 0.0);
+    }
+
+    #[test]
+    fn cme_gaps_require_timestamp_keyed_candle_data() {
+        let footprint = KlineChartKind::Footprint {
+            clusters: ClusterKind::BidAsk,
+            scaling: ClusterScaling::default(),
+            studies: Vec::new(),
+        };
+
+        assert!(KlineChartKind::Candles.allows_indicator(KlineIndicator::CmeGap));
+        assert!(footprint.allows_indicator(KlineIndicator::CmeGap));
+        assert!(
+            !KlineChartKind::Renko {
+                config: RenkoConfig::default(),
+            }
+            .allows_indicator(KlineIndicator::CmeGap)
+        );
+        assert!(
+            !KlineChartKind::Tpo {
+                config: crate::chart::tpo::Config::default(),
+            }
+            .allows_indicator(KlineIndicator::CmeGap)
+        );
     }
 }
 

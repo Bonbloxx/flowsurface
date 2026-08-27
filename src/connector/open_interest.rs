@@ -1,4 +1,4 @@
-use exchange::{OpenInterest, Ticker, TickerInfo, UnixMs};
+use exchange::{OpenInterest, OpenInterestKind, Ticker, TickerInfo, UnixMs};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashSet},
@@ -7,9 +7,10 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 
-// v3 invalidates Bybit values cached before the venue-published both-side OI
-// correction. Older cache directories remain untouched and are never read.
-const CACHE_SCHEMA_VERSION: u16 = 3;
+// v4 records whether a point is an exact-time snapshot or a coarse interval
+// summary. Older cache directories remain untouched and are never read because
+// their points cannot be ranked truthfully when both occur in the same minute.
+const CACHE_SCHEMA_VERSION: u16 = 4;
 const MINUTE_MS: u64 = 60_000;
 const DAY_MS: u64 = 24 * 60 * MINUTE_MS;
 const RETENTION_DAYS: u64 = 90;
@@ -19,9 +20,9 @@ struct CachedOpenInterestDay {
     schema_version: u16,
     source: String,
     day_start: u64,
-    /// One exact venue observation per minute. Repeated observations in the
-    /// same minute replace that minute's close rather than creating unbounded
-    /// duplicate rows.
+    /// One preferred venue observation per minute. Exact-time snapshots
+    /// outrank interval summaries; observations of the same kind keep the
+    /// newest timestamp rather than creating unbounded duplicate rows.
     points: BTreeMap<u64, CachedObservation>,
 }
 
@@ -29,6 +30,33 @@ struct CachedOpenInterestDay {
 struct CachedObservation {
     observed_at: u64,
     value: f64,
+    kind: OpenInterestKind,
+}
+
+impl From<OpenInterest> for CachedObservation {
+    fn from(value: OpenInterest) -> Self {
+        Self {
+            observed_at: value.time.as_u64(),
+            value: value.value,
+            kind: value.kind,
+        }
+    }
+}
+
+impl From<CachedObservation> for OpenInterest {
+    fn from(value: CachedObservation) -> Self {
+        Self {
+            time: UnixMs::new(value.observed_at),
+            value: value.value,
+            kind: value.kind,
+        }
+    }
+}
+
+impl CachedObservation {
+    fn supersedes(self, current: Self) -> bool {
+        OpenInterest::from(self).supersedes(current.into())
+    }
 }
 
 fn day_start(time: u64) -> u64 {
@@ -141,7 +169,7 @@ fn write_cached_day(
     for (time, observation) in updates {
         let should_replace = points
             .get(time)
-            .is_none_or(|current| observation.observed_at >= current.observed_at);
+            .is_none_or(|current| observation.supersedes(*current));
         if should_replace && points.get(time) != Some(observation) {
             points.insert(*time, *observation);
             changed = true;
@@ -231,10 +259,7 @@ fn load_range_from_root(
         let path = cache_path(root, source, day);
         if let Some(points) = read_cached_day(&path, source, day) {
             result.extend(points.into_iter().filter_map(|(minute, observation)| {
-                (minute >= from && minute <= to).then_some(OpenInterest {
-                    time: UnixMs::new(observation.observed_at),
-                    value: observation.value,
-                })
+                (minute >= from && minute <= to).then_some(OpenInterest::from(observation))
             }));
         }
         let next = day.saturating_add(DAY_MS);
@@ -287,13 +312,17 @@ fn merge_and_load_from_root(
         .filter(|point| point.time.as_u64() >= oldest)
     {
         let minute = minute_start(point.time.as_u64());
-        by_day.entry(day_start(minute)).or_default().insert(
-            minute,
-            CachedObservation {
-                observed_at: point.time.as_u64(),
-                value: point.value,
-            },
-        );
+        let observation = CachedObservation::from(*point);
+        by_day
+            .entry(day_start(minute))
+            .or_default()
+            .entry(minute)
+            .and_modify(|current| {
+                if observation.supersedes(*current) {
+                    *current = observation;
+                }
+            })
+            .or_insert(observation);
     }
     for (day, updates) in by_day {
         let path = cache_path(root, source, day);
@@ -314,7 +343,7 @@ fn merge_and_load_from_root(
         }
         let replace = merged
             .get(&minute)
-            .is_none_or(|current| point.time >= current.time);
+            .is_none_or(|current| point.supersedes(*current));
         if replace {
             merged.insert(minute, point);
         }
@@ -349,6 +378,7 @@ mod tests {
                 CachedObservation {
                     observed_at: day + MINUTE_MS + 1_000,
                     value: 100.0,
+                    kind: OpenInterestKind::Snapshot,
                 },
             ),
             (
@@ -356,6 +386,7 @@ mod tests {
                 CachedObservation {
                     observed_at: day + 2 * MINUTE_MS + 1_000,
                     value: 110.0,
+                    kind: OpenInterestKind::Snapshot,
                 },
             ),
         ]);
@@ -369,6 +400,7 @@ mod tests {
                 CachedObservation {
                     observed_at: day + MINUTE_MS + 2_000,
                     value: 105.0,
+                    kind: OpenInterestKind::Snapshot,
                 },
             )]),
         )
@@ -391,14 +423,8 @@ mod tests {
     fn invalid_values_are_not_persisted() {
         let now = UnixMs::now();
         let values = [
-            OpenInterest {
-                time: now,
-                value: f64::NAN,
-            },
-            OpenInterest {
-                time: now,
-                value: -1.0,
-            },
+            OpenInterest::snapshot(now, f64::NAN),
+            OpenInterest::snapshot(now, -1.0),
         ];
         let oldest = oldest_retained_day(now);
         let mut sorted = values
@@ -418,10 +444,7 @@ mod tests {
         let source = source();
         let now = UnixMs::new(200 * DAY_MS);
         let old_time = UnixMs::new(10 * DAY_MS + 1_000);
-        let values = [OpenInterest {
-            time: old_time,
-            value: 42.0,
-        }];
+        let values = [OpenInterest::snapshot(old_time, 42.0)];
 
         let merged = merge_and_load_from_root(
             &root,
@@ -443,14 +466,8 @@ mod tests {
         let minute = minute_start(now.as_u64()).saturating_sub(MINUTE_MS);
         let range = Some((UnixMs::new(minute), UnixMs::new(minute + MINUTE_MS)));
 
-        let newer = OpenInterest {
-            time: UnixMs::new(minute + 40_000),
-            value: 200.0,
-        };
-        let older = OpenInterest {
-            time: UnixMs::new(minute + 5_000),
-            value: 100.0,
-        };
+        let newer = OpenInterest::snapshot(UnixMs::new(minute + 40_000), 200.0);
+        let older = OpenInterest::snapshot(UnixMs::new(minute + 5_000), 100.0);
         let first = merge_and_load_from_root(&root, source, &[newer], range, now);
         let second = merge_and_load_from_root(&root, source, &[older], range, now);
 
@@ -458,6 +475,34 @@ mod tests {
         assert_eq!(second, vec![newer]);
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn snapshot_outranks_a_later_interval_summary_in_the_same_minute() {
+        let root = std::env::temp_dir().join(format!("flowsurface-oi-{}", uuid::Uuid::new_v4()));
+        let source = source();
+        let now = UnixMs::new(100 * DAY_MS + 5 * MINUTE_MS);
+        let minute = minute_start(now.as_u64()).saturating_sub(MINUTE_MS);
+        let range = Some((UnixMs::new(minute), UnixMs::new(minute + MINUTE_MS)));
+        let snapshot = OpenInterest::snapshot(UnixMs::new(minute + 16_000), 100.0);
+        let interval = OpenInterest::interval(UnixMs::new(minute + 59_999), 200.0);
+
+        let first = merge_and_load_from_root(&root, source, &[snapshot], range, now);
+        let second = merge_and_load_from_root(&root, source, &[interval], range, now);
+
+        assert_eq!(first, vec![snapshot]);
+        assert_eq!(second, vec![snapshot]);
+
+        let reverse_root =
+            std::env::temp_dir().join(format!("flowsurface-oi-{}", uuid::Uuid::new_v4()));
+        let first = merge_and_load_from_root(&reverse_root, source, &[interval], range, now);
+        let second = merge_and_load_from_root(&reverse_root, source, &[snapshot], range, now);
+
+        assert_eq!(first, vec![interval]);
+        assert_eq!(second, vec![snapshot]);
+
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(reverse_root);
     }
 
     #[test]

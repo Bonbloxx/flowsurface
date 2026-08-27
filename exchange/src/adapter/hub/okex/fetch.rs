@@ -377,10 +377,7 @@ pub(super) async fn fetch_historical_oi(
             let arr = row.as_array()?;
             let ts = serde_util::value_as_u64(arr.first()?)?;
             let oi_ccy = serde_util::value_as_f64(arr.get(2)?)?;
-            Some(OpenInterest {
-                time: ts.into(),
-                value: oi_ccy,
-            })
+            Some(OpenInterest::interval(ts.into(), oi_ccy))
         })
         .collect();
 

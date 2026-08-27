@@ -350,10 +350,7 @@ fn validate_oi_history_page(
             ));
         }
         *last_seen = Some(*bucket);
-        output.push(OpenInterest {
-            time: UnixMs::new(*observed_at),
-            value: *value,
-        });
+        output.push(OpenInterest::snapshot(UnixMs::new(*observed_at), *value));
     }
 
     match payload.next_from {
@@ -389,6 +386,46 @@ pub struct ServerClient {
 struct ServerCoverage {
     fetched_at: Option<Instant>,
     earliest_by_ticker: FxHashMap<String, Option<UnixMs>>,
+    ranges: FxHashMap<(String, u64, u64), CachedTradeCoverage>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedTradeCoverage {
+    fetched_at: Instant,
+    coverage: ServerTradeCoverage,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub(crate) struct ServerCoverageSegment {
+    pub from: u64,
+    pub to: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ServerTradeCoverage {
+    pub segments: Vec<ServerCoverageSegment>,
+}
+
+impl ServerTradeCoverage {
+    pub(crate) fn missing_ranges(&self, from: UnixMs, to: UnixMs) -> Vec<(UnixMs, UnixMs)> {
+        coverage_missing_ranges(&self.segments, from.as_u64(), to.as_u64())
+            .into_iter()
+            .map(|(start, end)| (UnixMs::new(start), UnixMs::new(end)))
+            .collect()
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ServerCoverageResponse {
+    version: u32,
+    venue: String,
+    market: String,
+    symbol: String,
+    requested_from: u64,
+    requested_to: u64,
+    proof: String,
+    segments: Vec<ServerCoverageSegment>,
+    complete: bool,
 }
 
 #[derive(Deserialize)]
@@ -403,6 +440,9 @@ struct ServerPair {
 }
 
 const SERVER_COVERAGE_TTL: Duration = Duration::from_secs(30);
+const SERVER_COVERAGE_VERSION: u32 = 1;
+const SERVER_COVERAGE_PROOF: &str = "recorder_capture_intervals_v1";
+const MAX_SERVER_COVERAGE_CACHE_ENTRIES: usize = 256;
 
 impl ServerClient {
     /// Create a new client targeting the given base URL
@@ -516,6 +556,112 @@ impl ServerClient {
         Ok(earliest)
     }
 
+    /// Return the server's proven stored intervals for an exact trade range.
+    ///
+    /// The response is treated as untrusted metadata: identity, request bounds,
+    /// schema version and segment ordering are all checked before any Arrow rows
+    /// are accepted as coverage.
+    pub(crate) async fn trade_coverage(
+        &self,
+        ticker_info: TickerInfo,
+        from: UnixMs,
+        to: UnixMs,
+    ) -> Result<ServerTradeCoverage, AdapterError> {
+        self.trade_coverage_inner(ticker_info, from, to, true).await
+    }
+
+    /// Refresh coverage without accepting the short-lived client cache.
+    ///
+    /// A just-closed trade range can race the recorder's two-second durable
+    /// flush. The caller uses this only after a bounded delay for a tiny recent
+    /// trailing gap; all historical queries continue to use the normal cache.
+    pub(crate) async fn refresh_trade_coverage(
+        &self,
+        ticker_info: TickerInfo,
+        from: UnixMs,
+        to: UnixMs,
+    ) -> Result<ServerTradeCoverage, AdapterError> {
+        self.trade_coverage_inner(ticker_info, from, to, false)
+            .await
+    }
+
+    async fn trade_coverage_inner(
+        &self,
+        ticker_info: TickerInfo,
+        from: UnixMs,
+        to: UnixMs,
+        allow_cache: bool,
+    ) -> Result<ServerTradeCoverage, AdapterError> {
+        let (venue, market, symbol) = server_source_parts(ticker_info);
+        let cache_key = (
+            format!("{venue}:{market}:{symbol}"),
+            from.as_u64(),
+            to.as_u64(),
+        );
+        if allow_cache
+            && let Ok(coverage) = self.coverage.read()
+            && let Some(cached) = coverage.ranges.get(&cache_key)
+            && cached.fetched_at.elapsed() < SERVER_COVERAGE_TTL
+        {
+            return Ok(cached.coverage.clone());
+        }
+
+        let url = format!("{}/coverage", self.base_url());
+        let mut request = self
+            .http_client()
+            .get(&url)
+            .query(&[
+                ("venue", venue.as_str()),
+                ("market", market.as_str()),
+                ("symbol", symbol.as_str()),
+            ])
+            .query(&[("from", from.as_u64().to_string())])
+            .query(&[("to", to.as_u64().to_string())]);
+        if let Some(token) = self.auth_token() {
+            request = request.header("Authorization", &format!("Bearer {token}"));
+        }
+        let response = request.send().await.map_err(|e| {
+            AdapterError::FetchError(FetchError::new(
+                format!("server coverage request failed: {e}"),
+                "External data source error. Check logs for details.",
+            ))
+        })?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(AdapterError::http_status_failed(
+                status,
+                format!("server coverage: {body}"),
+            ));
+        }
+        let payload = response
+            .json::<ServerCoverageResponse>()
+            .await
+            .map_err(|e| AdapterError::ParseError(format!("server coverage response: {e}")))?;
+        let coverage = validate_server_trade_coverage(
+            payload,
+            &venue,
+            &market,
+            &symbol,
+            from.as_u64(),
+            to.as_u64(),
+        )?;
+
+        if let Ok(mut cache) = self.coverage.write() {
+            if cache.ranges.len() >= MAX_SERVER_COVERAGE_CACHE_ENTRIES {
+                cache.ranges.clear();
+            }
+            cache.ranges.insert(
+                cache_key,
+                CachedTradeCoverage {
+                    fetched_at: Instant::now(),
+                    coverage: coverage.clone(),
+                },
+            );
+        }
+        Ok(coverage)
+    }
+
     /// Build a [`ServerClient`] from the shared HTTP client and the current
     /// network configuration.
     ///
@@ -539,19 +685,7 @@ impl ServerClient {
         to: UnixMs,
         limit: usize,
     ) -> Result<ParsedArrowBatch, AdapterError> {
-        let (venue, market) = {
-            let exchange = ticker_info.exchange();
-
-            let venue = exchange.venue().to_string().to_lowercase();
-            let market = exchange.market_type().to_string().to_lowercase();
-
-            (venue, market)
-        };
-        let symbol = if let Some(display_symbol) = ticker_info.ticker.display_symbol() {
-            display_symbol.to_lowercase()
-        } else {
-            ticker_info.ticker.to_string().to_lowercase()
-        };
+        let (venue, market, symbol) = server_source_parts(ticker_info);
 
         let url = format!("{}/trades.arrow", self.base_url());
 
@@ -610,19 +744,125 @@ impl ServerClient {
             AdapterError::ParseError(format!("server (arrow): {e}"))
         })?;
 
-        parse_arrow_trades(bytes, &ticker_info)
+        let parsed = parse_arrow_trades(bytes, &ticker_info)?;
+        validate_server_trade_page(&parsed, from, to, limit)?;
+        Ok(parsed)
     }
 }
 
 fn server_ticker_key(ticker_info: TickerInfo) -> Option<String> {
     let serialized = serde_json::to_value(ticker_info.ticker).ok()?;
     let (exchange, _) = serialized.as_str()?.split_once(':')?;
-    let symbol = ticker_info
-        .ticker
-        .display_symbol()
-        .map(str::to_owned)
-        .unwrap_or_else(|| ticker_info.ticker.to_string());
+    let symbol = server_symbol(ticker_info);
     Some(format!("{exchange}:{}", symbol.to_ascii_lowercase()).to_ascii_lowercase())
+}
+
+fn server_source_parts(ticker_info: TickerInfo) -> (String, String, String) {
+    let exchange = ticker_info.exchange();
+    let venue = exchange.venue().to_string().to_ascii_lowercase();
+    let market = exchange.market_type().to_string().to_ascii_lowercase();
+    let symbol = server_symbol(ticker_info).to_ascii_lowercase();
+    (venue, market, symbol)
+}
+
+/// Canonical symbol used by the recorder API.
+///
+/// Hyperliquid's public stream identifies native perpetuals by base asset
+/// (`BTC`), while the recorder catalog identifies the same venue market by
+/// its quoted display symbol (`BTCUSDC`). Fresh metadata normally carries that
+/// display alias, but old saved layouts and the native metadata response can
+/// legitimately restore an alias-less ticker. Falling back to raw `BTC` then
+/// produces a truthful-but-empty coverage response for the wrong recorder key.
+fn server_symbol(ticker_info: TickerInfo) -> String {
+    if let Some(display) = ticker_info.ticker.display_symbol() {
+        return display.to_owned();
+    }
+
+    let (native, market) = ticker_info.ticker.to_full_symbol_and_type();
+    if ticker_info.exchange().venue() == Venue::Hyperliquid
+        && market == MarketKind::LinearPerps
+        // Builder-deployed markets carry a `dex:asset` identity and may use a
+        // non-USDC collateral. Never guess their quote when metadata omitted
+        // the display alias.
+        && !native.contains(':')
+        && !native.to_ascii_uppercase().ends_with("USDC")
+    {
+        format!("{native}USDC")
+    } else {
+        native
+    }
+}
+
+fn validate_server_trade_coverage(
+    payload: ServerCoverageResponse,
+    expected_venue: &str,
+    expected_market: &str,
+    expected_symbol: &str,
+    expected_from: u64,
+    expected_to: u64,
+) -> Result<ServerTradeCoverage, AdapterError> {
+    if payload.version != SERVER_COVERAGE_VERSION
+        || !payload.venue.eq_ignore_ascii_case(expected_venue)
+        || !payload.market.eq_ignore_ascii_case(expected_market)
+        || !payload.symbol.eq_ignore_ascii_case(expected_symbol)
+        || payload.requested_from != expected_from
+        || payload.requested_to != expected_to
+        || payload.proof != SERVER_COVERAGE_PROOF
+    {
+        return Err(AdapterError::ParseError(
+            "server coverage metadata did not match the requested source/range".into(),
+        ));
+    }
+
+    let mut previous_to = None;
+    for segment in &payload.segments {
+        if segment.from > segment.to
+            || segment.from < expected_from
+            || segment.to > expected_to
+            || previous_to.is_some_and(|end| segment.from <= end)
+        {
+            return Err(AdapterError::ParseError(
+                "server coverage segments were invalid, overlapping, or unordered".into(),
+            ));
+        }
+        previous_to = Some(segment.to);
+    }
+
+    let computed_complete =
+        coverage_missing_ranges(&payload.segments, expected_from, expected_to).is_empty();
+    if payload.complete != computed_complete {
+        return Err(AdapterError::ParseError(
+            "server coverage completion flag contradicted its segments".into(),
+        ));
+    }
+    Ok(ServerTradeCoverage {
+        segments: payload.segments,
+    })
+}
+
+fn coverage_missing_ranges(
+    segments: &[ServerCoverageSegment],
+    from: u64,
+    to: u64,
+) -> Vec<(u64, u64)> {
+    if from > to {
+        return Vec::new();
+    }
+    let mut missing = Vec::new();
+    let mut cursor = from;
+    for segment in segments {
+        if segment.from > cursor {
+            missing.push((cursor, segment.from.saturating_sub(1)));
+        }
+        cursor = cursor.max(segment.to.saturating_add(1));
+        if cursor > to {
+            break;
+        }
+    }
+    if cursor <= to {
+        missing.push((cursor, to));
+    }
+    missing
 }
 
 #[cfg(test)]
@@ -646,6 +886,41 @@ mod tests {
     }
 
     #[test]
+    fn server_coverage_key_restores_aliasless_native_hyperliquid_perp() {
+        let source = TickerInfo::new(
+            Ticker::new("BTC", Exchange::HyperliquidLinear),
+            1.0,
+            0.001,
+            None,
+        );
+
+        assert_eq!(
+            server_ticker_key(source).as_deref(),
+            Some("hyperliquidlinear:btcusdc")
+        );
+        assert_eq!(
+            server_source_parts(source),
+            (
+                "hyperliquid".to_string(),
+                "linear".to_string(),
+                "btcusdc".to_string(),
+            )
+        );
+    }
+
+    #[test]
+    fn server_symbol_does_not_guess_builder_market_collateral() {
+        let source = TickerInfo::new(
+            Ticker::new("hyna:BTC", Exchange::HyperliquidLinear),
+            1.0,
+            0.001,
+            None,
+        );
+
+        assert_eq!(server_symbol(source), "hyna:BTC");
+    }
+
+    #[test]
     fn server_coverage_key_uses_native_symbol_without_alias() {
         let source = TickerInfo::new(
             Ticker::new("BTCUSDT", Exchange::BinanceLinear),
@@ -657,6 +932,78 @@ mod tests {
         assert_eq!(
             server_ticker_key(source).as_deref(),
             Some("binancelinear:btcusdt")
+        );
+    }
+
+    #[test]
+    fn server_coverage_complement_preserves_internal_and_boundary_gaps() {
+        let segments = [
+            ServerCoverageSegment { from: 110, to: 119 },
+            ServerCoverageSegment { from: 130, to: 140 },
+        ];
+        assert_eq!(
+            coverage_missing_ranges(&segments, 100, 150),
+            vec![(100, 109), (120, 129), (141, 150)]
+        );
+    }
+
+    #[test]
+    fn server_coverage_rejects_false_completion() {
+        let payload = ServerCoverageResponse {
+            version: SERVER_COVERAGE_VERSION,
+            venue: "bybit".into(),
+            market: "linear".into(),
+            symbol: "btcusdt".into(),
+            requested_from: 100,
+            requested_to: 200,
+            proof: SERVER_COVERAGE_PROOF.into(),
+            segments: vec![ServerCoverageSegment { from: 100, to: 150 }],
+            complete: true,
+        };
+        assert!(
+            validate_server_trade_coverage(payload, "bybit", "linear", "btcusdt", 100, 200)
+                .is_err()
+        );
+    }
+
+    fn valid_trade(time: u64) -> Trade {
+        Trade {
+            time: UnixMs::new(time),
+            is_sell: false,
+            price: Price::from_f64(100.0),
+            qty: exchange::unit::qty::Qty::from_f64(1.0),
+        }
+    }
+
+    #[test]
+    fn server_trade_page_accepts_only_complete_ordered_bounded_rows() {
+        let parsed = ParsedArrowBatch {
+            trades: vec![valid_trade(100), valid_trade(101)],
+            raw_row_count: 2,
+            last_ts: Some(UnixMs::new(101)),
+        };
+
+        assert!(validate_server_trade_page(&parsed, UnixMs::new(100), UnixMs::new(101), 2).is_ok());
+    }
+
+    #[test]
+    fn server_trade_page_rejects_missing_or_unordered_rows() {
+        let missing = ParsedArrowBatch {
+            trades: vec![valid_trade(100)],
+            raw_row_count: 2,
+            last_ts: Some(UnixMs::new(101)),
+        };
+        assert!(
+            validate_server_trade_page(&missing, UnixMs::new(100), UnixMs::new(101), 2).is_err()
+        );
+
+        let unordered = ParsedArrowBatch {
+            trades: vec![valid_trade(101), valid_trade(100)],
+            raw_row_count: 2,
+            last_ts: Some(UnixMs::new(100)),
+        };
+        assert!(
+            validate_server_trade_page(&unordered, UnixMs::new(100), UnixMs::new(101), 2).is_err()
         );
     }
 
@@ -756,10 +1103,7 @@ mod tests {
             60_000,
             120_000,
         );
-        let values = [OpenInterest {
-            time: UnixMs::new(61_000),
-            value: 10.0,
-        }];
+        let values = [OpenInterest::snapshot(UnixMs::new(61_000), 10.0)];
 
         client.cache_open_interest(key, &values);
 
@@ -836,6 +1180,64 @@ pub struct ParsedArrowBatch {
     /// filtered out due to nulls in other columns).  Used for cursor
     /// advancement in the paging loop.
     pub last_ts: Option<UnixMs>,
+}
+
+/// Fail closed on malformed recorder pages before any row reaches an
+/// indicator or a durable cache. Coverage metadata proves that an interval was
+/// recorded; every Arrow row inside that interval must still be complete,
+/// ordered, bounded by the request, and economically meaningful.
+fn validate_server_trade_page(
+    parsed: &ParsedArrowBatch,
+    from: UnixMs,
+    to: UnixMs,
+    limit: usize,
+) -> Result<(), AdapterError> {
+    if parsed.raw_row_count > limit {
+        return Err(AdapterError::ParseError(
+            "server trade page exceeded the requested row limit".into(),
+        ));
+    }
+    if parsed.raw_row_count != parsed.trades.len() {
+        return Err(AdapterError::ParseError(
+            "server trade page contained null or otherwise unusable required fields".into(),
+        ));
+    }
+    if parsed.trades.is_empty() {
+        return if parsed.last_ts.is_none() {
+            Ok(())
+        } else {
+            Err(AdapterError::ParseError(
+                "empty server trade page reported a paging timestamp".into(),
+            ))
+        };
+    }
+
+    let first = parsed.trades.first().expect("non-empty checked above");
+    let last = parsed.trades.last().expect("non-empty checked above");
+    if first.time < from || last.time > to || parsed.last_ts != Some(last.time) {
+        return Err(AdapterError::ParseError(
+            "server trade page fell outside its requested range or reported a false cursor".into(),
+        ));
+    }
+    if parsed
+        .trades
+        .windows(2)
+        .any(|pair| pair[0].time > pair[1].time)
+    {
+        return Err(AdapterError::ParseError(
+            "server trade page was not ordered by timestamp".into(),
+        ));
+    }
+    if parsed
+        .trades
+        .iter()
+        .any(|trade| trade.price.units <= 0 || trade.qty.units <= 0)
+    {
+        return Err(AdapterError::ParseError(
+            "server trade page contained a non-positive price or quantity".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Parse raw Arrow IPC stream bytes into a [`ParsedArrowBatch`].

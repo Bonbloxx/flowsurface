@@ -1,4 +1,4 @@
-use crate::chart::{Basis, Interaction, Message, ViewState};
+use crate::chart::{Basis, Interaction, Message, ViewState, active_crosshair_x};
 use crate::style::{self, dashed_line};
 use data::util::{guesstimate_ticks, round_to_tick};
 use exchange::UnixMs;
@@ -430,12 +430,13 @@ where
             }
 
             // Time-aligned stats follow the shared x-axis: hovering the main
-            // chart *or* this indicator row should show the datapoint tooltip.
+            // chart or any indicator row should show the datapoint tooltip.
             let over_self = cursor.position_in(bounds);
-            let cursor_x = cursor
+            let local_x = cursor
                 .position_in(ctx.bounds)
                 .or(over_self)
                 .map(|position| position.x);
+            let cursor_x = active_crosshair_x(local_x, ctx.crosshair_x());
 
             if let Some(cursor_x) = cursor_x {
                 let earliest_f = ctx.x_to_interval(region.x) as f64;

@@ -31,6 +31,12 @@ pub struct OpenInterestCandle {
     pub expected_source_count: usize,
 }
 
+fn change_text(value: &OpenInterestCandle) -> String {
+    let delta = value.close - value.open;
+    let sign = if delta >= 0.0 { "+" } else { "-" };
+    format!("Change: {sign}${}", format_with_commas(delta.abs()))
+}
+
 pub struct OpenInterestIndicator {
     cache: Caches,
     pub data: BTreeMap<UnixMs, OpenInterestCandle>,
@@ -154,7 +160,7 @@ impl OpenInterestIndicator {
         } else {
             "Venue-reported OI"
         };
-        let tooltip = move |value: &OpenInterestCandle, next: Option<&OpenInterestCandle>| {
+        let tooltip = move |value: &OpenInterestCandle, _next: Option<&OpenInterestCandle>| {
             let usd = |value: f64| format!("${}", format_with_commas(value));
             let value_text = format!(
                 "{value_label}: {} ({})\nO {}  H {}\nL {}  C {}",
@@ -165,13 +171,7 @@ impl OpenInterestIndicator {
                 usd(value.low),
                 usd(value.close),
             );
-            let change_text = if let Some(next_value) = next {
-                let delta = next_value.close - value.close;
-                let sign = if delta >= 0.0 { "+" } else { "" };
-                format!("Change: {sign}${}", format_with_commas(delta.abs()))
-            } else {
-                "Change: N/A".to_string()
-            };
+            let change_text = change_text(value);
             let coverage = format!(
                 "Sources: {}/{}",
                 value.source_count, value.expected_source_count
@@ -545,6 +545,26 @@ mod tests {
     }
 
     #[test]
+    fn tooltip_change_uses_the_hovered_candle_body() {
+        let rising = OpenInterestCandle {
+            open: 100.0,
+            high: 160.0,
+            low: 90.0,
+            close: 150.0,
+            source_count: 3,
+            expected_source_count: 3,
+        };
+        let falling = OpenInterestCandle {
+            open: 150.0,
+            close: 100.0,
+            ..rising
+        };
+
+        assert_eq!(change_text(&rising), "Change: +$50.00");
+        assert_eq!(change_text(&falling), "Change: -$50.00");
+    }
+
+    #[test]
     fn aggregates_venue_notional_and_builds_oi_candles() {
         let binance = source(Exchange::BinanceLinear, "BTCUSDT");
         let bybit = source(Exchange::BybitLinear, "BTCUSDT");
@@ -556,76 +576,31 @@ mod tests {
         indicator.on_source_open_interest(
             binance,
             &[
-                OpenInterest {
-                    time: UnixMs::new(300_000),
-                    value: 7_000_000_000.0,
-                },
-                OpenInterest {
-                    time: UnixMs::new(600_000),
-                    value: 7_100_000_000.0,
-                },
-                OpenInterest {
-                    time: UnixMs::new(900_000),
-                    value: 7_050_000_000.0,
-                },
-                OpenInterest {
-                    time: UnixMs::new(1_200_000),
-                    value: 7_150_000_000.0,
-                },
-                OpenInterest {
-                    time: UnixMs::new(1_500_000),
-                    value: 7_200_000_000.0,
-                },
+                OpenInterest::snapshot(UnixMs::new(300_000), 7_000_000_000.0),
+                OpenInterest::snapshot(UnixMs::new(600_000), 7_100_000_000.0),
+                OpenInterest::snapshot(UnixMs::new(900_000), 7_050_000_000.0),
+                OpenInterest::snapshot(UnixMs::new(1_200_000), 7_150_000_000.0),
+                OpenInterest::snapshot(UnixMs::new(1_500_000), 7_200_000_000.0),
             ],
         );
         indicator.on_source_open_interest(
             bybit,
             &[
-                OpenInterest {
-                    time: UnixMs::new(300_000),
-                    value: 4_000_000_000.0,
-                },
-                OpenInterest {
-                    time: UnixMs::new(600_000),
-                    value: 3_900_000_000.0,
-                },
-                OpenInterest {
-                    time: UnixMs::new(900_000),
-                    value: 3_950_000_000.0,
-                },
-                OpenInterest {
-                    time: UnixMs::new(1_200_000),
-                    value: 3_850_000_000.0,
-                },
-                OpenInterest {
-                    time: UnixMs::new(1_500_000),
-                    value: 3_800_000_000.0,
-                },
+                OpenInterest::snapshot(UnixMs::new(300_000), 4_000_000_000.0),
+                OpenInterest::snapshot(UnixMs::new(600_000), 3_900_000_000.0),
+                OpenInterest::snapshot(UnixMs::new(900_000), 3_950_000_000.0),
+                OpenInterest::snapshot(UnixMs::new(1_200_000), 3_850_000_000.0),
+                OpenInterest::snapshot(UnixMs::new(1_500_000), 3_800_000_000.0),
             ],
         );
         indicator.on_source_open_interest(
             hyperliquid,
             &[
-                OpenInterest {
-                    time: UnixMs::new(600_123),
-                    value: 2_500_000_000.0,
-                },
-                OpenInterest {
-                    time: UnixMs::new(900_000),
-                    value: 2_600_000_000.0,
-                },
-                OpenInterest {
-                    time: UnixMs::new(1_200_123),
-                    value: 2_550_000_000.0,
-                },
-                OpenInterest {
-                    time: UnixMs::new(1_500_000),
-                    value: 2_650_000_000.0,
-                },
-                OpenInterest {
-                    time: UnixMs::new(1_800_123),
-                    value: 2_700_000_000.0,
-                },
+                OpenInterest::snapshot(UnixMs::new(600_123), 2_500_000_000.0),
+                OpenInterest::snapshot(UnixMs::new(900_000), 2_600_000_000.0),
+                OpenInterest::snapshot(UnixMs::new(1_200_123), 2_550_000_000.0),
+                OpenInterest::snapshot(UnixMs::new(1_500_000), 2_650_000_000.0),
+                OpenInterest::snapshot(UnixMs::new(1_800_123), 2_700_000_000.0),
             ],
         );
 
@@ -648,10 +623,7 @@ mod tests {
         indicator.timeframe = Some(Timeframe::M5);
         indicator.configure_open_interest(&[binance, hyperliquid]);
 
-        let oi = |time: u64, value: f64| OpenInterest {
-            time: UnixMs::new(time),
-            value,
-        };
+        let oi = |time: u64, value: f64| OpenInterest::snapshot(UnixMs::new(time), value);
         // Constant per-source values so any coverage-driven step in the
         // aggregate would be visible as a candle whose close != open.
         indicator.on_source_open_interest(
@@ -704,36 +676,21 @@ mod tests {
         indicator.on_source_open_interest(
             binance,
             &[
-                OpenInterest {
-                    time: UnixMs::new(300_000),
-                    value: 7_000_000_000.0,
-                },
-                OpenInterest {
-                    time: UnixMs::new(600_000),
-                    value: 7_100_000_000.0,
-                },
-                OpenInterest {
-                    time: UnixMs::new(900_000),
-                    value: 7_050_000_000.0,
-                },
-                OpenInterest {
-                    time: UnixMs::new(1_200_000),
-                    value: 7_150_000_000.0,
-                },
-                OpenInterest {
-                    time: UnixMs::new(1_500_000),
-                    value: 7_200_000_000.0,
-                },
+                OpenInterest::snapshot(UnixMs::new(300_000), 7_000_000_000.0),
+                OpenInterest::snapshot(UnixMs::new(600_000), 7_100_000_000.0),
+                OpenInterest::snapshot(UnixMs::new(900_000), 7_050_000_000.0),
+                OpenInterest::snapshot(UnixMs::new(1_200_000), 7_150_000_000.0),
+                OpenInterest::snapshot(UnixMs::new(1_500_000), 7_200_000_000.0),
             ],
         );
         // A single live snapshot must not enter the aggregate: it would add
         // its whole notional to the newest candles and then age out again.
         indicator.on_source_open_interest(
             hyperliquid,
-            &[OpenInterest {
-                time: UnixMs::new(600_123),
-                value: 2_500_000_000.0,
-            }],
+            &[OpenInterest::snapshot(
+                UnixMs::new(600_123),
+                2_500_000_000.0,
+            )],
         );
 
         assert!(indicator.data.is_empty());
@@ -752,10 +709,10 @@ mod tests {
 
         indicator.on_source_open_interest(
             hyperliquid,
-            &[OpenInterest {
-                time: UnixMs::new(660_123),
-                value: 2_500_000_000.0,
-            }],
+            &[OpenInterest::snapshot(
+                UnixMs::new(660_123),
+                2_500_000_000.0,
+            )],
         );
 
         let candle = indicator.data[&UnixMs::new(660_000)];
@@ -775,10 +732,7 @@ mod tests {
             binance,
             &[
                 OpenInterest::completed_interval(UnixMs::new(600_000), 10.0),
-                OpenInterest {
-                    time: UnixMs::new(600_123),
-                    value: 11.0,
-                },
+                OpenInterest::snapshot(UnixMs::new(600_123), 11.0),
             ],
         );
 
@@ -794,10 +748,7 @@ mod tests {
         indicator.timeframe = Some(Timeframe::M5);
         indicator.configure_open_interest(&[binance, bybit]);
 
-        let oi = |time: u64, value: f64| OpenInterest {
-            time: UnixMs::new(time),
-            value,
-        };
+        let oi = |time: u64, value: f64| OpenInterest::snapshot(UnixMs::new(time), value);
         // Bybit stops updating after 1_800_000 but has enough history to
         // qualify; within the carry-forward window its last known value is
         // used so a slow publisher does not read as an OI outflow.
@@ -847,10 +798,7 @@ mod tests {
         indicator.timeframe = Some(Timeframe::M5);
         indicator.configure_open_interest(&[binance, bybit]);
 
-        let oi = |time: u64, value: f64| OpenInterest {
-            time: UnixMs::new(time),
-            value,
-        };
+        let oi = |time: u64, value: f64| OpenInterest::snapshot(UnixMs::new(time), value);
         // Bybit qualifies but goes silent after 1_500_000. Its value may be
         // carried forward across two buckets (1_800_000 and 2_100_000) but
         // must then be excluded: keeping the stale notional in the sum would
@@ -891,9 +839,11 @@ mod tests {
         indicator.configure_open_interest(&[binance, bybit]);
 
         let current_minute = UnixMs::now().as_u64() / 60_000 * 60_000;
-        let oi = |minutes_ago: u64, value: f64| OpenInterest {
-            time: UnixMs::new(current_minute.saturating_sub(minutes_ago * 60_000)),
-            value,
+        let oi = |minutes_ago: u64, value: f64| {
+            OpenInterest::snapshot(
+                UnixMs::new(current_minute.saturating_sub(minutes_ago * 60_000)),
+                value,
+            )
         };
         indicator.on_source_open_interest(
             binance,
@@ -975,26 +925,11 @@ mod tests {
         indicator.on_source_open_interest(
             binance,
             &[
-                OpenInterest {
-                    time: UnixMs::new(300_000),
-                    value: 10.0,
-                },
-                OpenInterest {
-                    time: UnixMs::new(600_000),
-                    value: 12.0,
-                },
-                OpenInterest {
-                    time: UnixMs::new(900_000),
-                    value: 11.0,
-                },
-                OpenInterest {
-                    time: UnixMs::new(1_200_000),
-                    value: 14.0,
-                },
-                OpenInterest {
-                    time: UnixMs::new(1_500_000),
-                    value: 13.0,
-                },
+                OpenInterest::snapshot(UnixMs::new(300_000), 10.0),
+                OpenInterest::snapshot(UnixMs::new(600_000), 12.0),
+                OpenInterest::snapshot(UnixMs::new(900_000), 11.0),
+                OpenInterest::snapshot(UnixMs::new(1_200_000), 14.0),
+                OpenInterest::snapshot(UnixMs::new(1_500_000), 13.0),
             ],
         );
 
@@ -1040,9 +975,8 @@ mod tests {
         ];
         let series = |base: f64| {
             (1..=6)
-                .map(|minute| OpenInterest {
-                    time: UnixMs::new(minute * 60_000),
-                    value: base + minute as f64,
+                .map(|minute| {
+                    OpenInterest::snapshot(UnixMs::new(minute * 60_000), base + minute as f64)
                 })
                 .collect::<Vec<_>>()
         };
@@ -1056,14 +990,8 @@ mod tests {
         incremental.on_source_open_interest(sources[1], &second);
 
         first[3].value = 150.0;
-        first.push(OpenInterest {
-            time: UnixMs::new(7 * 60_000),
-            value: 160.0,
-        });
-        second.push(OpenInterest {
-            time: UnixMs::new(7 * 60_000),
-            value: 260.0,
-        });
+        first.push(OpenInterest::snapshot(UnixMs::new(7 * 60_000), 160.0));
+        second.push(OpenInterest::snapshot(UnixMs::new(7 * 60_000), 260.0));
         incremental.on_source_open_interest(sources[0], &[first[3], first[6]]);
         incremental.on_source_open_interest(sources[1], &[second[6]]);
 
@@ -1089,9 +1017,11 @@ mod tests {
         indicator.timeframe = Some(Timeframe::M1);
         indicator.configure_open_interest(&sources);
         let values = (0..POINTS_PER_SOURCE)
-            .map(|minute| OpenInterest {
-                time: UnixMs::new(minute * 60_000),
-                value: 1_000_000_000.0 + minute as f64,
+            .map(|minute| {
+                OpenInterest::snapshot(
+                    UnixMs::new(minute * 60_000),
+                    1_000_000_000.0 + minute as f64,
+                )
             })
             .collect::<Vec<_>>();
 
@@ -1106,10 +1036,10 @@ mod tests {
         for (index, source) in sources.into_iter().enumerate() {
             indicator.on_source_open_interest(
                 source,
-                &[OpenInterest {
-                    time: UnixMs::new(POINTS_PER_SOURCE * 60_000),
-                    value: 2_000_000_000.0 + index as f64,
-                }],
+                &[OpenInterest::snapshot(
+                    UnixMs::new(POINTS_PER_SOURCE * 60_000),
+                    2_000_000_000.0 + index as f64,
+                )],
             );
         }
         let incremental_elapsed = incremental.elapsed();

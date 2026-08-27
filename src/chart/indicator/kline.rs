@@ -13,6 +13,7 @@ use iced::{Rectangle, widget::canvas};
 use super::plot::AnySeries;
 
 pub mod bar_analysis;
+pub mod cme_gap;
 pub mod cumulative_delta;
 pub mod daily_delta;
 pub mod footprint_history;
@@ -189,6 +190,16 @@ pub trait KlineIndicatorImpl {
     /// Atomically publish every staged page owned by `req_id`.
     fn commit_staged_source_trades(&mut self, _req_id: uuid::Uuid) {}
 
+    /// Record exact uncovered intervals after publishing only recorder-proven
+    /// pages. Implementations must keep these ranges out of durable completion
+    /// checkpoints and any calculations that require continuous history.
+    fn mark_incomplete_trade_history(
+        &mut self,
+        _source: exchange::TickerInfo,
+        _missing_ranges: &[(UnixMs, UnixMs)],
+    ) {
+    }
+
     /// Discard every staged page owned by a failed, cancelled or stale fetch.
     fn discard_staged_source_trades(&mut self, _req_id: uuid::Uuid) {}
 
@@ -271,6 +282,7 @@ pub fn make_empty(which: KlineIndicator) -> Box<dyn KlineIndicatorImpl> {
         KlineIndicator::DailyDelta => {
             Box::new(super::kline::daily_delta::DailyDeltaIndicator::new())
         }
+        KlineIndicator::CmeGap => Box::new(super::kline::cme_gap::CmeGapIndicator::new()),
         KlineIndicator::PreviousValueArea => {
             Box::new(super::kline::previous_value_area::PreviousValueAreaIndicator::new())
         }

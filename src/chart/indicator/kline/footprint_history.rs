@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 pub(crate) const DAY_MS: u64 = 24 * 60 * 60 * 1_000;
 const ONE_MIN_MS: u64 = 60 * 1_000;
 const FIVE_MIN_MS: u64 = 5 * 60 * 1_000;
-const DELTA_ROUNDING_EPSILON: f64 = 0.01;
+pub(crate) const DELTA_ROUNDING_EPSILON: f64 = 0.01;
 pub(crate) const DAYS: usize = 3;
 /// v2: binary (bincode) encoding. A busy day serializes an order of magnitude
 /// faster than the previous JSON format, which blocked the UI thread for
@@ -46,6 +46,60 @@ pub(crate) const DAYS: usize = 3;
 /// a second time when producing USD notionals.
 pub(crate) const CACHE_SCHEMA_VERSION: u16 = 7;
 const MAX_LOOKBACK_DAYS: usize = 732;
+// v2 invalidates any completion proof produced before Hyperliquid replay IDs
+// were deduplicated and its legacy recorder coverage was retired. Valid days
+// are fetched once from the recorder again; unproven days remain uncached.
+const CACHE_PROOF_VERSION: &str = "flowsurface-complete-range-v2";
+
+fn cache_proof_path(path: &Path) -> PathBuf {
+    path.with_extension(format!(
+        "{}.proof",
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("cache")
+    ))
+}
+
+fn cache_bytes_fingerprint(bytes: &[u8]) -> String {
+    // FNV-1a is used only to bind the completion proof to exact cache bytes;
+    // this is corruption/stale-marker detection, not authentication.
+    let hash = bytes.iter().fold(0xcbf29ce484222325u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+    });
+    format!("{CACHE_PROOF_VERSION}\n{}\n{hash:016x}\n", bytes.len())
+}
+
+pub(crate) fn cache_has_completion_proof(path: &Path, bytes: &[u8]) -> bool {
+    std::fs::read_to_string(cache_proof_path(path))
+        .is_ok_and(|proof| proof == cache_bytes_fingerprint(bytes))
+}
+
+pub(crate) fn write_cache_with_completion_proof(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let proof_path = cache_proof_path(path);
+    let cache_temp = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+    let proof_temp = proof_path.with_extension(format!("proof.{}.tmp", uuid::Uuid::new_v4()));
+
+    // Invalidate the old proof before replacing bytes. A crash at any later
+    // point leaves an untrusted cache, never a falsely trusted one.
+    if proof_path.exists() {
+        std::fs::remove_file(&proof_path)?;
+    }
+    std::fs::write(&cache_temp, bytes)?;
+    if path.exists() {
+        std::fs::remove_file(path)?;
+    }
+    if let Err(err) = std::fs::rename(&cache_temp, path) {
+        let _ = std::fs::remove_file(&cache_temp);
+        return Err(err);
+    }
+
+    std::fs::write(&proof_temp, cache_bytes_fingerprint(bytes))?;
+    if let Err(err) = std::fs::rename(&proof_temp, &proof_path) {
+        let _ = std::fs::remove_file(&proof_temp);
+        return Err(err);
+    }
+    Ok(())
+}
 
 /// Notional floor (quote currency) at which an executed trade is retained for
 /// the Large Trades overlay. Matches the lowest configurable UI threshold so
@@ -143,6 +197,21 @@ pub(crate) fn missing_day_range(
     (missing_start <= end).then_some((missing_start, end))
 }
 
+fn merge_ranges(mut ranges: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
+    ranges.sort_unstable_by_key(|range| range.0);
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        if let Some((_, previous_end)) = merged.last_mut()
+            && start <= previous_end.saturating_add(1)
+        {
+            *previous_end = (*previous_end).max(end);
+        } else {
+            merged.push((start, end));
+        }
+    }
+    merged
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Deserialize, Serialize)]
 pub(crate) struct LevelStats {
     bid: f64,
@@ -209,6 +278,17 @@ pub(crate) struct DayBookRetain {
     pub one_min_delta: bool,
     pub five_min_delta: bool,
     pub large_trades: bool,
+}
+
+/// One active venue's execution-derived CVD inputs for a UTC day.
+///
+/// `missing_ranges` is the exact recorder-uncovered complement for this
+/// source. Keeping it source-local lets aggregate CVD retain the venues that
+/// are proven for a bucket instead of discarding every venue when only one
+/// recorder stream has a gap.
+pub(crate) struct CvdSourceDay {
+    pub(crate) deltas: BTreeMap<u64, f64>,
+    pub(crate) missing_ranges: Vec<(u64, u64)>,
 }
 
 impl DayBookRetain {
@@ -483,6 +563,26 @@ impl DayStats {
     }
 }
 
+fn source_cvd_deltas_from(stats: &DayStats, from: u64) -> BTreeMap<u64, f64> {
+    let mut deltas = stats
+        .five_min_delta
+        .range(from..)
+        .map(|(bucket, delta)| (*bucket, *delta))
+        .collect::<BTreeMap<_, _>>();
+    for (minute, delta) in stats.one_min_deltas().range(from..) {
+        let five_min_bucket = minute / FIVE_MIN_MS * FIVE_MIN_MS;
+        if five_min_bucket >= from
+            && stats.five_min_delta.contains_key(&five_min_bucket)
+            && let Some(coarse) = deltas.get_mut(&five_min_bucket)
+        {
+            *coarse -= *delta;
+        }
+        *deltas.entry(*minute).or_default() += *delta;
+    }
+    deltas.retain(|_, delta| delta.abs() > DELTA_ROUNDING_EPSILON);
+    deltas
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 struct OiDay {
     first: Option<(UnixMs, f64)>,
@@ -542,6 +642,13 @@ pub struct FootprintHistoryIndicator {
     lookback_days: usize,
     histories: FxHashMap<Ticker, SourceHistory>,
     history_cutoffs: FxHashMap<Ticker, UnixMs>,
+    /// Boundary immediately before the first accepted live execution for each
+    /// source. Recorder gaps after this point belong to the live stream and
+    /// must not permanently invalidate the bucket that contains the seam.
+    live_history_cutoffs: FxHashMap<Ticker, UnixMs>,
+    /// Set once the planner requests historical executions. Until then the
+    /// indicator intentionally operates in explicit live-only mode.
+    history_requested: bool,
     historical_days_started: FxHashSet<(Ticker, u64)>,
     /// Request-owned historical deltas. Pages are not visible and cannot be
     /// persisted until their fetch reaches terminal completion.
@@ -552,6 +659,9 @@ pub struct FootprintHistoryIndicator {
     live_seam_days: FxHashSet<(Ticker, u64)>,
     completed_days: FxHashSet<(Ticker, u64)>,
     cache_checkpoints: FxHashMap<(Ticker, u64), Option<UnixMs>>,
+    /// Exact recorder holes for requests whose proven segments were retained
+    /// in memory. These ranges never count as cache coverage.
+    incomplete_ranges: FxHashMap<(Ticker, u64), Vec<(u64, u64)>>,
     retain: DayBookRetain,
     /// When true, keep a merged 3-day display snapshot so iced `view()` does
     /// not clone/merge venue level maps on every mouse move.
@@ -571,11 +681,14 @@ impl FootprintHistoryIndicator {
             lookback_days: DAYS,
             histories: FxHashMap::default(),
             history_cutoffs: FxHashMap::default(),
+            live_history_cutoffs: FxHashMap::default(),
+            history_requested: false,
             historical_days_started: FxHashSet::default(),
             historical_staging: FxHashMap::default(),
             live_seam_days: FxHashSet::default(),
             completed_days: FxHashSet::default(),
             cache_checkpoints: FxHashMap::default(),
+            incomplete_ranges: FxHashMap::default(),
             retain: DayBookRetain::ALL,
             track_display: false,
             display: Box::default(),
@@ -688,6 +801,12 @@ impl FootprintHistoryIndicator {
                 return None;
             }
         };
+        if !cache_has_completion_proof(path, &bytes) {
+            log::warn!(
+                "Footprint cache {path:?} predates verified range proofs; preserving it on disk but refusing its checkpoint"
+            );
+            return None;
+        }
         let (cached, _) = match bincode::serde::decode_from_slice::<CachedDayStats, _>(
             &bytes,
             bincode::config::standard(),
@@ -761,19 +880,7 @@ impl FootprintHistoryIndicator {
         };
         let bytes = bincode::serde::encode_to_vec(&payload, bincode::config::standard())
             .map_err(std::io::Error::other)?;
-        let temp_path = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
-        std::fs::write(&temp_path, bytes)?;
-        if path.exists() {
-            std::fs::remove_file(path)?;
-        }
-        if let Err(err) = std::fs::rename(&temp_path, path) {
-            let target_won_race = path.exists();
-            let _ = std::fs::remove_file(&temp_path);
-            if !target_won_race {
-                return Err(err);
-            }
-        }
-        Ok(())
+        write_cache_with_completion_proof(path, &bytes)
     }
 
     pub(crate) fn load_day_cache(&mut self, source: TickerInfo, day: UnixMs) -> Option<UnixMs> {
@@ -853,6 +960,7 @@ impl FootprintHistoryIndicator {
         {
             return;
         }
+        self.accept_verified_day(source, UnixMs::new(day), covered_through);
         let Some(stats) = self
             .histories
             .get_mut(&source.ticker)
@@ -862,9 +970,6 @@ impl FootprintHistoryIndicator {
         };
         stats.compact_large_trades();
         let complete = Self::day_is_complete(UnixMs::new(day), covered_through);
-        if complete {
-            self.completed_days.insert((source.ticker, day));
-        }
         if !self.retain.levels {
             // Incomplete books (Large Trades skips price levels) must not
             // occupy the shared on-disk path: Footprint History would treat
@@ -872,8 +977,6 @@ impl FootprintHistoryIndicator {
             // They still consumed this request successfully in memory. Advance
             // their local checkpoint or the planner will request the identical
             // missing suffix again for the rest of the session.
-            self.cache_checkpoints
-                .insert((source.ticker, day), Some(covered_through));
             return;
         }
         let path = Self::cache_path(source, day);
@@ -884,8 +987,6 @@ impl FootprintHistoryIndicator {
         if !self.retain.large_trades && complete {
             stats.large_trades.clear();
         }
-        self.cache_checkpoints
-            .insert((source.ticker, day), Some(covered_through));
         std::thread::Builder::new()
             .name("footprint-cache-writer".to_string())
             .spawn(move || {
@@ -900,6 +1001,37 @@ impl FootprintHistoryIndicator {
                 log::warn!("Failed to spawn footprint cache writer: {err}");
             });
         log::debug!("Stored footprint day cache for {} at {day}", source.ticker);
+    }
+
+    pub(crate) fn accept_verified_day(
+        &mut self,
+        source: TickerInfo,
+        day: UnixMs,
+        covered_through: UnixMs,
+    ) {
+        let day = day_start(day);
+        self.cache_checkpoints
+            .insert((source.ticker, day), Some(covered_through));
+        if let Some(ranges) = self.incomplete_ranges.get_mut(&(source.ticker, day)) {
+            let through = covered_through.as_u64();
+            ranges.retain_mut(|(start, end)| {
+                if *end <= through {
+                    return false;
+                }
+                if *start <= through {
+                    *start = through.saturating_add(1);
+                }
+                true
+            });
+            if ranges.is_empty() {
+                self.incomplete_ranges.remove(&(source.ticker, day));
+            }
+        }
+        if Self::day_is_complete(UnixMs::new(day), covered_through) {
+            self.completed_days.insert((source.ticker, day));
+        }
+        self.rebuild_display();
+        self.clear_all_caches();
     }
 
     fn retain_oldest(&self, now: UnixMs) -> u64 {
@@ -936,6 +1068,74 @@ impl FootprintHistoryIndicator {
         }
     }
 
+    fn day_has_verified_coverage(&self, day: u64) -> bool {
+        !self.history_requested
+            || self.active_sources().iter().all(|source| {
+                self.incomplete_ranges
+                    .get(&(source.ticker, day))
+                    .is_none_or(Vec::is_empty)
+                    && self
+                        .cache_checkpoints
+                        .get(&(source.ticker, day))
+                        .copied()
+                        .flatten()
+                        .is_some()
+            })
+    }
+
+    fn cvd_source_missing_ranges(&self, source: TickerInfo, day: u64) -> Vec<(u64, u64)> {
+        if !self.history_requested {
+            return Vec::new();
+        }
+        let day = day_start(UnixMs::new(day));
+        if let Some(ranges) = self.incomplete_ranges.get(&(source.ticker, day))
+            && !ranges.is_empty()
+        {
+            return ranges.clone();
+        }
+        if self
+            .cache_checkpoints
+            .get(&(source.ticker, day))
+            .copied()
+            .flatten()
+            .is_some()
+        {
+            return Vec::new();
+        }
+        vec![(day, day.saturating_add(DAY_MS).saturating_sub(1))]
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cvd_missing_ranges(&self, day: u64) -> Vec<(u64, u64)> {
+        if !self.history_requested {
+            return Vec::new();
+        }
+        let day = day_start(UnixMs::new(day));
+        let mut missing = Vec::new();
+        for source in self.active_sources() {
+            missing.extend(self.cvd_source_missing_ranges(*source, day));
+        }
+        merge_ranges(missing)
+    }
+
+    pub(crate) fn cvd_source_days_from(&self, day: u64, from: u64) -> Vec<CvdSourceDay> {
+        let day = day_start(UnixMs::new(day));
+        self.active_sources()
+            .iter()
+            .map(|source| {
+                let deltas = self
+                    .histories
+                    .get(&source.ticker)
+                    .and_then(|history| history.days.get(&day))
+                    .map_or_else(BTreeMap::new, |stats| source_cvd_deltas_from(stats, from));
+                CvdSourceDay {
+                    deltas,
+                    missing_ranges: self.cvd_source_missing_ranges(*source, day),
+                }
+            })
+            .collect()
+    }
+
     #[cfg(test)]
     pub(crate) fn display_days(&self, now: UnixMs) -> [DisplayDay; DAYS] {
         let days = self.display_day_list(now, DAYS);
@@ -944,6 +1144,9 @@ impl FootprintHistoryIndicator {
 
     pub(crate) fn display_day_at(&self, day: u64) -> DisplayDay {
         let mut result = DisplayDay::default();
+        if !self.day_has_verified_coverage(day) {
+            return result;
+        }
         let mut oi_delta = 0.0;
         let mut has_oi = false;
         for source in self.active_sources() {
@@ -967,7 +1170,26 @@ impl FootprintHistoryIndicator {
     /// ingested this session contribute one-minute samples; their amounts are
     /// subtracted from the matching five-minute total before being reinserted
     /// at minute resolution, so no execution can be counted twice.
+    #[cfg(test)]
     pub(crate) fn merged_cvd_deltas_from(&self, day: u64, from: u64) -> BTreeMap<u64, f64> {
+        if self.history_requested
+            && self.active_sources().iter().any(|source| {
+                self.cache_checkpoints
+                    .get(&(source.ticker, day))
+                    .copied()
+                    .flatten()
+                    .is_none()
+                    && self
+                        .incomplete_ranges
+                        .get(&(source.ticker, day))
+                        .is_none_or(Vec::is_empty)
+            })
+        {
+            // Until every venue has either a verified checkpoint or exact
+            // missing intervals, there is no honest boundary at which an
+            // aggregate CVD segment can start.
+            return BTreeMap::new();
+        }
         let mut merged = BTreeMap::<u64, f64>::new();
         for source in self.active_sources() {
             let Some(stats) = self
@@ -977,18 +1199,8 @@ impl FootprintHistoryIndicator {
             else {
                 continue;
             };
-            for (bucket, delta) in stats.five_min_delta.range(from..) {
-                *merged.entry(*bucket).or_default() += *delta;
-            }
-            for (minute, delta) in stats.one_min_deltas().range(from..) {
-                let five_min_bucket = minute / FIVE_MIN_MS * FIVE_MIN_MS;
-                if five_min_bucket >= from
-                    && stats.five_min_delta.contains_key(&five_min_bucket)
-                    && let Some(coarse) = merged.get_mut(&five_min_bucket)
-                {
-                    *coarse -= *delta;
-                }
-                *merged.entry(*minute).or_default() += *delta;
+            for (bucket, delta) in source_cvd_deltas_from(stats, from) {
+                *merged.entry(bucket).or_default() += delta;
             }
         }
         merged.retain(|_, delta| delta.abs() > DELTA_ROUNDING_EPSILON);
@@ -1031,6 +1243,10 @@ impl FootprintHistoryIndicator {
         threshold_usd: f32,
         mut visit: impl FnMut(StoredLargeTrade),
     ) {
+        // Individual markers remain truthful even when another interval in the
+        // same day is missing. Unlike daily totals or profiles, they do not
+        // imply continuous coverage; partial fetches contain only
+        // recorder-proven segments.
         let floor =
             f64::from(threshold_usd.max(data::chart::kline::Config::LARGE_TRADES_MIN_USD_MIN));
         for source in self.active_sources() {
@@ -1164,6 +1380,10 @@ impl FootprintHistoryIndicator {
     }
 
     fn history_note(&self) -> Option<&'static str> {
+        let today = day_start(UnixMs::now());
+        if self.history_requested && !self.day_has_verified_coverage(today) {
+            return Some("History incomplete · waiting for verified venue coverage");
+        }
         match trade_fetch_mode() {
             TradeFetchMode::Off => Some("Live data only · enable historical trades in Network"),
             TradeFetchMode::Exchange
@@ -1228,6 +1448,23 @@ impl FootprintHistoryIndicator {
         })
         .into()
     }
+
+    fn clip_incomplete_ranges_to_live_cutoff(&mut self, source: Ticker, cutoff: UnixMs) {
+        let cutoff = cutoff.as_u64();
+        self.incomplete_ranges.retain(|(candidate, _), ranges| {
+            if !candidate.same_market(&source) {
+                return true;
+            }
+            ranges.retain_mut(|(start, end)| {
+                if *start > cutoff {
+                    return false;
+                }
+                *end = (*end).min(cutoff);
+                true
+            });
+            !ranges.is_empty()
+        });
+    }
 }
 
 impl KlineIndicatorImpl for FootprintHistoryIndicator {
@@ -1284,8 +1521,10 @@ impl KlineIndicatorImpl for FootprintHistoryIndicator {
         self.live_seam_days.clear();
         self.completed_days.clear();
         self.cache_checkpoints.clear();
+        self.incomplete_ranges.clear();
         self.histories.clear();
         self.history_cutoffs.clear();
+        self.live_history_cutoffs.clear();
         self.rebuild_display();
         self.clear_all_caches();
     }
@@ -1300,6 +1539,7 @@ impl KlineIndicatorImpl for FootprintHistoryIndicator {
     }
 
     fn prepare_footprint_history(&mut self, source: TickerInfo, cutoff: UnixMs) {
+        self.history_requested = true;
         // The first planner pass can run before the trade WebSocket connects,
         // making this a provisional boundary. Once the first live execution
         // is known, the planner advances `cutoff` to immediately before it so
@@ -1351,9 +1591,16 @@ impl KlineIndicatorImpl for FootprintHistoryIndicator {
         if !historical && let Some(first_live) = trades.iter().map(|trade| trade.time).min() {
             // Stop history immediately before the first accepted live print.
             // This protects pre-hydration live data without replay overlap.
+            let live_cutoff = first_live.saturating_sub(1);
             self.history_cutoffs
                 .entry(source_key)
-                .or_insert_with(|| first_live.saturating_sub(1));
+                .or_insert(live_cutoff);
+            let live_cutoff = *self
+                .live_history_cutoffs
+                .entry(source_key)
+                .and_modify(|current| *current = (*current).min(live_cutoff))
+                .or_insert(live_cutoff);
+            self.clip_incomplete_ranges_to_live_cutoff(source_key, live_cutoff);
         }
         let cutoff = self.history_cutoffs.get(&source_key).copied();
 
@@ -1478,6 +1725,43 @@ impl KlineIndicatorImpl for FootprintHistoryIndicator {
             self.historical_days_started.insert((stage.source, day));
         }
         history.days.retain(|day, _| *day >= oldest);
+        self.rebuild_display();
+        self.clear_all_caches();
+    }
+
+    fn mark_incomplete_trade_history(
+        &mut self,
+        source: TickerInfo,
+        missing_ranges: &[(UnixMs, UnixMs)],
+    ) {
+        let source = self
+            .sources
+            .iter()
+            .find(|candidate| candidate.ticker.same_market(&source.ticker))
+            .map_or(source.ticker, |candidate| candidate.ticker);
+        let live_cutoff = self.live_history_cutoffs.get(&source).copied();
+        for &(start, end) in missing_ranges {
+            let mut cursor = start.as_u64();
+            let end = live_cutoff.map_or(end.as_u64(), |cutoff| end.as_u64().min(cutoff.as_u64()));
+            if cursor > end {
+                continue;
+            }
+            while cursor <= end {
+                let day = day_start(UnixMs::new(cursor));
+                let clipped_end = end.min(day.saturating_add(DAY_MS).saturating_sub(1));
+                self.incomplete_ranges
+                    .entry((source, day))
+                    .or_default()
+                    .push((cursor, clipped_end));
+                if clipped_end == u64::MAX {
+                    break;
+                }
+                cursor = clipped_end.saturating_add(1);
+            }
+        }
+        for ranges in self.incomplete_ranges.values_mut() {
+            *ranges = merge_ranges(std::mem::take(ranges));
+        }
         self.rebuild_display();
         self.clear_all_caches();
     }
@@ -2445,10 +2729,45 @@ mod tests {
             &[trade(day + ONE_MIN_MS + 10_000, 10.0, 10.0, false)],
         );
         indicator.commit_staged_source_trades(req_id);
+        indicator.accept_verified_day(source, UnixMs::new(day), first_live.saturating_sub(1));
 
         let stats = indicator.display_day_at(day).stats;
         assert_eq!(stats.volume(), 300.0);
         assert_eq!(stats.delta(), 300.0);
+    }
+
+    #[test]
+    fn live_seam_clips_only_the_recorder_suffix_it_replaces() {
+        let source = TickerInfo::new(
+            Ticker::new("BTCUSDT", Exchange::BinanceLinear),
+            0.1,
+            0.001,
+            None,
+        );
+        let day = day_start(UnixMs::now());
+        let first_live = UnixMs::new(day + 10 * ONE_MIN_MS);
+        let mut indicator = FootprintHistoryIndicator::new();
+        indicator.configure_footprint_history(&[source], false);
+        indicator.on_source_trades(
+            source,
+            &[trade(first_live.as_u64(), 10.0, 20.0, false)],
+            false,
+        );
+        indicator.mark_incomplete_trade_history(
+            source,
+            &[(
+                UnixMs::new(day + 8 * ONE_MIN_MS),
+                UnixMs::new(day + 12 * ONE_MIN_MS),
+            )],
+        );
+
+        assert_eq!(
+            indicator
+                .incomplete_ranges
+                .get(&(source.ticker, day))
+                .map(Vec::as_slice),
+            Some([(day + 8 * ONE_MIN_MS, first_live.saturating_sub(1).as_u64())].as_slice())
+        );
     }
 
     #[test]
@@ -2476,6 +2795,42 @@ mod tests {
 
         indicator.configure_footprint_history(&[binance, bybit], true);
         assert_eq!(indicator.display_days(now)[0].stats.volume(), 300.0);
+    }
+
+    #[test]
+    fn requested_aggregate_history_stays_hidden_until_every_source_is_verified() {
+        let binance = TickerInfo::new(
+            Ticker::new("BTCUSDT", Exchange::BinanceLinear),
+            0.1,
+            0.001,
+            None,
+        );
+        let bybit = TickerInfo::new(
+            Ticker::new("BTCUSDT", Exchange::BybitLinear),
+            0.1,
+            0.001,
+            None,
+        );
+        let day = day_start(UnixMs::now());
+        let cutoff = UnixMs::new(day + 500);
+        let through = UnixMs::new(day + 10_000);
+        let mut indicator = FootprintHistoryIndicator::new();
+        indicator.configure_footprint_history(&[binance, bybit], true);
+        indicator.prepare_footprint_history(binance, cutoff);
+        indicator.prepare_footprint_history(bybit, cutoff);
+        indicator.on_source_trades(binance, &[trade(day + 1_000, 100.0, 2.0, false)], false);
+        indicator.on_source_trades(bybit, &[trade(day + 2_000, 100.0, 1.0, true)], false);
+
+        indicator
+            .cache_checkpoints
+            .insert((binance.ticker, day), Some(through));
+        assert_eq!(indicator.display_day_at(day).stats, DayStats::default());
+        assert!(indicator.merged_cvd_deltas_from(day, day).is_empty());
+
+        indicator
+            .cache_checkpoints
+            .insert((bybit.ticker, day), Some(through));
+        assert_eq!(indicator.display_day_at(day).stats.volume(), 300.0);
     }
 
     #[test]
@@ -2550,8 +2905,13 @@ mod tests {
         expected.one_min_delta.clear();
         assert_eq!(loaded, expected);
         assert_eq!(loaded_through, covered_through);
-        std::fs::remove_file(&path).expect("remove cache file");
-        std::fs::remove_dir(&root).expect("remove cache directory");
+        std::fs::remove_file(cache_proof_path(&path)).expect("remove completion proof");
+        assert!(FootprintHistoryIndicator::read_cached_day(&path, source, day).is_none());
+        assert!(
+            path.exists(),
+            "unproven cache bytes must be preserved for recovery"
+        );
+        std::fs::remove_dir_all(&root).expect("remove cache directory");
     }
 
     #[test]
@@ -2589,8 +2949,7 @@ mod tests {
         );
         assert_eq!(indicator.display_day_at(day).stats.volume(), 503.0);
 
-        std::fs::remove_file(&path).expect("remove cache file");
-        std::fs::remove_dir(&root).expect("remove cache directory");
+        std::fs::remove_dir_all(&root).expect("remove cache directory");
     }
 
     #[test]
@@ -2626,8 +2985,7 @@ mod tests {
         );
         assert_eq!(indicator.display_day_at(day).stats.volume(), 503.0);
 
-        std::fs::remove_file(&path).expect("remove cache file");
-        std::fs::remove_dir(&root).expect("remove cache directory");
+        std::fs::remove_dir_all(&root).expect("remove cache directory");
     }
 
     #[test]
@@ -2801,6 +3159,7 @@ mod tests {
         // The authoritative backfill for today finally arrives (it is paced
         // last, after every older UTC day) and must not wipe the live seam.
         indicator.on_source_trades(source, &[trade(today + 1_000, 90.0, 3.0, true)], true);
+        indicator.accept_verified_day(source, UnixMs::new(today), cutoff);
 
         let stats = indicator.display_day_at(today).stats;
         assert_eq!(stats.volume(), 490.0);
@@ -2836,6 +3195,7 @@ mod tests {
         // Today's batch arrives much later; the live capture must survive it
         // exactly once.
         indicator.on_source_trades(source, &[trade(today + 5_000, 90.0, 4.0, true)], true);
+        indicator.accept_verified_day(source, UnixMs::new(today), cutoff);
 
         let stats = indicator.display_day_at(today).stats;
         assert_eq!(stats.volume(), 600.0);
@@ -3135,5 +3495,38 @@ mod tests {
             FootprintHistoryIndicator::read_cached_day(&path, source, day).expect("read");
         assert_eq!(loaded.large_trades.len(), 1);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn partial_verified_day_exposes_individual_prints_but_not_daily_totals() {
+        let source = TickerInfo::new(
+            Ticker::new("BTC", Exchange::HyperliquidLinear),
+            1.0,
+            0.00001,
+            None,
+        );
+        let day = day_start(UnixMs::now());
+        let mut indicator = FootprintHistoryIndicator::new();
+        indicator.configure_footprint_history(&[source], false);
+        indicator.prepare_footprint_history(source, UnixMs::new(day + DAY_MS - 1));
+        indicator.accept_verified_day(source, UnixMs::new(day), UnixMs::new(day + 2 * 60_000 - 1));
+        let req_id = uuid::Uuid::new_v4();
+        indicator.stage_source_trades(
+            req_id,
+            source,
+            &[trade(day + 4 * 60_000, 80_000.0, 25.0, false)],
+        );
+        indicator.commit_staged_source_trades(req_id);
+        indicator.mark_incomplete_trade_history(
+            source,
+            &[(UnixMs::new(day + 2 * 60_000), UnixMs::new(day + 3 * 60_000))],
+        );
+
+        assert_eq!(indicator.display_day_at(day).stats, DayStats::default());
+        assert_eq!(indicator.display_large_trades(day, 1_000_000.0).len(), 1);
+        assert_eq!(
+            indicator.cvd_missing_ranges(day),
+            vec![(day + 2 * 60_000, day + 3 * 60_000)]
+        );
     }
 }

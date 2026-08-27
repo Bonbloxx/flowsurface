@@ -1101,6 +1101,9 @@ impl State {
                         );
                     }
                 } else {
+                    if chart.insert_initial_klines(timeframe, ticker_info, klines) {
+                        return;
+                    }
                     let (raw_trades, display_step) = (chart.raw_trades(), chart.tick_size());
                     let live_trade_starts = chart.live_trade_starts();
                     let layout = chart.chart_layout();

@@ -8,7 +8,7 @@ use iced::{
 use rustc_hash::FxHashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 use crate::connector::{
@@ -27,6 +27,28 @@ const ARROW_LIMIT: usize = 400_000;
 /// to the iced update loop. A busy UTC day can contain millions of trades;
 /// processing large pages as one message blocks chart interaction.
 const TRADE_UI_CHUNK: usize = 10_000;
+
+/// The recorder flushes accepted executions every two seconds. A fetch issued
+/// immediately after a candle boundary can therefore see a sub-second trailing
+/// gap even though a later execution on the same still-connected stream will
+/// prove the interval continuous. Wait once, then bypass the coverage cache.
+const RECORDER_FINALITY_RETRY_DELAY: Duration = Duration::from_secs(4);
+const RECORDER_FINALITY_WINDOW_MS: u64 = 60_000;
+const RECORDER_FINALITY_MAX_GAP_MS: u64 = 5_000;
+
+fn exchange_trade_gate(ticker_info: TickerInfo) -> Arc<tokio::sync::Semaphore> {
+    static BINANCE: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+    static BYBIT: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+    match ticker_info.exchange().venue() {
+        exchange::adapter::Venue::Binance => BINANCE
+            .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1)))
+            .clone(),
+        exchange::adapter::Venue::Bybit => BYBIT
+            .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1)))
+            .clone(),
+        _ => Arc::new(tokio::sync::Semaphore::new(1)),
+    }
+}
 
 fn split_trade_batch(batch: Vec<Trade>) -> Vec<Vec<Trade>> {
     if batch.len() <= TRADE_UI_CHUNK {
@@ -140,9 +162,9 @@ pub enum ReqError {
 
 /// Lifecycle of a fetch request.
 ///
-/// * `Failed` is retried after the cooldown (transient errors may resolve).
-///   After [`RequestHandler::MAX_FETCH_ATTEMPTS`] the request is treated as
-///   `NoData` so a permanently broken range cannot retry forever.
+/// * `Failed` is retried after an exponentially increasing cooldown. A failed
+///   fetch is never reclassified as `NoData`: source failure is not evidence
+///   that an execution range is empty.
 /// * `Completed` and `NoData` are never retried — the data is either
 ///   already present or the source confirmed the range is empty.
 #[derive(PartialEq, Clone, Debug)]
@@ -166,7 +188,7 @@ pub struct RequestHandler {
 
 impl RequestHandler {
     const RETRY_AFTER_MS: u64 = 30_000;
-    const MAX_FETCH_ATTEMPTS: u32 = 5;
+    const MAX_RETRY_AFTER_MS: u64 = 5 * 60_000;
 
     pub fn add_request(
         &mut self,
@@ -184,20 +206,17 @@ impl RequestHandler {
             }
         }) {
             let now_ms = chrono::Utc::now().timestamp_millis() as u64;
-            let retry_after_ms = Self::RETRY_AFTER_MS;
             let status = existing_req.status.clone();
 
             return match status {
                 RequestStatus::Completed => Ok(None),
                 RequestStatus::Pending => Err(ReqError::Overlaps),
                 RequestStatus::NoData => Err(ReqError::NoData),
-                RequestStatus::Failed { at: _, attempts }
-                    if attempts >= Self::MAX_FETCH_ATTEMPTS =>
-                {
-                    Err(ReqError::NoData)
-                }
-                RequestStatus::Failed { at, .. } => {
-                    if now_ms - at > retry_after_ms {
+                RequestStatus::Failed { at, attempts } => {
+                    let retry_after_ms = Self::RETRY_AFTER_MS
+                        .saturating_mul(1_u64 << attempts.saturating_sub(1).min(3))
+                        .min(Self::MAX_RETRY_AFTER_MS);
+                    if now_ms.saturating_sub(at) > retry_after_ms {
                         existing_req.status = RequestStatus::Pending;
                         Ok(Some(existing_id))
                     } else {
@@ -207,12 +226,10 @@ impl RequestHandler {
             };
         }
 
-        // A range already covered by a tracked request normally must not burn
-        // another rate-limited page. Visible footprint history is the exception:
-        // a broad server response can span an internal recorder outage, and the
-        // chart deliberately follows it with a narrower request for the proven
-        // empty candle range. That second pass is what lets the fetcher fall back
-        // to exchange/archive data. Exact completed ranges remain suppressed.
+        // A completed range is authoritative only after exact recorder
+        // coverage plus every exchange complement succeeded. Any contained
+        // request is therefore already proven and must not burn another
+        // rate-limited page or double-merge executions.
         let mut completed_coverage = false;
         for existing in self
             .requests
@@ -223,9 +240,7 @@ impl RequestHandler {
                 RequestStatus::Pending => return Err(ReqError::Overlaps),
                 RequestStatus::NoData => return Err(ReqError::NoData),
                 RequestStatus::Completed => {
-                    if !existing.allows_completed_footprint_subrange(&request) {
-                        completed_coverage = true;
-                    }
+                    completed_coverage = true;
                 }
                 RequestStatus::Failed { .. } => {}
             }
@@ -291,17 +306,14 @@ impl RequestHandler {
     pub fn mark_failed(&mut self, id: Uuid) {
         if let Some(request) = self.requests.get_mut(&id) {
             let timestamp = chrono::Utc::now().timestamp_millis() as u64;
-            let attempts = match &request.status {
-                RequestStatus::Failed { attempts, .. } => attempts + 1,
-                _ => 1,
-            };
+            request.attempts = request.attempts.saturating_add(1);
+            let attempts = request.attempts;
             request.status = RequestStatus::Failed {
                 at: timestamp,
                 attempts,
             };
             log::debug!(
-                "Fetch request failed (attempt {attempts}/{}): {:?}",
-                Self::MAX_FETCH_ATTEMPTS,
+                "Fetch request failed (attempt {attempts}; range remains incomplete): {:?}",
                 request.fetch_type
             );
         } else {
@@ -332,6 +344,9 @@ struct FetchRequest {
     fetch_type: FetchRange,
     stream: Option<StreamKind>,
     status: RequestStatus,
+    /// Survives `Failed -> Pending` retry transitions so exponential backoff
+    /// cannot accidentally reset to its shortest interval forever.
+    attempts: u32,
 }
 
 impl FetchRequest {
@@ -340,6 +355,7 @@ impl FetchRequest {
             fetch_type,
             stream,
             status: RequestStatus::Pending,
+            attempts: 0,
         }
     }
 
@@ -394,16 +410,6 @@ impl FetchRequest {
         };
         std::mem::discriminant(&self.fetch_type) == std::mem::discriminant(&other.fetch_type)
             && range_contains(outer, inner)
-    }
-
-    fn allows_completed_footprint_subrange(&self, other: &FetchRequest) -> bool {
-        matches!(
-            (&self.fetch_type, &other.fetch_type),
-            (
-                FetchRange::FootprintTrades(outer_from, outer_to),
-                FetchRange::FootprintTrades(inner_from, inner_to),
-            ) if (outer_from, outer_to) != (inner_from, inner_to)
-        )
     }
 }
 
@@ -476,6 +482,31 @@ pub enum FetchUpdate {
         error: String,
         req_id: Option<Uuid>,
     },
+    /// The recorder returned only coverage-proven segments of the requested
+    /// interval. These batches are safe to publish in memory, but the request
+    /// must not advance a durable cache checkpoint across `missing_ranges`.
+    PartialTrades {
+        pane_id: Uuid,
+        req_id: Uuid,
+        source: TickerInfo,
+        missing_ranges: Vec<(UnixMs, UnixMs)>,
+        warning: String,
+    },
+}
+
+#[derive(Debug)]
+struct TradeFetchOutcome {
+    had_data: bool,
+    missing_ranges: Vec<(UnixMs, UnixMs)>,
+}
+
+impl TradeFetchOutcome {
+    fn complete(had_data: bool) -> Self {
+        Self {
+            had_data,
+            missing_ranges: Vec::new(),
+        }
+    }
 }
 
 pub fn request_fetch(
@@ -636,22 +667,57 @@ pub fn request_fetch(
                         }
                     },
                     move |result| match result {
-                        Ok(true) => FetchUpdate::Status {
-                            pane_id,
-                            status: FetchTaskStatus::Completed,
-                            req_id: Some(req_id),
-                        },
-                        Ok(false) => {
-                            // Source returned no data for this range. Produce
-                            // an empty batch so the dashboard calls mark_no_data.
-                            FetchUpdate::Data {
-                                layout_id,
-                                pane_id,
-                                data: FetchedData::Trades {
-                                    batch: Vec::new(),
+                        Ok(TradeFetchOutcome {
+                            had_data,
+                            missing_ranges,
+                        }) => {
+                            if missing_ranges.is_empty() && had_data {
+                                if is_complete_footprint {
+                                    log::debug!(
+                                        "Trade-history fetch completed for {} ({}) range={}..{}",
+                                        ticker_info.ticker,
+                                        ticker_info.exchange(),
+                                        from_time,
+                                        to_time,
+                                    );
+                                }
+                                return FetchUpdate::Status {
+                                    pane_id,
+                                    status: FetchTaskStatus::Completed,
                                     req_id: Some(req_id),
-                                },
-                                stream,
+                                };
+                            }
+                            if missing_ranges.is_empty() {
+                                // Source returned no data for this range. Produce
+                                // an empty batch so the dashboard calls mark_no_data.
+                                return FetchUpdate::Data {
+                                    layout_id,
+                                    pane_id,
+                                    data: FetchedData::Trades {
+                                        batch: Vec::new(),
+                                        req_id: Some(req_id),
+                                    },
+                                    stream,
+                                };
+                            }
+                            let retained = if had_data {
+                                "Recorder-proven history was retained"
+                            } else {
+                                "No executions were available in the recorder's proven segments"
+                            };
+                            let warning = format!(
+                                "{retained} for {} over {}..{}, but {} recorder gap(s) remain. Full-day totals and cache completion remain disabled.",
+                                ticker_info.exchange(),
+                                from_time,
+                                to_time,
+                                missing_ranges.len()
+                            );
+                            FetchUpdate::PartialTrades {
+                                pane_id,
+                                req_id,
+                                source: ticker_info,
+                                missing_ranges,
+                                warning,
                             }
                         }
                         Err(err) => {
@@ -882,7 +948,7 @@ fn merge_open_interest_observations(
         let minute = observation.time.as_u64() / MINUTE_MS * MINUTE_MS;
         let replace = by_minute
             .get(&minute)
-            .is_none_or(|current| observation.time >= current.time);
+            .is_none_or(|current| observation.supersedes(*current));
         if replace {
             by_minute.insert(minute, *observation);
         }
@@ -1034,8 +1100,10 @@ fn shared_kline_fetch(
 /// Fetch trades from the configured source using a single forward-paging
 /// loop (oldest → newest).
 ///
-/// Returns `Ok(true)` when at least one trade was received, `Ok(false)`
-/// when the source confirmed the range has no data.
+/// Returns a complete outcome when the whole requested range was accounted
+/// for. If the recorder proves only disjoint segments and the venue has no
+/// direct fallback, those verified batches are streamed and the exact
+/// uncovered complement is returned in `missing_ranges`.
 fn fetch_trades_paged(
     server: Option<ServerClient>,
     handles: AdapterHandles,
@@ -1046,7 +1114,7 @@ fn fetch_trades_paged(
     recent_first: bool,
     limits: Option<FetchLimits>,
     fill_exchange_gaps: bool,
-) -> impl Straw<bool, Vec<Trade>, AdapterError> {
+) -> impl Straw<TradeFetchOutcome, Vec<Trade>, AdapterError> {
     sipper(async move |mut progress| {
         if recent_first {
             let batches = if let Some(client) = server {
@@ -1065,7 +1133,166 @@ fn fetch_trades_paged(
             for batch in batches {
                 progress.send(batch).await;
             }
-            return Ok(had_data);
+            return Ok(TradeFetchOutcome::complete(had_data));
+        }
+
+        // Modes are deliberately exclusive. In Server mode, recorder gaps
+        // stay explicit and uncheckpointed; they must never trigger large
+        // Binance/Bybit archive downloads onto the desktop. Direct exchange
+        // history is available only when no recorder client is configured
+        // (TradeFetchMode::Exchange).
+        let exchange_available = server.is_none() && supports_exchange_trade_fetch(ticker_info);
+
+        // Durable footprint-derived caches may advance only after the whole
+        // requested interval is accounted for. The recorder proves the exact
+        // segments it stored. In Server mode, its exact uncovered complement
+        // remains missing; in Exchange mode, the exchange owns the whole
+        // request. Any source/coverage failure aborts the staged request so the
+        // chart cannot persist a false high-water mark.
+        if fill_exchange_gaps {
+            let (server_ranges, deferred_ranges, exchange_ranges) = if let Some(ref client) = server
+            {
+                match client.trade_coverage(ticker_info, from_time, to_time).await {
+                    Ok(mut coverage) => {
+                        let initial_gaps = coverage.missing_ranges(from_time, to_time);
+                        if should_retry_recent_trailing_coverage(
+                            &initial_gaps,
+                            to_time,
+                            UnixMs::now(),
+                        ) {
+                            tokio::time::sleep(RECORDER_FINALITY_RETRY_DELAY).await;
+                            coverage = client
+                                .refresh_trade_coverage(ticker_info, from_time, to_time)
+                                .await?;
+                        }
+                        let gaps = coverage.missing_ranges(from_time, to_time);
+                        let stored = coverage
+                            .segments
+                            .into_iter()
+                            .map(|segment| (UnixMs::new(segment.from), UnixMs::new(segment.to)))
+                            .collect::<Vec<_>>();
+                        (stored, gaps, Vec::new())
+                    }
+                    Err(err) => return Err(err),
+                }
+            } else {
+                (Vec::new(), Vec::new(), vec![(from_time, to_time)])
+            };
+
+            let mut had_data = false;
+            for (range_from, range_to) in server_ranges {
+                let Some(ref client) = server else {
+                    return Err(AdapterError::ParseError(
+                        "server coverage existed without a configured server".into(),
+                    ));
+                };
+                let mut cursor = range_from;
+                while cursor <= range_to {
+                    let prev_cursor = cursor;
+                    let parsed = client
+                        .fetch_trades_arrow(ticker_info, cursor, range_to, ARROW_LIMIT)
+                        .await?;
+                    if parsed.raw_row_count == 0 {
+                        break;
+                    }
+                    if !parsed.trades.is_empty() {
+                        had_data = true;
+                        for chunk in split_trade_batch(parsed.trades) {
+                            progress.send(chunk).await;
+                        }
+                    }
+                    cursor = parsed.last_ts.map_or(cursor, |time| time.saturating_add(1));
+                    if cursor <= prev_cursor {
+                        return Err(AdapterError::ParseError(
+                            "server trade paging cursor did not advance".into(),
+                        ));
+                    }
+                }
+            }
+
+            if !exchange_ranges.is_empty() && !exchange_available {
+                let mut missing_ranges = deferred_ranges;
+                missing_ranges.extend(exchange_ranges);
+                log::warn!(
+                    "Historical executions are partial for {} ({}): retaining recorder-proven segments while leaving {} uncovered interval(s) uncheckpointed",
+                    ticker_info.ticker,
+                    ticker_info.exchange(),
+                    missing_ranges.len()
+                );
+                return Ok(TradeFetchOutcome {
+                    had_data,
+                    missing_ranges,
+                });
+            }
+
+            let _venue_permit = if exchange_ranges.is_empty() {
+                None
+            } else {
+                Some(
+                    exchange_trade_gate(ticker_info)
+                        .acquire_owned()
+                        .await
+                        .map_err(|_| {
+                            AdapterError::ParseError(
+                                "exchange history scheduler closed unexpectedly".into(),
+                            )
+                        })?,
+                )
+            };
+            for (range_index, (range_from, range_to)) in exchange_ranges.iter().copied().enumerate()
+            {
+                let mut cursor = range_from;
+                while cursor <= range_to {
+                    let prev_cursor = cursor;
+                    let mut batch = match handles
+                        .fetch_trades(ticker_info, cursor, Some(range_to), Some(data_path.clone()))
+                        .await
+                    {
+                        Ok(batch) => batch,
+                        Err(error) => {
+                            let mut missing_ranges = deferred_ranges.clone();
+                            missing_ranges.extend(remaining_exchange_ranges(
+                                &exchange_ranges,
+                                range_index,
+                                cursor,
+                                range_to,
+                            ));
+                            log::warn!(
+                                "Exchange complement failed for {} ({}): {error}. Retaining recorder-proven and already-fetched pages while leaving {} interval(s) uncheckpointed",
+                                ticker_info.ticker,
+                                ticker_info.exchange(),
+                                missing_ranges.len()
+                            );
+                            return Ok(TradeFetchOutcome {
+                                had_data,
+                                missing_ranges,
+                            });
+                        }
+                    };
+                    batch.retain(|trade| trade.time >= cursor && trade.time <= range_to);
+                    if batch.is_empty() {
+                        break;
+                    }
+                    batch.sort_by_key(|trade| trade.time);
+                    cursor = batch
+                        .last()
+                        .map_or(cursor, |trade| trade.time.saturating_add(1));
+                    had_data = true;
+                    for chunk in split_trade_batch(batch) {
+                        progress.send(chunk).await;
+                    }
+                    if cursor <= prev_cursor {
+                        return Err(AdapterError::ParseError(
+                            "exchange trade paging cursor did not advance".into(),
+                        ));
+                    }
+                }
+            }
+
+            return Ok(TradeFetchOutcome {
+                had_data,
+                missing_ranges: deferred_ranges,
+            });
         }
 
         let mut cursor = from_time;
@@ -1073,7 +1300,6 @@ fn fetch_trades_paged(
         let mut pages: usize = 0;
         let mut total_trades: usize = 0;
         let mut earliest_server: Option<UnixMs> = None;
-        let exchange_available = supports_exchange_trade_fetch(ticker_info);
 
         let query_server = if let Some(ref client) = server {
             match client.earliest_trade_time(ticker_info).await {
@@ -1094,7 +1320,7 @@ fn fetch_trades_paged(
         if query_server && let Some(ref client) = server {
             while cursor <= to_time {
                 if fetch_limit_reached(limits, pages, total_trades) {
-                    log::info!(
+                    log::debug!(
                         "Trade fetch page/trade cap reached (pages={pages}, trades={total_trades}); stopping seed"
                     );
                     break;
@@ -1136,15 +1362,7 @@ fn fetch_trades_paged(
             }
         }
 
-        let exchange_ranges = exchange_trade_ranges(
-            server.is_some(),
-            fill_exchange_gaps,
-            from_time,
-            to_time,
-            earliest_server,
-            cursor,
-            had_data,
-        );
+        let exchange_ranges = exchange_trade_ranges(server.is_some(), from_time, to_time);
 
         for (exchange_from, exchange_to) in exchange_ranges {
             if !exchange_available {
@@ -1153,7 +1371,7 @@ fn fetch_trades_paged(
             cursor = exchange_from;
             while cursor <= exchange_to {
                 if fetch_limit_reached(limits, pages, total_trades) {
-                    log::info!(
+                    log::debug!(
                         "Trade fetch page/trade cap reached (pages={pages}, trades={total_trades}); stopping seed"
                     );
                     break;
@@ -1194,39 +1412,47 @@ fn fetch_trades_paged(
             }
         }
 
-        Ok(had_data)
+        Ok(TradeFetchOutcome::complete(had_data))
     })
 }
 
 fn exchange_trade_ranges(
     server_configured: bool,
-    fill_exchange_gaps: bool,
     from_time: UnixMs,
     to_time: UnixMs,
-    earliest_server: Option<UnixMs>,
-    next_server_cursor: UnixMs,
-    had_server_data: bool,
 ) -> Vec<(UnixMs, UnixMs)> {
-    if !server_configured {
-        return vec![(from_time, to_time)];
-    }
-    if !fill_exchange_gaps {
-        return Vec::new();
-    }
-    if !had_server_data {
-        return vec![(from_time, to_time)];
-    }
+    (!server_configured)
+        .then_some((from_time, to_time))
+        .into_iter()
+        .collect()
+}
 
-    let mut ranges = Vec::with_capacity(2);
-    if let Some(first) = earliest_server
-        && first > from_time
-    {
-        ranges.push((from_time, first.saturating_sub(1)));
+fn should_retry_recent_trailing_coverage(
+    gaps: &[(UnixMs, UnixMs)],
+    requested_to: UnixMs,
+    now: UnixMs,
+) -> bool {
+    let Some((gap_from, gap_to)) = gaps.last().copied() else {
+        return false;
+    };
+    gap_to == requested_to
+        && requested_to <= now
+        && now.as_u64().saturating_sub(requested_to.as_u64()) <= RECORDER_FINALITY_WINDOW_MS
+        && gap_to.as_u64().saturating_sub(gap_from.as_u64()) <= RECORDER_FINALITY_MAX_GAP_MS
+}
+
+fn remaining_exchange_ranges(
+    ranges: &[(UnixMs, UnixMs)],
+    failed_index: usize,
+    failed_from: UnixMs,
+    failed_to: UnixMs,
+) -> Vec<(UnixMs, UnixMs)> {
+    let mut remaining = Vec::with_capacity(ranges.len().saturating_sub(failed_index));
+    if failed_from <= failed_to {
+        remaining.push((failed_from, failed_to));
     }
-    if next_server_cursor < to_time {
-        ranges.push((next_server_cursor, to_time));
-    }
-    ranges
+    remaining.extend_from_slice(ranges.get(failed_index.saturating_add(1)..).unwrap_or(&[]));
+    remaining
 }
 
 fn server_range_may_have_data(to_time: UnixMs, earliest_server: Option<UnixMs>) -> bool {
@@ -1455,7 +1681,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_footprint_days_retry_with_bounded_attempts() {
+    fn failed_footprint_days_never_become_false_no_data() {
         let stream = StreamKind::Trades {
             ticker_info: TickerInfo::new(
                 Ticker::new("BTCUSDT", Exchange::BinanceLinear),
@@ -1476,14 +1702,28 @@ mod tests {
             Err(ReqError::Failed)
         ));
 
-        // After the bounded attempt count the range is treated as NoData so
-        // a permanently broken source cannot retry forever.
-        for _ in 0..RequestHandler::MAX_FETCH_ATTEMPTS {
+        // Repeated transport failures remain failures. They must never mint an
+        // authoritative empty-range result or a durable cache checkpoint.
+        for _ in 0..20 {
             handler.mark_failed(id);
         }
         assert!(matches!(
             handler.add_request(range, Some(stream)),
-            Err(ReqError::NoData)
+            Err(ReqError::Failed)
+        ));
+        if let Some(request) = handler.requests.get_mut(&id)
+            && let RequestStatus::Failed { at, .. } = &mut request.status
+        {
+            *at = 0;
+        }
+        assert!(matches!(
+            handler.add_request(range, Some(stream)),
+            Ok(Some(retried)) if retried == id
+        ));
+        handler.mark_failed(id);
+        assert!(matches!(
+            handler.requests.get(&id).map(|request| &request.status),
+            Some(RequestStatus::Failed { attempts, .. }) if *attempts > 20
         ));
     }
 
@@ -1517,7 +1757,7 @@ mod tests {
     }
 
     #[test]
-    fn completed_footprint_range_allows_targeted_gap_subrange() {
+    fn completed_footprint_range_suppresses_verified_subrange() {
         let stream = StreamKind::Trades {
             ticker_info: TickerInfo::new(
                 Ticker::new("BTCUSDT", Exchange::BinanceLinear),
@@ -1532,7 +1772,7 @@ mod tests {
         handler.mark_completed(id);
 
         let inner = FetchRange::FootprintTrades(UnixMs::new(4_000), UnixMs::new(5_000));
-        assert!(handler.add_request(inner, Some(stream)).unwrap().is_some());
+        assert!(handler.add_request(inner, Some(stream)).unwrap().is_none());
     }
 
     #[test]
@@ -1712,24 +1952,12 @@ mod tests {
     #[test]
     fn newest_truthful_oi_observation_wins_each_minute() {
         let exchange = [
-            OpenInterest {
-                time: UnixMs::new(60_000),
-                value: 100.0,
-            },
-            OpenInterest {
-                time: UnixMs::new(120_050),
-                value: 200.0,
-            },
+            OpenInterest::snapshot(UnixMs::new(60_000), 100.0),
+            OpenInterest::snapshot(UnixMs::new(120_050), 200.0),
         ];
         let remote = [
-            OpenInterest {
-                time: UnixMs::new(60_010),
-                value: 110.0,
-            },
-            OpenInterest {
-                time: UnixMs::new(120_000),
-                value: 190.0,
-            },
+            OpenInterest::snapshot(UnixMs::new(60_010), 110.0),
+            OpenInterest::snapshot(UnixMs::new(120_000), 190.0),
         ];
 
         let merged = merge_open_interest_observations(&exchange, &remote);
@@ -1741,56 +1969,74 @@ mod tests {
 
     #[test]
     fn remote_oi_wins_an_exact_timestamp_tie() {
-        let exchange = [OpenInterest {
-            time: UnixMs::new(60_000),
-            value: 100.0,
-        }];
-        let remote = [OpenInterest {
-            time: UnixMs::new(60_000),
-            value: 110.0,
-        }];
+        let exchange = [OpenInterest::snapshot(UnixMs::new(60_000), 100.0)];
+        let remote = [OpenInterest::snapshot(UnixMs::new(60_000), 110.0)];
 
         assert_eq!(merge_open_interest_observations(&exchange, &remote), remote);
     }
 
     #[test]
-    fn exchange_fills_trailing_gap_after_partial_server_prefix() {
+    fn server_mode_never_requests_exchange_history() {
         let from = UnixMs::new(1_000);
         let to = UnixMs::new(10_000);
-        let first_server = UnixMs::new(1_000);
-        let after_last_server = UnixMs::new(6_001);
+
+        assert!(exchange_trade_ranges(true, from, to).is_empty());
+    }
+
+    #[test]
+    fn failed_exchange_complement_keeps_only_the_unfetched_suffix_missing() {
+        let ranges = [
+            (UnixMs::new(100), UnixMs::new(199)),
+            (UnixMs::new(300), UnixMs::new(399)),
+            (UnixMs::new(500), UnixMs::new(599)),
+        ];
 
         assert_eq!(
-            exchange_trade_ranges(
-                true,
-                true,
-                from,
-                to,
-                Some(first_server),
-                after_last_server,
-                true,
-            ),
-            vec![(after_last_server, to)]
+            remaining_exchange_ranges(&ranges, 1, UnixMs::new(350), UnixMs::new(399)),
+            vec![
+                (UnixMs::new(350), UnixMs::new(399)),
+                (UnixMs::new(500), UnixMs::new(599)),
+            ]
         );
     }
 
     #[test]
-    fn exchange_fills_both_sides_of_partial_server_history() {
+    fn exchange_mode_requests_the_whole_history_range() {
         let from = UnixMs::new(1_000);
         let to = UnixMs::new(10_000);
 
-        assert_eq!(
-            exchange_trade_ranges(
-                true,
-                true,
-                from,
-                to,
-                Some(UnixMs::new(3_000)),
-                UnixMs::new(6_001),
-                true,
-            ),
-            vec![(from, UnixMs::new(2_999)), (UnixMs::new(6_001), to),]
-        );
+        assert_eq!(exchange_trade_ranges(false, from, to), vec![(from, to)]);
+    }
+
+    #[test]
+    fn tiny_recent_trailing_gap_gets_one_fresh_coverage_retry() {
+        let now = UnixMs::new(100_000);
+        let requested_to = UnixMs::new(99_000);
+        let gaps = vec![(UnixMs::new(98_500), requested_to)];
+
+        assert!(should_retry_recent_trailing_coverage(
+            &gaps,
+            requested_to,
+            now
+        ));
+    }
+
+    #[test]
+    fn historical_or_material_gaps_do_not_wait_for_recorder_finality() {
+        let now = UnixMs::new(1_000_000);
+        let historical_to = UnixMs::new(900_000);
+        assert!(!should_retry_recent_trailing_coverage(
+            &[(UnixMs::new(899_900), historical_to)],
+            historical_to,
+            now
+        ));
+
+        let recent_to = UnixMs::new(999_000);
+        assert!(!should_retry_recent_trailing_coverage(
+            &[(UnixMs::new(990_000), recent_to)],
+            recent_to,
+            now
+        ));
     }
 
     #[test]

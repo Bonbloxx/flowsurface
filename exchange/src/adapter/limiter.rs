@@ -117,7 +117,7 @@ impl DynamicBucket {
     }
 
     fn prepare_with_header_data(
-        &self,
+        &mut self,
         weight: usize,
     ) -> (Option<Duration>, Option<DynamicLimitReason>) {
         // The server reports cumulative used weight for the current window.
@@ -132,6 +132,14 @@ impl DynamicBucket {
         let available = self.max_weight as f64 - assumed_used;
 
         if available >= weight as f64 {
+            // Reserve capacity before releasing the mutex. Without this,
+            // concurrent callers all observe the same response-header value
+            // and can collectively overshoot the venue limit before any one
+            // of their responses updates the bucket.
+            self.current_used_weight = (assumed_used.ceil() as usize)
+                .saturating_add(weight)
+                .min(self.max_weight);
+            self.last_updated = Instant::now();
             return (None, None);
         }
 
@@ -282,5 +290,28 @@ impl RateLimiter for HeaderDynamicRateLimiter {
     fn should_exit_on_response(&self, response: &reqwest::Response) -> bool {
         let status = response.status();
         status == self.exit_status || Some(status) == self.extra_exit_status
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn header_bucket_reserves_capacity_before_response_arrives() {
+        let mut bucket = DynamicBucket::new(100, Duration::from_secs(60));
+        bucket.update_weight(80);
+
+        assert_eq!(bucket.prepare_request(10).0, None);
+        assert!(bucket.current_used_weight >= 90);
+        assert!(bucket.prepare_request(11).0.is_some());
+    }
+
+    #[test]
+    fn fixed_bucket_wait_does_not_pretend_capacity_was_reserved() {
+        let mut bucket = FixedWindowBucket::new(1, Duration::from_secs(60));
+        assert_eq!(bucket.calculate_wait_time(1), None);
+        assert!(bucket.calculate_wait_time(1).is_some());
+        assert_eq!(bucket.available_tokens, 0);
     }
 }

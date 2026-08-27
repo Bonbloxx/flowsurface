@@ -57,6 +57,9 @@ pub(super) struct HttpHub<L> {
     /// parallel trade pages) can pace against one rate budget. Locks are
     /// only held across synchronous limiter updates, never across awaits.
     limiter: std::sync::Mutex<L>,
+    /// Venue-wide cooldown learned from a 429/418 response. Every request on
+    /// this hub observes it, not only the request that received the rejection.
+    cooldown_until: std::sync::Mutex<Option<std::time::Instant>>,
 }
 
 impl<L: RateLimiter> HttpHub<L> {
@@ -64,6 +67,7 @@ impl<L: RateLimiter> HttpHub<L> {
         Self {
             client,
             limiter: std::sync::Mutex::new(limiter),
+            cooldown_until: std::sync::Mutex::new(None),
         }
     }
 
@@ -99,13 +103,41 @@ impl<L: RateLimiter> HttpHub<L> {
 
         let mut attempt: u32 = 0;
         loop {
-            let wait_time = {
-                let mut limiter = Self::lock_limiter(&self.limiter);
-                limiter.prepare_request(weight)
-            };
-            if let Some(wait_time) = wait_time {
-                log::warn!("Rate limit hit for: {url}. Waiting for {:?}", wait_time);
-                tokio::time::sleep(wait_time).await;
+            // A wait is not a reservation. Re-check until the limiter consumes
+            // capacity under its mutex; otherwise many sleepers wake and burst
+            // simultaneously with the same stale allowance.
+            loop {
+                let cooldown = {
+                    let mut guard = match self.cooldown_until.lock() {
+                        Ok(guard) => guard,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    match *guard {
+                        Some(until) if until > std::time::Instant::now() => {
+                            Some(until.duration_since(std::time::Instant::now()))
+                        }
+                        Some(_) => {
+                            *guard = None;
+                            None
+                        }
+                        None => None,
+                    }
+                };
+                if let Some(wait_time) = cooldown {
+                    tokio::time::sleep(wait_time).await;
+                    continue;
+                }
+
+                let wait_time = {
+                    let mut limiter = Self::lock_limiter(&self.limiter);
+                    limiter.prepare_request(weight)
+                };
+                if let Some(wait_time) = wait_time {
+                    log::warn!("Rate limit budget reached for: {url}. Waiting for {wait_time:?}");
+                    tokio::time::sleep(wait_time).await;
+                    continue;
+                }
+                break;
             }
 
             let response = Self::send_request_client(self.client(), method.clone(), url, json_body)
@@ -121,8 +153,22 @@ impl<L: RateLimiter> HttpHub<L> {
                 attempt += 1;
                 let status = response.status();
                 let retry_after = Self::retry_after_duration(&response, attempt);
+                {
+                    let mut limiter = Self::lock_limiter(&self.limiter);
+                    limiter.update_from_response(&response, weight);
+                }
+                {
+                    let mut guard = match self.cooldown_until.lock() {
+                        Ok(guard) => guard,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    let until = std::time::Instant::now() + retry_after;
+                    if guard.is_none_or(|current| current < until) {
+                        *guard = Some(until);
+                    }
+                }
                 log::warn!(
-                    "Rate limited ({status}) for: {url}. Retry {attempt}/{} in {retry_after:?}",
+                    "Rate limited ({status}) for: {url}. Shared cooldown; retry {attempt}/{} in {retry_after:?}",
                     MAX_RATE_LIMIT_RETRIES
                 );
                 tokio::time::sleep(retry_after).await;
