@@ -9,8 +9,8 @@ use std::cell::RefCell;
 use data::chart::PlotData;
 use data::chart::kline::{Config as KlineChartConfig, KlineDataPoint};
 use data::util::abbr_large_numbers;
-use exchange::UnixMs;
 use exchange::unit::{Price, PriceStep};
+use exchange::{Timeframe, UnixMs};
 use iced::theme::palette::Extended;
 use iced::widget::canvas::{self, Path, Stroke};
 use iced::{Alignment, Element, Point, Rectangle};
@@ -100,14 +100,25 @@ fn merge_print_cluster(prints: &[StoredLargeTrade]) -> StoredLargeTrade {
     }
 }
 
-fn marker_radius(notional: f64, min_notional: f64, max_notional: f64, scaling: f32) -> f32 {
+fn marker_radius(
+    notional: f64,
+    min_notional: f64,
+    max_notional: f64,
+    scaling: f32,
+    column_width_px: f32,
+) -> f32 {
     let min_n = min_notional.max(1.0);
     let max_n = max_notional.max(min_n * 2.0);
     let span = (max_n / min_n).ln().max(f64::EPSILON);
     let t = ((notional / min_n).max(1.0).ln() / span).clamp(0.0, 1.0) as f32;
     // Steeper than linear at the top so 10M vs 40M reads as a size jump.
     let fraction = t.powf(1.35);
-    let radius_min = (4.0 / scaling).max(2.0);
+    // Keep the established 4 px zoomed-out floor, but let near-threshold
+    // bubbles grow with the visible candle footprint. Without this, dividing
+    // by `scaling` cancels zoom and leaves the smallest bubbles at 4 px even
+    // when a candle column fills a large part of the pane.
+    let zoomed_min_radius_px = (column_width_px.max(0.0) * 0.10).clamp(4.0, 14.0);
+    let radius_min = (4.0 / scaling).max(2.0).max(zoomed_min_radius_px / scaling);
     let radius_max = (32.0 / scaling).max(radius_min + 10.0);
     radius_min + (radius_max - radius_min) * fraction
 }
@@ -116,10 +127,14 @@ fn capture_floor_usd() -> f32 {
     KlineChartConfig::LARGE_TRADES_MIN_USD_MIN
 }
 
+fn time_marker_bucket(time: u64, interval: Timeframe) -> u64 {
+    UnixMs::new(time).floor_to(interval).as_u64()
+}
+
 /// How a trade timestamp maps to an x position for the current chart basis.
 enum XMapper {
-    /// Time-based charts map timestamps directly.
-    Timestamp,
+    /// Time-based charts center a marker on the footprint candle that owns it.
+    Timestamp { interval: Timeframe },
     /// Tick/Renko/TPO bricks map through the brick index that was open at the
     /// trade time. `first_idx`/`last_idx` bound the visible indices (larger is
     /// older).
@@ -186,10 +201,12 @@ impl LargeTradesIndicator {
     ) -> Option<VisibleWindow> {
         let (earliest, latest) = chart.interval_range(&region);
         match data_source {
-            PlotData::TimeBased(_) => Some(VisibleWindow {
+            PlotData::TimeBased(timeseries) => Some(VisibleWindow {
                 from: earliest.saturating_sub(EDGE_PAD_MS),
                 to: latest.saturating_add(EDGE_PAD_MS),
-                mapper: XMapper::Timestamp,
+                mapper: XMapper::Timestamp {
+                    interval: timeseries.interval,
+                },
             }),
             PlotData::TickBased(tick_aggr) => {
                 // Datapoints are stored oldest-first; a datapoint at vector
@@ -297,7 +314,9 @@ impl LargeTradesIndicator {
         time: u64,
     ) -> Option<f32> {
         match &window.mapper {
-            XMapper::Timestamp => Some(chart.interval_to_x(time)),
+            XMapper::Timestamp { interval } => {
+                Some(chart.interval_to_x(time_marker_bucket(time, *interval)))
+            }
             XMapper::Brick {
                 first_idx,
                 last_idx,
@@ -435,6 +454,7 @@ impl KlineIndicatorImpl for LargeTradesIndicator {
         }
 
         let scaling = chart.scaling.max(0.01);
+        let column_width_px = chart.cell_width * scaling;
         let min_notional = f64::from(self.min_usd.max(capture_floor_usd()));
         let max_notional = markers
             .iter()
@@ -445,7 +465,13 @@ impl KlineIndicatorImpl for LargeTradesIndicator {
 
         let mut hover = Vec::with_capacity(markers.len());
         for (x, trade) in markers {
-            let radius = marker_radius(trade.notional, min_notional, max_notional, scaling);
+            let radius = marker_radius(
+                trade.notional,
+                min_notional,
+                max_notional,
+                scaling,
+                column_width_px,
+            );
             if !radius.is_finite() || radius <= 0.0 {
                 continue;
             }
@@ -733,6 +759,41 @@ mod tests {
             notional,
             is_sell,
         }
+    }
+
+    #[test]
+    fn near_threshold_bubble_grows_with_zoomed_candle_width() {
+        let scaling = 0.5;
+        let zoomed_out_radius =
+            marker_radius(1_000_000.0, 1_000_000.0, 10_000_000.0, scaling, 30.0) * scaling;
+        let zoomed_in_radius =
+            marker_radius(1_000_000.0, 1_000_000.0, 10_000_000.0, scaling, 80.0) * scaling;
+
+        assert_eq!(zoomed_out_radius, 4.0);
+        assert_eq!(zoomed_in_radius, 8.0);
+    }
+
+    #[test]
+    fn zoomed_bubble_radius_retains_large_trade_hierarchy() {
+        let scaling = 0.5;
+        let near_threshold =
+            marker_radius(1_000_000.0, 1_000_000.0, 10_000_000.0, scaling, 80.0) * scaling;
+        let largest =
+            marker_radius(10_000_000.0, 1_000_000.0, 10_000_000.0, scaling, 80.0) * scaling;
+
+        assert!(largest > near_threshold);
+        assert_eq!(largest, 32.0);
+    }
+
+    #[test]
+    fn time_based_marker_uses_the_owning_footprint_candle() {
+        const CANDLE_04_50: u64 = 1_788_238_200_000;
+        const CLUSTER_04_50_58_372: u64 = CANDLE_04_50 + 58_372;
+
+        assert_eq!(
+            time_marker_bucket(CLUSTER_04_50_58_372, Timeframe::M1),
+            CANDLE_04_50
+        );
     }
 
     #[test]

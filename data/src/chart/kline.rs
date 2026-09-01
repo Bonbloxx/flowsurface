@@ -635,9 +635,9 @@ impl ClusterKind {
     pub fn min_footprint_width(self) -> f32 {
         match self {
             ClusterKind::VolumeProfile | ClusterKind::DeltaProfile => 80.0,
-            // Reference Bid x Ask columns repeat every ~104 px: a 10 px
-            // candle lane followed by two touching ~44 px histogram halves.
-            ClusterKind::BidAsk => 104.0,
+            // Bid x Ask adds a compact per-row delta value after the two
+            // histogram halves, while keeping both volume labels readable.
+            ClusterKind::BidAsk => 166.0,
             ClusterKind::Table => 100.0,
         }
     }
@@ -660,8 +660,13 @@ pub struct Config {
     // Whether to show last value labels on top right/left when not hovering
     // e.g. OHLC/bar change values for the main chart, or last value of an indicator series
     pub data_labels_always_visible: bool,
+    // Whether to draw OHLC candle bodies and wicks on footprint charts.
+    pub show_footprint_candles: bool,
     // Whether to show the footprint per-bar summary below each candle.
     pub show_footprint_summary: bool,
+    /// Highlight summary volume and absolute delta at this multiple of their
+    /// trailing per-candle averages.
+    pub footprint_summary_abnormal_multiplier: f32,
     // Whether Renko candles show the traded high/low beyond their fixed body.
     pub show_renko_wicks: bool,
     /// Daily Delta grouping in exchange min-ticks. `1` is one price level per min tick.
@@ -689,6 +694,11 @@ pub struct Config {
 }
 
 impl Config {
+    pub const FOOTPRINT_SUMMARY_ABNORMAL_MULTIPLIER_MIN: f32 = 1.5;
+    pub const FOOTPRINT_SUMMARY_ABNORMAL_MULTIPLIER_MAX: f32 = 10.0;
+    pub const FOOTPRINT_SUMMARY_ABNORMAL_MULTIPLIER_DEFAULT: f32 = 3.0;
+    pub const FOOTPRINT_SUMMARY_ABNORMAL_MULTIPLIER_STEP: f32 = 0.25;
+
     pub const DAILY_DELTA_DAY_PRESETS: [u16; 7] = [1, 2, 3, 4, 5, 7, 14];
 
     /// Large Trades capture floor. Every trade at or above this notional is
@@ -712,6 +722,18 @@ impl Config {
             ..super::tpo::Config::default()
         }
     }
+
+    pub fn normalized_footprint_summary_abnormal_multiplier(&self) -> f32 {
+        if self.footprint_summary_abnormal_multiplier.is_finite() {
+            self.footprint_summary_abnormal_multiplier.clamp(
+                Self::FOOTPRINT_SUMMARY_ABNORMAL_MULTIPLIER_MIN,
+                Self::FOOTPRINT_SUMMARY_ABNORMAL_MULTIPLIER_MAX,
+            )
+        } else {
+            Self::FOOTPRINT_SUMMARY_ABNORMAL_MULTIPLIER_DEFAULT
+        }
+    }
+
     pub const DAILY_DELTA_TICK_PRESETS: [TickMultiplier; 12] = [
         TickMultiplier(1),
         TickMultiplier(2),
@@ -732,7 +754,10 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             data_labels_always_visible: false,
+            show_footprint_candles: true,
             show_footprint_summary: false,
+            footprint_summary_abnormal_multiplier:
+                Self::FOOTPRINT_SUMMARY_ABNORMAL_MULTIPLIER_DEFAULT,
             show_renko_wicks: true,
             daily_delta_ticks: 10,
             daily_delta_days: 4,
@@ -860,13 +885,18 @@ mod config_tests {
     use crate::chart::indicator::KlineIndicator;
 
     #[test]
-    fn legacy_config_defaults_liquidity_order_filter() {
+    fn legacy_config_defaults_new_visual_settings() {
         let config: Config = serde_json::from_str(
             r#"{"data_labels_always_visible":true,"show_footprint_summary":false,"show_renko_wicks":true,"daily_delta_ticks":10,"daily_delta_days":4,"previous_value_area_ticks":10}"#,
         )
         .expect("legacy kline config should deserialize");
 
+        assert!(config.show_footprint_candles);
         assert_eq!(config.liquidity_heatmap_order_size_filter, 0.0);
+        assert_eq!(
+            config.footprint_summary_abnormal_multiplier,
+            Config::FOOTPRINT_SUMMARY_ABNORMAL_MULTIPLIER_DEFAULT
+        );
     }
 
     #[test]

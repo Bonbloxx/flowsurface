@@ -1008,6 +1008,23 @@ pub fn kline_cfg_view<'a>(
                     Message::PaneEvent(pane, Event::ClusterKindSelected(new_cluster_kind))
                 });
 
+            let footprint_candles_checkbox = tooltip(
+                checkbox(cfg.show_footprint_candles)
+                    .label("Show candles")
+                    .on_toggle(move |value| {
+                        Message::VisualConfigChanged(
+                            pane,
+                            VisualConfig::Kline(data::chart::kline::Config {
+                                show_footprint_candles: value,
+                                ..cfg
+                            }),
+                            false,
+                        )
+                    }),
+                Some("Show OHLC candle bodies and wicks beside footprint clusters"),
+                TooltipPosition::Top,
+            );
+
             let footprint_summary_checkbox = tooltip(
                 checkbox(cfg.show_footprint_summary)
                     .label("Show footprint summary")
@@ -1024,6 +1041,28 @@ pub fn kline_cfg_view<'a>(
                 Some("Show per-bar volume and delta below footprint candles"),
                 TooltipPosition::Top,
             );
+            let abnormal_multiplier = {
+                use data::chart::kline::Config as KlineConfig;
+
+                labeled_slider(
+                    "Abnormal threshold",
+                    KlineConfig::FOOTPRINT_SUMMARY_ABNORMAL_MULTIPLIER_MIN
+                        ..=KlineConfig::FOOTPRINT_SUMMARY_ABNORMAL_MULTIPLIER_MAX,
+                    cfg.normalized_footprint_summary_abnormal_multiplier(),
+                    move |value| {
+                        Message::VisualConfigChanged(
+                            pane,
+                            VisualConfig::Kline(data::chart::kline::Config {
+                                footprint_summary_abnormal_multiplier: value,
+                                ..cfg
+                            }),
+                            false,
+                        )
+                    },
+                    |value| format!("{value:.2}× average"),
+                    Some(KlineConfig::FOOTPRINT_SUMMARY_ABNORMAL_MULTIPLIER_STEP),
+                )
+            };
 
             let scaling = {
                 let picklist = pick_list(
@@ -1097,7 +1136,19 @@ pub fn kline_cfg_view<'a>(
                         .align_y(Alignment::Center),
                 ]
                 .spacing(8),
-                column![text("Footprint summary").size(crate::style::text_size::SECTION), footprint_summary_checkbox].spacing(8),
+                column![
+                    text("Footprint display").size(crate::style::text_size::SECTION),
+                    footprint_candles_checkbox,
+                ]
+                .spacing(8),
+                column![
+                    text("Footprint summary").size(crate::style::text_size::SECTION),
+                    footprint_summary_checkbox,
+                    abnormal_multiplier,
+                    text("Highlights volume and absolute delta against the prior 20 candles (after at least 5 candles).")
+                        .size(crate::style::text_size::SMALL),
+                ]
+                .spacing(8),
                 column![text("Cluster type").size(crate::style::text_size::SECTION), cluster_picklist].spacing(8),
                 ; spacing = 12, align_x = Alignment::Start
             ];

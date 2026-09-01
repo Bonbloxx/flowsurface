@@ -31,9 +31,9 @@ use serde::{Deserialize, Serialize};
 /// Resolution of the shared UTC-day trade books backing this indicator.
 const ONE_MIN_MS: u64 = 60 * 1_000;
 const FIVE_MIN_MS: u64 = 5 * ONE_MIN_MS;
-// v2 invalidates sidecars that could mark the provisional-cutoff/live-start
-// interval covered even though the old staging boundary discarded its trades.
-const MINUTE_CACHE_SCHEMA_VERSION: u16 = 2;
+// v3 invalidates v2 sidecars whose cached prefix could be merged a second time
+// when another trade-history consumer requested an overlapping range.
+const MINUTE_CACHE_SCHEMA_VERSION: u16 = 3;
 /// UTC days of multi-venue trade history retained in the running sum. Days
 /// are slimmed to compact minute deltas when available and truthful cached
 /// five-minute deltas otherwise, so memory stays linear in time buckets.
@@ -242,6 +242,39 @@ impl MinuteDeltaHistory {
         let oldest = Self::oldest_retained_day(UnixMs::now());
         let qty_is_quote = volume_size_unit() == SizeUnit::Quote
             || source.market_type() == MarketKind::InversePerps;
+        if self
+            .staging
+            .get(&req_id)
+            .is_some_and(|stage| !stage.source.same_market(&source.ticker))
+        {
+            return;
+        }
+
+        // Build the page outside `self.staging` so the checkpoint map remains
+        // available while filtering. The shared planner can legitimately fetch
+        // a wider range when another indicator has less cache coverage; CVD
+        // must not add the already-persisted prefix into its minute map again.
+        let mut accepted = BTreeMap::<u64, BTreeMap<u64, f64>>::new();
+        for trade in trades {
+            let day = day_start(trade.time);
+            let already_covered = self
+                .checkpoints
+                .get(&(source.ticker, day))
+                .copied()
+                .flatten()
+                .is_some_and(|checkpoint| trade.time <= checkpoint);
+            if trade.time.as_u64() < oldest
+                || cutoff.is_some_and(|boundary| trade.time > boundary)
+                || already_covered
+            {
+                continue;
+            }
+            let minute = trade.time.as_u64() / ONE_MIN_MS * ONE_MIN_MS;
+            let notional = trade_notional(*trade, qty_is_quote);
+            let signed = if trade.is_sell { -notional } else { notional };
+            *accepted.entry(day).or_default().entry(minute).or_default() += signed;
+        }
+
         let stage = self
             .staging
             .entry(req_id)
@@ -252,21 +285,11 @@ impl MinuteDeltaHistory {
         if !stage.source.same_market(&source.ticker) {
             return;
         }
-        for trade in trades {
-            if trade.time.as_u64() < oldest || cutoff.is_some_and(|boundary| trade.time > boundary)
-            {
-                continue;
+        for (day, deltas) in accepted {
+            let target = stage.days.entry(day).or_default();
+            for (minute, delta) in deltas {
+                *target.entry(minute).or_default() += delta;
             }
-            let day = day_start(trade.time);
-            let minute = trade.time.as_u64() / ONE_MIN_MS * ONE_MIN_MS;
-            let notional = trade_notional(*trade, qty_is_quote);
-            let signed = if trade.is_sell { -notional } else { notional };
-            *stage
-                .days
-                .entry(day)
-                .or_default()
-                .entry(minute)
-                .or_default() += signed;
         }
     }
 
@@ -329,8 +352,11 @@ pub struct DeltaCandle {
     delta: f64,
     /// Venue membership for this continuous coverage segment.
     source_mask: u128,
-    source_count: u16,
-    source_total: u16,
+}
+
+fn change_text(candle: &DeltaCandle) -> String {
+    let sign = if candle.delta >= 0.0 { "+" } else { "-" };
+    format!("Change: {sign}${}", format_with_commas(candle.delta.abs()))
 }
 
 pub struct CumulativeDeltaIndicator {
@@ -344,7 +370,6 @@ pub struct CumulativeDeltaIndicator {
     merged: MergedDays,
     candles: BTreeMap<UnixMs, DeltaCandle>,
     has_data: bool,
-    has_gaps: bool,
 }
 
 impl CumulativeDeltaIndicator {
@@ -361,7 +386,6 @@ impl CumulativeDeltaIndicator {
             merged: MergedDays::new(LOOKBACK_DAYS),
             candles: BTreeMap::new(),
             has_data: false,
-            has_gaps: false,
         }
     }
 
@@ -390,26 +414,8 @@ impl CumulativeDeltaIndicator {
             return center(text(message)).into();
         }
 
-        let exact = |value: f64| format!("${}", format_with_commas(value));
-        let signed_exact = move |value: f64| {
-            format!(
-                "{}{}",
-                if value >= 0.0 { "+" } else { "-" },
-                exact(value.abs())
-            )
-        };
-        let tooltip = move |candle: &DeltaCandle, _next: Option<&DeltaCandle>| {
-            PlotTooltip::new(format!(
-                "CVD: {}\nO {}  H {}\nL {}  C {}\nΔ {}\nSources {}/{}",
-                exact(candle.close),
-                exact(candle.open),
-                exact(candle.high),
-                exact(candle.low),
-                exact(candle.close),
-                signed_exact(candle.delta),
-                candle.source_count,
-                candle.source_total,
-            ))
+        let tooltip = |candle: &DeltaCandle, _next: Option<&DeltaCandle>| {
+            PlotTooltip::new(change_text(candle))
         };
 
         let plot = CandlePlot::new(
@@ -420,24 +426,14 @@ impl CumulativeDeltaIndicator {
         )
         .with_tooltip(tooltip);
 
-        let plot = indicator_row(
+        indicator_row(
             main_chart,
             &self.cache,
             data_labels_always_visible,
             plot,
             AnySeries::forward_unix_ms(&self.candles),
             visible_range,
-        );
-        if self.has_gaps {
-            iced::widget::column![
-                text("Partial verified history · CVD restarts when source coverage changes")
-                    .size(crate::style::text_size::TINY),
-                plot
-            ]
-            .into()
-        } else {
-            plot
-        }
+        )
     }
 
     fn refresh_merged(&mut self) {
@@ -485,12 +481,6 @@ impl CumulativeDeltaIndicator {
         let mut last_source_mask = previous.map(|(_, candle)| candle.source_mask);
         let mut last_bucket = previous.map(|(bucket, _)| bucket.as_u64());
         drop(self.candles.split_off(&rebuild_key));
-
-        self.has_gaps = self.merged.days.iter().any(|day| {
-            day.sources
-                .iter()
-                .any(|source| !source.missing_ranges.is_empty())
-        });
 
         for day in &self.merged.days {
             if day.day_ts.saturating_add(DAY_MS) <= rebuild_from {
@@ -565,8 +555,6 @@ impl CumulativeDeltaIndicator {
                         close: cumulative,
                         delta,
                         source_mask,
-                        source_count,
-                        source_total: day.sources.len().min(u16::MAX as usize) as u16,
                     },
                 );
                 last_source_mask = Some(source_mask);
@@ -875,6 +863,25 @@ mod tests {
         }
     }
 
+    #[test]
+    fn tooltip_change_uses_the_candle_bucket_delta() {
+        let rising = DeltaCandle {
+            open: 100.0,
+            high: 175.0,
+            low: 90.0,
+            close: 160.0,
+            delta: 60.0,
+            source_mask: 1,
+        };
+        let falling = DeltaCandle {
+            delta: -25.0,
+            ..rising
+        };
+
+        assert_eq!(change_text(&rising), "Change: +$60.00");
+        assert_eq!(change_text(&falling), "Change: -$25.00");
+    }
+
     fn accept_verified_day(
         indicator: &mut CumulativeDeltaIndicator,
         source: TickerInfo,
@@ -1017,6 +1024,58 @@ mod tests {
     }
 
     #[test]
+    fn cached_minute_prefix_is_not_merged_twice_by_an_overlapping_fetch() {
+        let only = source(Exchange::BinanceLinear, "BTCUSDT");
+        let today = day_start(UnixMs::now());
+        let checkpoint = UnixMs::new(today + ONE_MIN_MS - 1);
+        let cached_delta = 750.0;
+        let mut history = MinuteDeltaHistory::default();
+        history.days.insert(
+            (only.ticker, today),
+            BTreeMap::from([(today, cached_delta)]),
+        );
+        history
+            .checkpoints
+            .insert((only.ticker, today), Some(checkpoint));
+        history.prepare(only, UnixMs::new(today + 3 * ONE_MIN_MS));
+
+        let covered_trade = trade(today + 10_000, 10.0, 100.0, false);
+        let new_trade = trade(today + ONE_MIN_MS + 10_000, 10.0, 20.0, false);
+        let req_id = uuid::Uuid::new_v4();
+        history.stage(req_id, only, &[covered_trade, new_trade]);
+        let committed = history.commit(req_id);
+
+        assert_eq!(history.days[&(only.ticker, today)][&today], cached_delta);
+        assert_eq!(committed.len(), 1);
+        assert!(!committed[0].2.contains_key(&today));
+        assert!(committed[0].2.contains_key(&(today + ONE_MIN_MS)));
+    }
+
+    #[test]
+    fn legacy_v2_minute_sidecar_is_rejected() {
+        let only = source(Exchange::BinanceLinear, "BTCUSDT");
+        let day = day_start(UnixMs::now());
+        let root =
+            std::env::temp_dir().join(format!("flowsurface-cvd-v2-cache-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("create cache test directory");
+        let path = root.join("day.cvdbin");
+        let payload = CachedMinuteDeltas {
+            schema_version: 2,
+            source: only.ticker.symbol_and_exchange_string(),
+            day_start: day,
+            covered_through: day + ONE_MIN_MS - 1,
+            size_unit: volume_size_unit(),
+            deltas: BTreeMap::from([(day, 1_000.0)]),
+        };
+        let bytes = bincode::serde::encode_to_vec(&payload, bincode::config::standard())
+            .expect("encode legacy cache");
+        write_cache_with_completion_proof(&path, &bytes).expect("write legacy cache");
+
+        assert!(MinuteDeltaHistory::read_cached_day(&path, only, day).is_none());
+        std::fs::remove_dir_all(&root).expect("remove cache test directory");
+    }
+
+    #[test]
     fn delayed_live_start_backfills_the_provisional_cutoff_gap() {
         let only = source(Exchange::BinanceLinear, "BTCUSDT");
         let mut indicator = CumulativeDeltaIndicator::new();
@@ -1115,7 +1174,6 @@ mod tests {
             )],
         );
 
-        assert!(indicator.has_gaps);
         assert_eq!(indicator.candles.len(), 2);
         assert_eq!(
             indicator.candles[&UnixMs::new(today + ONE_MIN_MS)].close,
@@ -1207,14 +1265,12 @@ mod tests {
         let partial = indicator.candles[&UnixMs::new(today)];
         assert_eq!(partial.open, 0.0);
         assert_eq!(partial.close, 150.0);
-        assert_eq!(partial.source_count, 2);
-        assert_eq!(partial.source_total, 3);
+        assert_eq!(partial.source_mask.count_ones(), 2);
 
         let complete = indicator.candles[&UnixMs::new(today + 10 * ONE_MIN_MS)];
         assert_eq!(complete.open, 0.0);
         assert_eq!(complete.close, 370.0);
-        assert_eq!(complete.source_count, 3);
-        assert_eq!(complete.source_total, 3);
+        assert_eq!(complete.source_mask.count_ones(), 3);
     }
 
     #[test]
@@ -1272,7 +1328,6 @@ mod tests {
             }
         }
 
-        assert!(indicator.has_gaps);
         assert_eq!(indicator.candles.len(), 2);
         assert_eq!(indicator.candles[&UnixMs::new(today)].close, 300.0);
         let resumed = indicator.candles[&UnixMs::new(today + 10 * ONE_MIN_MS)];

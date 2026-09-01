@@ -9,7 +9,7 @@ use crate::chart::{
 use crate::connector::fetcher::FetchRange;
 
 use data::chart::{PlotData, kline::KlineDataPoint};
-use data::util::{abbr_large_numbers, format_with_commas};
+use data::util::format_with_commas;
 use exchange::adapter::{Exchange, Venue};
 use exchange::{Kline, TickerInfo, Timeframe, Trade, UnixMs};
 use rustc_hash::FxHashMap;
@@ -155,28 +155,8 @@ impl OpenInterestIndicator {
             return row![].into();
         }
 
-        let value_label = if self.sources.len() > 1 {
-            "Combined venue-reported OI"
-        } else {
-            "Venue-reported OI"
-        };
-        let tooltip = move |value: &OpenInterestCandle, _next: Option<&OpenInterestCandle>| {
-            let usd = |value: f64| format!("${}", format_with_commas(value));
-            let value_text = format!(
-                "{value_label}: {} ({})\nO {}  H {}\nL {}  C {}",
-                usd(value.close),
-                abbr_large_numbers(value.close),
-                usd(value.open),
-                usd(value.high),
-                usd(value.low),
-                usd(value.close),
-            );
-            let change_text = change_text(value);
-            let coverage = format!(
-                "Sources: {}/{}",
-                value.source_count, value.expected_source_count
-            );
-            PlotTooltip::new(format!("{value_text}\n{change_text}\n{coverage}"))
+        let tooltip = |value: &OpenInterestCandle, _next: Option<&OpenInterestCandle>| {
+            PlotTooltip::new(change_text(value))
         };
 
         let plot = CandlePlot::new(

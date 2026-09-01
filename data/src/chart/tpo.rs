@@ -1175,7 +1175,10 @@ mod tests {
         };
         let visual = VisualConfig {
             data_labels_always_visible: true,
+            show_footprint_candles: true,
             show_footprint_summary: false,
+            footprint_summary_abnormal_multiplier:
+                VisualConfig::FOOTPRINT_SUMMARY_ABNORMAL_MULTIPLIER_DEFAULT,
             show_renko_wicks: false,
             daily_delta_ticks: 10,
             daily_delta_days: 5,

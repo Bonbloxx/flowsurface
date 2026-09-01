@@ -46,7 +46,10 @@ use iced::{Alignment, Color, Element, Point, Rectangle, Renderer, Size, Theme, V
 
 use enum_map::EnumMap;
 use rustc_hash::{FxHashMap, FxHashSet};
-use std::time::{Duration, Instant};
+use std::{
+    collections::VecDeque,
+    time::{Duration, Instant},
+};
 
 const RENKO_SEED_TIMEFRAME: exchange::Timeframe = exchange::Timeframe::M1;
 /// Publish losslessly-ingested live data to the expensive canvas at 20 Hz.
@@ -186,6 +189,14 @@ struct FootprintTradeRequest {
     source: TickerInfo,
     day_start: UnixMs,
     covered_through: UnixMs,
+}
+
+fn retry_live_day_partial(
+    request: FootprintTradeRequest,
+    missing_ranges: &[(UnixMs, UnixMs)],
+    now: UnixMs,
+) -> bool {
+    !missing_ranges.is_empty() && day_start(request.day_start) == day_start(now)
 }
 
 impl FootprintHistoryRuntime {
@@ -407,7 +418,9 @@ impl KlineChart {
         kind: &KlineChartKind,
         visual_config: Option<Config>,
     ) -> Self {
-        let visual_config = visual_config.unwrap_or_default();
+        let mut visual_config = visual_config.unwrap_or_default();
+        visual_config.footprint_summary_abnormal_multiplier =
+            visual_config.normalized_footprint_summary_abnormal_multiplier();
         let kind = match kind.clone() {
             KlineChartKind::Tpo { config } => KlineChartKind::Tpo {
                 config: config.normalized(),
@@ -1818,12 +1831,33 @@ impl KlineChart {
             self.indicators[KlineIndicator::CumulativeDelta].is_some(),
             self.indicators[KlineIndicator::LargeTrades].is_some(),
         );
+        let retry_live_day = self
+            .footprint_history
+            .trade_requests
+            .get(&req_id)
+            .copied()
+            .is_some_and(|request| retry_live_day_partial(request, missing_ranges, UnixMs::now()));
         self.for_each_trade_history(|indicator| {
-            indicator.commit_staged_source_trades(req_id);
+            if retry_live_day {
+                // Recorder finality immediately after restart can leave a
+                // temporary suffix gap. Do not publish its surrounding pages:
+                // retrying the same current-day range would otherwise merge
+                // those executions twice before a durable checkpoint exists.
+                indicator.discard_staged_source_trades(req_id);
+            } else {
+                indicator.commit_staged_source_trades(req_id);
+            }
             indicator.mark_incomplete_trade_history(source, missing_ranges);
         });
         self.footprint_history.trade_requests.remove(&req_id);
-        self.request_handler.mark_completed(req_id);
+        if retry_live_day {
+            // Keep the request retryable. Once recorder coverage catches up, a
+            // successful retry clears the transient gap and rebuilds the CVD
+            // suffix from the prior verified cumulative close.
+            self.request_handler.mark_failed(req_id);
+        } else {
+            self.request_handler.mark_completed(req_id);
+        }
         self.finish_trade_fetch(req_id);
         self.refresh_history_overlay(true);
     }
@@ -1979,6 +2013,8 @@ impl KlineChart {
             .to_bits()
             != visual_config.liquidity_heatmap_order_size_filter.to_bits();
         let mut visual_config = visual_config;
+        visual_config.footprint_summary_abnormal_multiplier =
+            visual_config.normalized_footprint_summary_abnormal_multiplier();
         visual_config.large_trades_min_usd = visual_config.large_trades_min_usd.clamp(
             Config::LARGE_TRADES_MIN_USD_MIN,
             Config::LARGE_TRADES_MIN_USD_MAX,
@@ -2024,6 +2060,7 @@ impl KlineChart {
         } = self.kind
         {
             *clusters = new_kind;
+            self.chart.cell_width = self.chart.cell_width.max(new_kind.min_footprint_width());
         }
 
         self.invalidate(None);
@@ -3138,6 +3175,18 @@ impl canvas::Program<Message> for KlineChart {
                         chart.tick_size,
                         *clusters,
                     );
+                    let max_delta_qty = if *clusters == ClusterKind::BidAsk {
+                        self.calc_qty_scales(
+                            earliest,
+                            latest,
+                            highest,
+                            lowest,
+                            chart.tick_size,
+                            ClusterKind::DeltaProfile,
+                        )
+                    } else {
+                        max_cluster_qty
+                    };
 
                     // Never let the candle shrink below ~2.5 screen px so
                     // body/wick stay visible when panned/zoomed away.
@@ -3180,13 +3229,27 @@ impl canvas::Program<Message> for KlineChart {
 
                     let qty_is_quote = self.footprint_qty_is_quote();
                     let (visible_high, visible_low) = chart.price_range(&region);
+                    let summary_highlights = if self.visual_config.show_footprint_summary {
+                        footprint_summary_highlights(
+                            &self.data_source,
+                            earliest,
+                            latest,
+                            qty_is_quote,
+                            f64::from(
+                                self.visual_config
+                                    .normalized_footprint_summary_abnormal_multiplier(),
+                            ),
+                        )
+                    } else {
+                        FxHashMap::default()
+                    };
                     render_data_source(
                         &self.data_source,
                         frame,
                         earliest,
                         latest,
                         interval_to_x,
-                        |frame, x_position, kline, trades| {
+                        |frame, interval, x_position, kline, trades| {
                             let grouped = trades.grouped_to_step_cow(self.tick_size());
                             let visible_max_notional = if qty_is_quote {
                                 max_cluster_qty
@@ -3200,6 +3263,25 @@ impl canvas::Program<Message> for KlineChart {
                                 visible_max_notional,
                                 individual_max_notional,
                             );
+                            let delta_scaling = if cell_layout.cluster == ClusterKind::BidAsk {
+                                let visible_max_delta_notional = if qty_is_quote {
+                                    max_delta_qty
+                                } else {
+                                    max_delta_qty * kline.close.to_f64().max(1.0)
+                                };
+                                let individual_max_delta_notional = max_cluster_notional(
+                                    &grouped,
+                                    ClusterKind::DeltaProfile,
+                                    qty_is_quote,
+                                );
+                                effective_notional_scale(
+                                    *scaling,
+                                    visible_max_delta_notional,
+                                    individual_max_delta_notional,
+                                )
+                            } else {
+                                cluster_scaling
+                            };
 
                             draw_clusters(
                                 frame,
@@ -3208,9 +3290,17 @@ impl canvas::Program<Message> for KlineChart {
                                 &cell_layout,
                                 chart.scaling,
                                 cluster_scaling,
+                                delta_scaling,
                                 qty_is_quote,
                                 self.tick_size(),
-                                self.visual_config.show_footprint_summary,
+                                FootprintRenderOptions {
+                                    show_candles: self.visual_config.show_footprint_candles,
+                                    show_summary: self.visual_config.show_footprint_summary,
+                                    summary_highlight: summary_highlights
+                                        .get(&interval)
+                                        .copied()
+                                        .unwrap_or_default(),
+                                },
                                 imbalance,
                                 kline,
                                 &grouped,
@@ -3229,7 +3319,7 @@ impl canvas::Program<Message> for KlineChart {
                         earliest,
                         latest,
                         interval_to_x,
-                        |frame, x_position, kline, _| {
+                        |frame, _, x_position, kline, _| {
                             draw_candle_dp(
                                 frame,
                                 price_to_y,
@@ -3251,7 +3341,7 @@ impl canvas::Program<Message> for KlineChart {
                         earliest,
                         latest,
                         interval_to_x,
-                        |frame, x_position, kline, _| {
+                        |frame, _, x_position, kline, _| {
                             draw_candle_dp(
                                 frame,
                                 price_to_y,
@@ -4208,7 +4298,7 @@ fn render_data_source<F>(
     interval_to_x: impl Fn(u64) -> f32,
     draw_fn: F,
 ) where
-    F: Fn(&mut canvas::Frame, f32, &Kline, &KlineTrades),
+    F: Fn(&mut canvas::Frame, u64, f32, &Kline, &KlineTrades),
 {
     match data_source {
         PlotData::TickBased(tick_aggr) => {
@@ -4243,6 +4333,7 @@ fn render_data_source<F>(
 
                         draw_fn(
                             frame,
+                            offset as u64,
                             x_position,
                             &accumulation.kline,
                             &accumulation.footprint,
@@ -4261,7 +4352,13 @@ fn render_data_source<F>(
                 .for_each(|(timestamp, dp)| {
                     let x_position = interval_to_x(timestamp.as_u64());
 
-                    draw_fn(frame, x_position, &dp.kline, &dp.footprint);
+                    draw_fn(
+                        frame,
+                        timestamp.as_u64(),
+                        x_position,
+                        &dp.kline,
+                        &dp.footprint,
+                    );
                 });
         }
     }
@@ -4448,6 +4545,12 @@ fn cluster_label_size(available_w: f32, cell_h: f32, scaling: f32) -> Option<f32
     (size >= 7.0).then_some(size / scaling)
 }
 
+struct FootprintRenderOptions {
+    show_candles: bool,
+    show_summary: bool,
+    summary_highlight: FootprintSummaryHighlight,
+}
+
 fn draw_clusters(
     frame: &mut canvas::Frame,
     price_to_y: impl Fn(Price) -> f32,
@@ -4455,9 +4558,10 @@ fn draw_clusters(
     layout: &FootprintCellLayout<'_>,
     scaling: f32,
     max_cluster_qty: f64,
+    max_delta_qty: f64,
     qty_is_quote: bool,
     step: PriceStep,
-    show_summary: bool,
+    options: FootprintRenderOptions,
     imbalance: Option<(usize, Option<usize>, bool)>,
     kline: &Kline,
     footprint: &KlineTrades,
@@ -4591,15 +4695,17 @@ fn draw_clusters(
                 }
             }
 
-            draw_footprint_kline(
-                frame,
-                &price_to_y,
-                area.candle_center_x,
-                layout.candle_w,
-                scaling,
-                kline,
-                layout.pal,
-            );
+            if options.show_candles {
+                draw_footprint_kline(
+                    frame,
+                    &price_to_y,
+                    area.candle_center_x,
+                    layout.candle_w,
+                    scaling,
+                    kline,
+                    layout.pal,
+                );
+            }
         }
         ClusterKind::Table => {
             let tl = TableLayout::new(
@@ -4613,6 +4719,7 @@ fn draw_clusters(
                 frame,
                 &price_to_y,
                 &tl,
+                options.show_candles,
                 layout.candle_w,
                 scaling,
                 kline,
@@ -4782,6 +4889,11 @@ fn draw_clusters(
                 layout.cell_h,
                 scaling,
             );
+            let delta_text_size = cluster_label_size(
+                area.delta_area_right - area.delta_area_left,
+                layout.cell_h,
+                scaling,
+            );
             // Width now carries the volume hierarchy, so retain the original
             // subdued theme colors behind readable labels.
             let bar_alpha = if text_size.is_some() { 0.36 } else { 1.0 };
@@ -4798,6 +4910,7 @@ fn draw_clusters(
                 let sell_base = group.sell_qty.to_f64();
                 let buy_qty = usd_notional(*price, buy_base, qty_is_quote);
                 let sell_qty = usd_notional(*price, sell_base, qty_is_quote);
+                let delta = buy_qty - sell_qty;
                 let y = price_to_y(*price);
                 let row_top = y - (layout.cell_h / 2.0);
 
@@ -4891,6 +5004,47 @@ fn draw_clusters(
                     }
                 }
 
+                let delta_area_width = area.delta_area_right - area.delta_area_left;
+                let delta_bar_width =
+                    bid_ask_delta_bar_width(delta, max_delta_qty, delta_area_width, scaling);
+                let delta_color = if delta > 0.0 {
+                    layout.pal.success.strong.color
+                } else if delta < 0.0 {
+                    layout.pal.danger.strong.color
+                } else {
+                    text_color
+                };
+                if delta_bar_width > 0.0 {
+                    frame.fill_rectangle(
+                        Point::new(area.delta_area_left, row_top),
+                        Size::new(delta_bar_width, layout.cell_h),
+                        delta_color.scale_alpha(bar_alpha),
+                    );
+                    frame.stroke(
+                        &Path::rectangle(
+                            Point::new(area.delta_area_left, row_top),
+                            Size::new(delta_bar_width, layout.cell_h),
+                        ),
+                        Stroke::default()
+                            .with_color(Color::BLACK.scale_alpha(0.8))
+                            .with_width(bar_border),
+                    );
+                }
+
+                if let Some(delta_text_size) = delta_text_size {
+                    draw_cluster_text(
+                        frame,
+                        &abbr_large_numbers(delta),
+                        // Keep every signed value on one shared left edge. Right
+                        // alignment makes longer negative values look staggered.
+                        Point::new(area.delta_area_left + text_midpoint_padding, y),
+                        delta_text_size,
+                        delta_color,
+                        Alignment::Start,
+                        Alignment::Center,
+                    );
+                }
+
                 if let Some((threshold, color_scale, ignore_zeros)) = imbalance
                     && area.imb_marker_width > 0.0
                 {
@@ -4920,19 +5074,21 @@ fn draw_clusters(
                 }
             }
 
-            draw_footprint_kline(
-                frame,
-                &price_to_y,
-                area.candle_center_x,
-                layout.candle_w,
-                scaling,
-                kline,
-                layout.pal,
-            );
+            if options.show_candles {
+                draw_footprint_kline(
+                    frame,
+                    &price_to_y,
+                    area.candle_center_x,
+                    layout.candle_w,
+                    scaling,
+                    kline,
+                    layout.pal,
+                );
+            }
         }
     }
 
-    if show_summary {
+    if options.show_summary {
         let Some((total_notional, delta_notional)) =
             footprint_notional_summary(footprint, qty_is_quote)
         else {
@@ -4958,14 +5114,17 @@ fn draw_clusters(
             None => price_to_y(kline.low) + layout.cell_h / 2.0 + summary_layout.gap,
         };
 
-        draw_cluster_text(
+        let volume_label = format!("V: ${}", abbr_large_numbers(total_notional));
+        draw_footprint_summary_text(
             frame,
-            &format!("V: ${}", abbr_large_numbers(total_notional)),
+            &volume_label,
             Point::new(summary_x, summary_y),
             summary_layout.text_size,
             layout.pal.background.weakest.text,
-            Alignment::Center,
-            Alignment::Start,
+            options
+                .summary_highlight
+                .volume
+                .then_some(layout.pal.warning.base.color),
         );
 
         let delta_color = if delta_notional >= 0.0 {
@@ -4974,21 +5133,37 @@ fn draw_clusters(
             layout.pal.danger.base.color
         };
 
-        draw_cluster_text(
+        let delta_label = format!(
+            "Δ: {}${}",
+            if delta_notional >= 0.0 { "+" } else { "-" },
+            abbr_large_numbers(delta_notional.abs())
+        );
+        draw_footprint_summary_text(
             frame,
-            &format!(
-                "Δ: {}${}",
-                if delta_notional >= 0.0 { "+" } else { "-" },
-                abbr_large_numbers(delta_notional.abs())
-            ),
+            &delta_label,
             Point::new(
                 summary_x,
                 summary_y + summary_layout.text_size + summary_layout.line_gap,
             ),
             summary_layout.text_size,
             delta_color,
-            Alignment::Center,
-            Alignment::Start,
+            options.summary_highlight.delta.then_some(delta_color),
+        );
+
+        let delta_pct_label = format!(
+            "Δ%: {:+.1}%",
+            footprint_delta_percentage(total_notional, delta_notional)
+        );
+        draw_footprint_summary_text(
+            frame,
+            &delta_pct_label,
+            Point::new(
+                summary_x,
+                summary_y + 2.0 * (summary_layout.text_size + summary_layout.line_gap),
+            ),
+            summary_layout.text_size,
+            delta_color,
+            options.summary_highlight.delta.then_some(delta_color),
         );
     }
 }
@@ -5015,6 +5190,10 @@ fn bid_ask_bar_width(qty: f64, max_qty: f64, area_width: f32, scaling: f32) -> f
     let ratio = (qty / max_qty).clamp(0.0, 1.0) as f32;
     let emphasized = ratio.sqrt() * area_width;
     emphasized.max(2.0 / scaling.max(0.1)).min(area_width)
+}
+
+fn bid_ask_delta_bar_width(delta: f64, max_delta: f64, area_width: f32, scaling: f32) -> f32 {
+    bid_ask_bar_width(delta.abs(), max_delta, area_width, scaling)
 }
 
 fn bid_ask_text_padding(scaling: f32) -> f32 {
@@ -5067,6 +5246,151 @@ fn footprint_notional_summary(footprint: &KlineTrades, qty_is_quote: bool) -> Op
                 (total + buy + sell, delta + buy - sell)
             })
     })
+}
+
+fn footprint_delta_percentage(total_notional: f64, delta_notional: f64) -> f64 {
+    if total_notional > 0.0 {
+        (delta_notional / total_notional) * 100.0
+    } else {
+        0.0
+    }
+}
+
+const FOOTPRINT_SUMMARY_BASELINE_BARS: usize = 20;
+const FOOTPRINT_SUMMARY_MIN_BASELINE_BARS: usize = 5;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct FootprintSummaryHighlight {
+    volume: bool,
+    delta: bool,
+}
+
+#[derive(Default)]
+struct FootprintSummaryBaseline {
+    samples: VecDeque<(f64, f64)>,
+    total_volume: f64,
+    total_abs_delta: f64,
+}
+
+impl FootprintSummaryBaseline {
+    fn classify_and_push(
+        &mut self,
+        (volume, delta): (f64, f64),
+        multiplier: f64,
+    ) -> FootprintSummaryHighlight {
+        let highlight = if self.samples.len() >= FOOTPRINT_SUMMARY_MIN_BASELINE_BARS {
+            let count = self.samples.len() as f64;
+            let average_volume = self.total_volume / count;
+            let average_abs_delta = self.total_abs_delta / count;
+
+            FootprintSummaryHighlight {
+                volume: average_volume > 0.0 && volume >= average_volume * multiplier,
+                delta: average_abs_delta > 0.0 && delta.abs() >= average_abs_delta * multiplier,
+            }
+        } else {
+            FootprintSummaryHighlight::default()
+        };
+
+        let abs_delta = delta.abs();
+        self.samples.push_back((volume, abs_delta));
+        self.total_volume += volume;
+        self.total_abs_delta += abs_delta;
+
+        if self.samples.len() > FOOTPRINT_SUMMARY_BASELINE_BARS
+            && let Some((expired_volume, expired_abs_delta)) = self.samples.pop_front()
+        {
+            self.total_volume -= expired_volume;
+            self.total_abs_delta -= expired_abs_delta;
+        }
+
+        highlight
+    }
+}
+
+fn classify_footprint_summary(
+    baseline: &mut FootprintSummaryBaseline,
+    highlights: &mut FxHashMap<u64, FootprintSummaryHighlight>,
+    interval: u64,
+    footprint: &KlineTrades,
+    qty_is_quote: bool,
+    multiplier: f64,
+) {
+    if let Some(summary) = footprint_notional_summary(footprint, qty_is_quote) {
+        let highlight = baseline.classify_and_push(summary, multiplier);
+        if highlight.volume || highlight.delta {
+            highlights.insert(interval, highlight);
+        }
+    }
+}
+
+fn footprint_summary_highlights(
+    data_source: &PlotData<KlineDataPoint>,
+    earliest: u64,
+    latest: u64,
+    qty_is_quote: bool,
+    multiplier: f64,
+) -> FxHashMap<u64, FootprintSummaryHighlight> {
+    let mut baseline = FootprintSummaryBaseline::default();
+    let mut highlights = FxHashMap::default();
+
+    match data_source {
+        PlotData::TimeBased(timeseries) => {
+            let start = UnixMs::new(earliest);
+            let mut prior = timeseries
+                .datapoints
+                .range(..start)
+                .rev()
+                .filter_map(|(_, dp)| footprint_notional_summary(&dp.footprint, qty_is_quote))
+                .take(FOOTPRINT_SUMMARY_BASELINE_BARS)
+                .collect::<Vec<_>>();
+            for summary in prior.drain(..).rev() {
+                baseline.classify_and_push(summary, multiplier);
+            }
+
+            if latest >= earliest {
+                for (_, dp) in timeseries.datapoints.range(start..=UnixMs::new(latest)) {
+                    classify_footprint_summary(
+                        &mut baseline,
+                        &mut highlights,
+                        dp.kline.time.as_u64(),
+                        &dp.footprint,
+                        qty_is_quote,
+                        multiplier,
+                    );
+                }
+            }
+        }
+        PlotData::TickBased(tick_aggr) => {
+            let skip = usize::from(tick_aggr.is_renko());
+            let base = tick_aggr.datapoints.len().saturating_sub(1 + skip);
+            let range = base
+                .checked_sub(earliest as usize)
+                .map(|upper| (base.saturating_sub(latest as usize), upper))
+                .filter(|(lower, upper)| lower <= upper);
+
+            if let Some((lower, upper)) = range {
+                let prior_start = lower.saturating_sub(FOOTPRINT_SUMMARY_BASELINE_BARS);
+                for dp in &tick_aggr.datapoints[prior_start..lower] {
+                    if let Some(summary) = footprint_notional_summary(&dp.footprint, qty_is_quote) {
+                        baseline.classify_and_push(summary, multiplier);
+                    }
+                }
+                for (index, dp) in tick_aggr.datapoints[lower..=upper].iter().enumerate() {
+                    let absolute_index = lower + index;
+                    classify_footprint_summary(
+                        &mut baseline,
+                        &mut highlights,
+                        (base - absolute_index) as u64,
+                        &dp.footprint,
+                        qty_is_quote,
+                        multiplier,
+                    );
+                }
+            }
+        }
+    }
+
+    highlights
 }
 
 fn draw_imbalance_markers(
@@ -5156,6 +5480,47 @@ fn draw_cluster_text(
         font: style::AZERET_MONO,
         ..canvas::Text::default()
     });
+}
+
+fn draw_footprint_summary_text(
+    frame: &mut canvas::Frame,
+    text: &str,
+    position: Point,
+    text_size: f32,
+    normal_color: Color,
+    highlight_color: Option<Color>,
+) {
+    let color = highlight_color.unwrap_or(normal_color);
+
+    if let Some(highlight_color) = highlight_color {
+        // Azeret Mono is close to 0.62 em per glyph. The small theme-colored
+        // backdrop makes an anomaly visible without changing the summary text
+        // or introducing chart-specific hardcoded colors.
+        let text_width = text.chars().count() as f32 * text_size * 0.62;
+        let horizontal_padding = text_size * 0.3;
+        let vertical_padding = text_size * 0.12;
+        frame.fill_rectangle(
+            Point::new(
+                position.x - text_width / 2.0 - horizontal_padding,
+                position.y - vertical_padding,
+            ),
+            Size::new(
+                text_width + horizontal_padding * 2.0,
+                text_size + vertical_padding * 2.0,
+            ),
+            highlight_color.scale_alpha(0.2),
+        );
+    }
+
+    draw_cluster_text(
+        frame,
+        text,
+        position,
+        text_size,
+        color,
+        Alignment::Center,
+        Alignment::Start,
+    );
 }
 
 fn draw_crosshair_tooltip(
@@ -5483,6 +5848,12 @@ struct ContentGaps {
     candle_to_ladder: f32,
     /// Inner space reserved between imb. markers and clusters (used for BidAsk)
     marker_to_bars: f32,
+    /// Gap between the Bid x Ask ladder and its per-row delta value.
+    bars_to_delta: f32,
+    /// Trailing space between the delta lane and the next footprint candle.
+    delta_trailing: f32,
+    /// Minimum screen-space width for the proportional per-row delta lane.
+    delta_column_min_width: f32,
 }
 
 impl ContentGaps {
@@ -5495,6 +5866,9 @@ impl ContentGaps {
             candle_leading: px(2.0),
             candle_to_ladder: base + px(5.0),
             marker_to_bars: px(2.0),
+            bars_to_delta: px(12.0),
+            delta_trailing: px(3.0),
+            delta_column_min_width: px(32.0),
         }
     }
 }
@@ -5552,6 +5926,8 @@ struct BidAskArea {
     bid_area_right: f32,
     ask_area_left: f32,
     ask_area_right: f32,
+    delta_area_left: f32,
+    delta_area_right: f32,
     candle_center_x: f32,
     imb_marker_width: f32,
 }
@@ -5563,7 +5939,18 @@ impl BidAskArea {
         let candle_left = content_left + spacing.candle_leading;
         let candle_center_x = candle_left + candle_width / 2.0;
         let hist_left = (candle_left + candle_width + spacing.candle_to_ladder).min(content_right);
-        let half_width = ((content_right - hist_left) / 2.0).max(0.0);
+        let available_width = (content_right - hist_left).max(0.0);
+        let max_delta_width = available_width * 0.34;
+        let delta_width = (available_width * 0.26)
+            .max(spacing.delta_column_min_width.min(max_delta_width))
+            .min(max_delta_width);
+        // Preserve the established delta-lane width and move the whole lane
+        // left, leaving a true trailing gutter before the next candle.
+        let delta_area_right = (content_right - spacing.delta_trailing).max(hist_left);
+        let delta_area_left = delta_area_right - delta_width;
+        let hist_right =
+            (delta_area_left - spacing.bars_to_delta.min(available_width * 0.10)).max(hist_left);
+        let half_width = ((hist_right - hist_left) / 2.0).max(0.0);
 
         // Bid and ask share one exact midpoint, matching the compact ladder in
         // the reference instead of leaving an artificial middle gutter.
@@ -5571,13 +5958,15 @@ impl BidAskArea {
         let ask_area_left = hist_left;
         let ask_area_right = mid;
         let bid_area_left = mid;
-        let bid_area_right = content_right;
+        let bid_area_right = hist_right;
 
         Self {
             bid_area_left,
             bid_area_right,
             ask_area_left,
             ask_area_right,
+            delta_area_left,
+            delta_area_right,
             candle_center_x,
             imb_marker_width: candle_width,
         }
@@ -5627,20 +6016,23 @@ impl TableArea {
         frame: &mut canvas::Frame,
         price_to_y: &impl Fn(Price) -> f32,
         table_layout: &TableLayout,
+        show_candles: bool,
         candle_width: f32,
         scaling: f32,
         kline: &Kline,
         palette: &Extended,
     ) -> Self {
-        draw_footprint_kline(
-            frame,
-            price_to_y,
-            table_layout.candle_center_x,
-            candle_width,
-            scaling,
-            kline,
-            palette,
-        );
+        if show_candles {
+            draw_footprint_kline(
+                frame,
+                price_to_y,
+                table_layout.candle_center_x,
+                candle_width,
+                scaling,
+                kline,
+                palette,
+            );
+        }
 
         Self {
             table_left: table_layout.table_left,
@@ -5695,8 +6087,9 @@ impl FootprintSummaryLayout {
 
         let first_line_bottom = layout.gap + layout.text_size;
         let second_line_bottom = first_line_bottom + layout.line_gap + layout.text_size;
+        let third_line_bottom = second_line_bottom + layout.line_gap + layout.text_size;
 
-        let summary_ticks = second_line_bottom / cell_height;
+        let summary_ticks = third_line_bottom / cell_height;
         summary_ticks * tick_size
     }
 }
@@ -6836,6 +7229,10 @@ mod tests {
             200.0
         );
         assert_eq!(
+            max_cluster_notional(&footprint, ClusterKind::DeltaProfile, false),
+            100.0
+        );
+        assert_eq!(
             footprint_notional_summary(&footprint, false),
             Some((300.0, 100.0))
         );
@@ -6843,6 +7240,49 @@ mod tests {
             footprint_notional_summary(&footprint, true),
             Some((3.0, 1.0)),
             "quote-normalized quantities must not be multiplied by price twice"
+        );
+    }
+
+    #[test]
+    fn footprint_summary_delta_percentage_uses_total_volume() {
+        let percentage = footprint_delta_percentage(38_740_000.0, -23_920_000.0);
+
+        assert!((percentage - -61.744_966).abs() < 0.000_001);
+        assert_eq!(footprint_delta_percentage(0.0, 0.0), 0.0);
+    }
+
+    #[test]
+    fn footprint_summary_highlights_three_times_the_trailing_average() {
+        let mut baseline = FootprintSummaryBaseline::default();
+        for _ in 0..FOOTPRINT_SUMMARY_MIN_BASELINE_BARS {
+            assert_eq!(
+                baseline.classify_and_push((100.0, 20.0), 3.0),
+                FootprintSummaryHighlight::default()
+            );
+        }
+
+        assert_eq!(
+            baseline.classify_and_push((300.0, -60.0), 3.0),
+            FootprintSummaryHighlight {
+                volume: true,
+                delta: true,
+            }
+        );
+    }
+
+    #[test]
+    fn footprint_summary_compares_absolute_delta_without_flagging_normal_volume() {
+        let mut baseline = FootprintSummaryBaseline::default();
+        for _ in 0..FOOTPRINT_SUMMARY_MIN_BASELINE_BARS {
+            baseline.classify_and_push((100.0, -20.0), 3.0);
+        }
+
+        assert_eq!(
+            baseline.classify_and_push((100.0, 60.0), 3.0),
+            FootprintSummaryHighlight {
+                volume: false,
+                delta: true,
+            }
         );
     }
 
@@ -6938,6 +7378,8 @@ mod tests {
         );
         let right_width = area.bid_area_right - area.bid_area_left;
         let left_width = area.ask_area_right - area.ask_area_left;
+        let delta_width = area.delta_area_right - area.delta_area_left;
+        let ladder_to_delta = area.delta_area_left - area.bid_area_right;
         let candle_left = area.candle_center_x - candle_width / 2.0;
         let candle_leading = candle_left - content_left;
         let candle_right = area.candle_center_x + candle_width / 2.0;
@@ -6946,8 +7388,10 @@ mod tests {
             area.ask_area_left - bid_ask_poc_outline_padding(scaling) - candle_right;
         let label_size = cluster_label_size(left_width.min(right_width), 18.0, scaling)
             .expect("default Bid x Ask labels should be readable");
+        let delta_label_size = cluster_label_size(delta_width, 18.0, scaling)
+            .expect("default Bid x Ask delta labels should be readable");
 
-        assert_eq!(cell_width, 104.0);
+        assert_eq!(cell_width, 166.0);
         assert_eq!(cell_width, ClusterKind::BidAsk.min_footprint_width());
         assert!(
             (area.ask_area_right - area.bid_area_left).abs() < f32::EPSILON,
@@ -6971,10 +7415,35 @@ mod tests {
         );
         assert!(left_width >= 40.0, "left histogram width was {left_width}");
         assert!(
+            delta_width * scaling >= 34.0,
+            "delta column width was {delta_width}"
+        );
+        assert!(
+            ladder_to_delta * scaling >= 11.9,
+            "ladder-to-delta gap was {ladder_to_delta}"
+        );
+        assert!(((content_right - area.delta_area_right) * scaling - 3.0).abs() < f32::EPSILON);
+        assert!(
             right_width >= 40.0,
             "right histogram width was {right_width}"
         );
         assert!(label_size >= 11.0, "label size was {label_size}");
+        assert!(
+            delta_label_size >= 9.0,
+            "delta label size was {delta_label_size}"
+        );
+
+        let zoomed_scaling = 2.0;
+        let zoomed_area = BidAskArea::new(
+            content_left,
+            content_right,
+            candle_width,
+            ContentGaps::from_view(candle_width, zoomed_scaling),
+        );
+        let zoomed_delta_width = zoomed_area.delta_area_right - zoomed_area.delta_area_left;
+        let zoomed_delta_label = cluster_label_size(zoomed_delta_width, 18.0, zoomed_scaling)
+            .expect("zoomed Bid x Ask delta labels should be readable");
+        assert!(zoomed_delta_label * zoomed_scaling > delta_label_size * scaling);
     }
 
     #[test]
@@ -6987,6 +7456,9 @@ mod tests {
             let gaps = ContentGaps::from_view(10.4 / scaling, scaling);
             assert!((gaps.candle_leading * scaling - 2.0).abs() < f32::EPSILON);
             assert!(gaps.candle_to_ladder * scaling >= 7.0);
+            assert!((gaps.bars_to_delta * scaling - 12.0).abs() < f32::EPSILON);
+            assert!((gaps.delta_trailing * scaling - 3.0).abs() < f32::EPSILON);
+            assert!((gaps.delta_column_min_width * scaling - 32.0).abs() < f32::EPSILON);
             assert!(bid_ask_bar_width(1.0, 1_000.0, 40.0, scaling) * scaling >= 2.0);
         }
 
@@ -7017,6 +7489,22 @@ mod tests {
     }
 
     #[test]
+    fn bid_ask_delta_bars_scale_with_absolute_delta() {
+        let lane_width = 42.0;
+        let max_delta = 100.0;
+        let small = bid_ask_delta_bar_width(5.0, max_delta, lane_width, 1.0);
+        let medium = bid_ask_delta_bar_width(-25.0, max_delta, lane_width, 1.0);
+        let maximum = bid_ask_delta_bar_width(100.0, max_delta, lane_width, 1.0);
+
+        assert!(small < medium && medium < maximum);
+        assert_eq!(
+            medium,
+            bid_ask_delta_bar_width(25.0, max_delta, lane_width, 1.0)
+        );
+        assert_eq!(maximum, lane_width);
+    }
+
+    #[test]
     fn footprint_can_pan_and_zoom_beyond_the_old_limits() {
         let source = TickerInfo::new(
             Ticker::new("BTCUSDT", Exchange::BinanceLinear),
@@ -7039,6 +7527,13 @@ mod tests {
             source,
             &kind,
             None,
+        );
+
+        chart.chart.cell_width = 100.0;
+        chart.set_cluster_kind(ClusterKind::BidAsk);
+        assert_eq!(
+            chart.chart.cell_width,
+            ClusterKind::BidAsk.min_footprint_width()
         );
 
         chart.chart.layout.autoscale = Some(Autoscale::FitToVisible);
@@ -7278,6 +7773,36 @@ mod tests {
             "requested {requested_days:?} extends past the {oldest_allowed} fetch horizon"
         );
         crate::connector::fetcher::set_trade_fetch_mode(TradeFetchMode::Off);
+    }
+
+    #[test]
+    fn current_day_partial_history_is_retryable_but_old_gaps_remain_terminal() {
+        let source = TickerInfo::new(
+            Ticker::new("BTCUSDT", Exchange::BinanceLinear),
+            0.1,
+            0.001,
+            None,
+        );
+        let today = day_start(UnixMs::now());
+        let current = FootprintTradeRequest {
+            source,
+            day_start: UnixMs::new(today),
+            covered_through: UnixMs::new(today + 10 * 60_000),
+        };
+        let missing = [(
+            UnixMs::new(today + 9 * 60_000),
+            UnixMs::new(today + 10 * 60_000),
+        )];
+
+        assert!(retry_live_day_partial(current, &missing, UnixMs::now()));
+        assert!(!retry_live_day_partial(current, &[], UnixMs::now()));
+
+        let previous = FootprintTradeRequest {
+            day_start: UnixMs::new(today.saturating_sub(24 * 60 * 60 * 1_000)),
+            covered_through: UnixMs::new(today - 1),
+            ..current
+        };
+        assert!(!retry_live_day_partial(previous, &missing, UnixMs::now()));
     }
 
     #[test]

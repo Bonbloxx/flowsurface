@@ -17,6 +17,17 @@ pub struct CandlePlot<O, H, L, C, T> {
     bar_width_factor: f32,
 }
 
+const MIN_BODY_HEIGHT_PX: f32 = 3.0;
+
+fn emphasized_body(open_y: f32, close_y: f32, scaling: f32) -> (f32, f32) {
+    let actual_top = open_y.min(close_y);
+    let actual_height = (open_y - close_y).abs();
+    let min_height = MIN_BODY_HEIGHT_PX / scaling.max(f32::EPSILON);
+    let height = actual_height.max(min_height);
+
+    (actual_top - (height - actual_height) / 2.0, height)
+}
+
 impl<O, H, L, C, T> CandlePlot<O, H, L, C, T> {
     pub fn new(open: O, high: H, low: L, close: C) -> Self {
         Self {
@@ -96,10 +107,10 @@ where
 
             let open_y = scale.to_y(open);
             let close_y = scale.to_y(close);
-            let top = open_y.min(close_y);
+            let (top, height) = emphasized_body(open_y, close_y, ctx.scaling);
             frame.fill_rectangle(
                 Point::new(center_x - width / 2.0, top),
-                Size::new(width, (open_y - close_y).abs().max(1.0)),
+                Size::new(width, height),
                 color,
             );
         });
@@ -107,5 +118,24 @@ where
 
     fn tooltip_fn(&self) -> Option<&TooltipFn<S::Y>> {
         self.tooltip.as_ref()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn short_candle_bodies_keep_a_three_pixel_screen_height() {
+        let (top, height) = emphasized_body(10.0, 11.0, 2.0);
+
+        assert_eq!(top, 9.75);
+        assert_eq!(height, 1.5);
+        assert_eq!(height * 2.0, MIN_BODY_HEIGHT_PX);
+    }
+
+    #[test]
+    fn large_candle_bodies_keep_their_true_geometry() {
+        assert_eq!(emphasized_body(10.0, 16.0, 2.0), (10.0, 6.0));
     }
 }
