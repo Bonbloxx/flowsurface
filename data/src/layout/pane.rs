@@ -287,6 +287,14 @@ pub struct PaneSetup {
 }
 
 impl PaneSetup {
+    pub fn footprint_tick_multiplier(basis: Basis) -> Option<TickMultiplier> {
+        match basis {
+            Basis::Time(Timeframe::M1) => Some(TickMultiplier(100)),
+            Basis::Time(Timeframe::M5) => Some(TickMultiplier(200)),
+            _ => None,
+        }
+    }
+
     pub fn new(
         content_kind: ContentKind,
         base_ticker: TickerInfo,
@@ -356,9 +364,11 @@ impl PaneSetup {
                 };
                 Some(tm)
             }
-            ContentKind::FootprintChart => {
-                Some(current_tick_multiplier.unwrap_or(TickMultiplier(50)))
-            }
+            ContentKind::FootprintChart => Some(current_tick_multiplier.unwrap_or_else(|| {
+                basis
+                    .and_then(Self::footprint_tick_multiplier)
+                    .unwrap_or(TickMultiplier(50))
+            })),
             ContentKind::FootprintHistory => {
                 Some(current_tick_multiplier.unwrap_or(TickMultiplier(1000)))
             }

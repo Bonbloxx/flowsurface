@@ -2675,6 +2675,17 @@ impl State {
                                 self.settings.selected_basis = Some(new_basis);
 
                                 let base_ticker = self.stream_pair();
+                                let footprint_tick_multiplier = match &self.content {
+                                    Content::Kline { chart: Some(c), .. }
+                                        if matches!(
+                                            c.kind,
+                                            data::chart::KlineChartKind::Footprint { .. }
+                                        ) =>
+                                    {
+                                        PaneSetup::footprint_tick_multiplier(new_basis)
+                                    }
+                                    _ => None,
+                                };
 
                                 match &mut self.content {
                                     Content::Heatmap { chart: Some(c), .. } => {
@@ -2812,6 +2823,13 @@ impl State {
                                         }
                                     }
                                     _ => {}
+                                }
+
+                                if let Some(tm) = footprint_tick_multiplier {
+                                    modifier.update_kind_with_multiplier(tm);
+                                    if let Some(tick_effect) = self.apply_tick_multiplier(tm) {
+                                        effect = Some(tick_effect);
+                                    }
                                 }
                             }
                         }
@@ -4191,8 +4209,8 @@ mod tests {
             panic!("Footprint chart initialized");
         };
         assert_eq!(chart.feed().sources(), &[binance, bybit, hyperliquid]);
-        // Shared BTC grid is 0.1; default footprint grouping is 50x.
-        assert_eq!(chart.tick_size().to_ui_string(), "5");
+        // Shared BTC grid is 0.1; the default M5 footprint grouping is 200x.
+        assert_eq!(chart.tick_size().to_ui_string(), "20");
         assert!(matches!(
             state.stream_pair_kind(),
             Some(StreamPairKind::MultiSource(sources)) if sources == vec![binance, bybit, hyperliquid]
@@ -4312,6 +4330,51 @@ mod tests {
         };
         assert_eq!(chart.tick_size().to_ui_string(), "20");
         assert!(!indicators.contains(&KlineIndicator::LiquidityHeatmap));
+    }
+
+    #[test]
+    fn footprint_timeframes_apply_automatic_tick_multipliers() {
+        let binance = ticker_info(Exchange::BinanceLinear, "BTCUSDT", 0.1);
+        let mut state = State::default();
+        state.set_content_and_streams(vec![binance], ContentKind::FootprintChart);
+
+        assert_eq!(
+            state.settings.selected_basis,
+            Some(Basis::Time(Timeframe::M5))
+        );
+        assert_eq!(state.settings.tick_multiply, Some(TickMultiplier(200)));
+
+        state.modal = Some(Modal::StreamModifier(modal::stream::Modifier::new(
+            ModifierKind::Footprint(Basis::Time(Timeframe::M5), TickMultiplier(200)),
+        )));
+        state.update(Event::StreamModifierChanged(
+            modal::stream::Message::BasisSelected(Basis::Time(Timeframe::M1)),
+        ));
+
+        assert_eq!(state.settings.tick_multiply, Some(TickMultiplier(100)));
+        let Content::Kline {
+            chart: Some(chart), ..
+        } = &state.content
+        else {
+            panic!("Footprint chart initialized");
+        };
+        assert_eq!(chart.tick_size().to_ui_string(), "10");
+
+        state.update(Event::TicksizeSelected(TickMultiplier(500)));
+        assert_eq!(state.settings.tick_multiply, Some(TickMultiplier(500)));
+
+        state.update(Event::StreamModifierChanged(
+            modal::stream::Message::BasisSelected(Basis::Time(Timeframe::M5)),
+        ));
+
+        assert_eq!(state.settings.tick_multiply, Some(TickMultiplier(200)));
+        let Content::Kline {
+            chart: Some(chart), ..
+        } = &state.content
+        else {
+            panic!("Footprint chart initialized");
+        };
+        assert_eq!(chart.tick_size().to_ui_string(), "20");
     }
 
     #[test]
