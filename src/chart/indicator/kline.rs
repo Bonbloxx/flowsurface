@@ -149,6 +149,9 @@ pub trait KlineIndicatorImpl {
     /// Minimum executed-trade notional shown by the Large Trades overlay.
     fn set_large_trades_threshold(&mut self, _min_notional_usd: f32) {}
 
+    /// Execution side shown by the Large Trades overlay.
+    fn set_large_trades_side(&mut self, _side: data::chart::kline::LargeTradesSide) {}
+
     /// Set the historical/live boundary before a source backfill begins.
     fn prepare_footprint_history(&mut self, _source: exchange::TickerInfo, _cutoff: UnixMs) {}
 

@@ -535,6 +535,7 @@ impl KlineChart {
                     }
                     if i == KlineIndicator::LargeTrades {
                         indi.set_large_trades_threshold(visual_config.large_trades_min_usd);
+                        indi.set_large_trades_side(visual_config.large_trades_side);
                     }
                     indi.rebuild_from_source(&data_source);
                     indicators[i] = Some(indi);
@@ -648,6 +649,7 @@ impl KlineChart {
                     }
                     if i == KlineIndicator::LargeTrades {
                         indi.set_large_trades_threshold(visual_config.large_trades_min_usd);
+                        indi.set_large_trades_side(visual_config.large_trades_side);
                     }
                     indi.rebuild_from_source(&data_source);
                     indicators[i] = Some(indi);
@@ -2051,6 +2053,8 @@ impl KlineChart {
         );
         let large_trades_threshold_changed = self.visual_config.large_trades_min_usd.to_bits()
             != visual_config.large_trades_min_usd.to_bits();
+        let large_trades_side_changed =
+            self.visual_config.large_trades_side != visual_config.large_trades_side;
         self.visual_config = visual_config;
         if lookback_changed {
             self.restart_trade_history_backfill();
@@ -2066,10 +2070,11 @@ impl KlineChart {
         if let Some(indicator) = self.indicators[KlineIndicator::DailyDelta].as_mut() {
             indicator.set_trade_history_lookback(self.visual_config.daily_delta_days);
         }
-        if large_trades_threshold_changed
+        if (large_trades_threshold_changed || large_trades_side_changed)
             && let Some(indicator) = self.indicators[KlineIndicator::LargeTrades].as_mut()
         {
             indicator.set_large_trades_threshold(self.visual_config.large_trades_min_usd);
+            indicator.set_large_trades_side(self.visual_config.large_trades_side);
         }
         if liquidity_filter_changed && let Some(runtime) = self.footprint_history.liquidity.as_mut()
         {
@@ -3084,6 +3089,7 @@ impl KlineChart {
                 }
                 if indicator == KlineIndicator::LargeTrades {
                     box_indi.set_large_trades_threshold(self.visual_config.large_trades_min_usd);
+                    box_indi.set_large_trades_side(self.visual_config.large_trades_side);
                 }
             }
             if indicator == KlineIndicator::PreviousValueArea {

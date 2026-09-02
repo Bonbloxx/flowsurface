@@ -7,7 +7,7 @@ use crate::chart::{Message, ViewState};
 use std::cell::RefCell;
 
 use data::chart::PlotData;
-use data::chart::kline::{Config as KlineChartConfig, KlineDataPoint};
+use data::chart::kline::{Config as KlineChartConfig, KlineDataPoint, LargeTradesSide};
 use data::util::abbr_large_numbers;
 use exchange::unit::{Price, PriceStep};
 use exchange::{Timeframe, UnixMs};
@@ -61,6 +61,16 @@ fn display_clusters_above_threshold(
     // slider rises even when its displayed total still clears the threshold.
     let mut clustered = cluster_same_side_prints(prints);
     clustered.retain(|trade| trade.notional >= threshold);
+    clustered
+}
+
+fn display_clusters_for_side(
+    prints: Vec<StoredLargeTrade>,
+    threshold: f64,
+    side: LargeTradesSide,
+) -> Vec<StoredLargeTrade> {
+    let mut clustered = display_clusters_above_threshold(prints, threshold);
+    clustered.retain(|trade| side.includes(trade.is_sell));
     clustered
 }
 
@@ -169,6 +179,7 @@ struct HoverMarker {
 pub struct LargeTradesIndicator {
     inner: FootprintHistoryIndicator,
     min_usd: f32,
+    side: LargeTradesSide,
     /// Filled by `draw_overlay` and reused by hover so mouse-move crosshair
     /// frames do not re-scan the day books.
     hover_markers: RefCell<Vec<HoverMarker>>,
@@ -182,6 +193,7 @@ impl LargeTradesIndicator {
         Self {
             inner,
             min_usd: KlineChartConfig::LARGE_TRADES_MIN_USD_DEFAULT,
+            side: LargeTradesSide::default(),
             hover_markers: RefCell::new(Vec::new()),
         }
     }
@@ -191,6 +203,10 @@ impl LargeTradesIndicator {
             KlineChartConfig::LARGE_TRADES_MIN_USD_MIN,
             KlineChartConfig::LARGE_TRADES_MIN_USD_MAX,
         );
+    }
+
+    pub fn set_side(&mut self, side: LargeTradesSide) {
+        self.side = side;
     }
 
     fn visible_window(
@@ -285,7 +301,7 @@ impl LargeTradesIndicator {
             day = day.saturating_add(DAY_MS);
         }
 
-        let clustered = display_clusters_above_threshold(prints, f64::from(threshold));
+        let clustered = display_clusters_for_side(prints, f64::from(threshold), self.side);
         let mut markers: Vec<(f32, StoredLargeTrade)> = Vec::with_capacity(clustered.len());
         for trade in clustered {
             let Some(x) = self.marker_x(chart, data_source, window, trade.time.as_u64()) else {
@@ -434,6 +450,10 @@ impl KlineIndicatorImpl for LargeTradesIndicator {
 
     fn set_large_trades_threshold(&mut self, min_notional_usd: f32) {
         self.set_threshold(min_notional_usd);
+    }
+
+    fn set_large_trades_side(&mut self, side: LargeTradesSide) {
+        self.set_side(side);
     }
 
     fn draw_overlay(
@@ -852,6 +872,24 @@ mod tests {
             stored(1_010, 80_000.0, 1_200_000.0, true),
         ]);
         assert_eq!(clustered.len(), 2);
+    }
+
+    #[test]
+    fn side_filter_can_show_buys_sells_or_both_without_changing_clusters() {
+        let prints = vec![
+            stored(1_000, 80_000.0, 1_200_000.0, false),
+            stored(1_010, 80_000.0, 1_300_000.0, true),
+        ];
+
+        let both = display_clusters_for_side(prints.clone(), 100_000.0, LargeTradesSide::Both);
+        let buys = display_clusters_for_side(prints.clone(), 100_000.0, LargeTradesSide::Buys);
+        let sells = display_clusters_for_side(prints, 100_000.0, LargeTradesSide::Sells);
+
+        assert_eq!(both.len(), 2);
+        assert_eq!(buys.len(), 1);
+        assert!(!buys[0].is_sell);
+        assert_eq!(sells.len(), 1);
+        assert!(sells[0].is_sell);
     }
 
     #[test]

@@ -1411,7 +1411,7 @@ pub fn kline_cfg_view<'a>(
     }
 
     if let Some(min_usd) = large_trades {
-        use data::chart::kline::Config as KlineConfig;
+        use data::chart::kline::{Config as KlineConfig, LargeTradesSide};
         let min_usd = min_usd.clamp(
             KlineConfig::LARGE_TRADES_MIN_USD_MIN,
             KlineConfig::LARGE_TRADES_MIN_USD_MAX,
@@ -1433,6 +1433,49 @@ pub fn kline_cfg_view<'a>(
             |value| format!("${}", format_with_commas(*value as f64)),
             Some(KlineConfig::LARGE_TRADES_MIN_USD_STEP),
         );
+
+        let side_filter = row![
+            radio(
+                "Both",
+                LargeTradesSide::Both,
+                Some(cfg.large_trades_side),
+                move |side| Message::VisualConfigChanged(
+                    pane,
+                    VisualConfig::Kline(data::chart::kline::Config {
+                        large_trades_side: side,
+                        ..cfg
+                    }),
+                    false,
+                ),
+            ),
+            radio(
+                "Buys only",
+                LargeTradesSide::Buys,
+                Some(cfg.large_trades_side),
+                move |side| Message::VisualConfigChanged(
+                    pane,
+                    VisualConfig::Kline(data::chart::kline::Config {
+                        large_trades_side: side,
+                        ..cfg
+                    }),
+                    false,
+                ),
+            ),
+            radio(
+                "Sells only",
+                LargeTradesSide::Sells,
+                Some(cfg.large_trades_side),
+                move |side| Message::VisualConfigChanged(
+                    pane,
+                    VisualConfig::Kline(data::chart::kline::Config {
+                        large_trades_side: side,
+                        ..cfg
+                    }),
+                    false,
+                ),
+            ),
+        ]
+        .spacing(8);
 
         let preset_button = |value: f32, label: &'static str| {
             let is_selected = (min_usd - value).abs() < 0.5;
@@ -1503,6 +1546,8 @@ pub fn kline_cfg_view<'a>(
             column![
                 text("Large Trades").size(crate::style::text_size::SECTION),
                 text("Circles mark executed trades above the threshold. Same-side prints within 100ms — including across selected venues — are drawn as one bubble at VWAP. Buy markers use bid color, sells use ask color; size scales with notional. Hover a circle to see its value."),
+                text("Show"),
+                side_filter,
                 text("Presets"),
                 preset_grid,
                 threshold_slider,

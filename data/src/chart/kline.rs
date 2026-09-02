@@ -689,8 +689,28 @@ pub struct Config {
     /// Minimum executed-trade notional in quote currency shown by the
     /// Large Trades overlay.
     pub large_trades_min_usd: f32,
+    /// Which execution side is shown by the Large Trades overlay.
+    pub large_trades_side: LargeTradesSide,
     /// VPVR grouping in exchange min-ticks. `1` is one price level per min tick.
     pub vpvr_ticks: u16,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
+pub enum LargeTradesSide {
+    #[default]
+    Both,
+    Buys,
+    Sells,
+}
+
+impl LargeTradesSide {
+    pub fn includes(self, is_sell: bool) -> bool {
+        match self {
+            Self::Both => true,
+            Self::Buys => !is_sell,
+            Self::Sells => is_sell,
+        }
+    }
 }
 
 impl Config {
@@ -777,6 +797,7 @@ impl Default for Config {
             previous_value_area_value_area_percent: 70,
             liquidity_heatmap_order_size_filter: 0.0,
             large_trades_min_usd: Self::LARGE_TRADES_MIN_USD_DEFAULT,
+            large_trades_side: LargeTradesSide::default(),
             vpvr_ticks: 10,
         }
     }
@@ -891,7 +912,9 @@ impl Default for PointOfControl {
 
 #[cfg(test)]
 mod config_tests {
-    use super::{ClusterKind, ClusterScaling, Config, KlineChartKind, RenkoConfig};
+    use super::{
+        ClusterKind, ClusterScaling, Config, KlineChartKind, LargeTradesSide, RenkoConfig,
+    };
     use crate::chart::indicator::KlineIndicator;
 
     #[test]
@@ -903,6 +926,7 @@ mod config_tests {
 
         assert!(config.show_footprint_candles);
         assert_eq!(config.liquidity_heatmap_order_size_filter, 0.0);
+        assert_eq!(config.large_trades_side, LargeTradesSide::Both);
         assert_eq!(
             config.footprint_summary_abnormal_multiplier,
             Config::FOOTPRINT_SUMMARY_ABNORMAL_MULTIPLIER_DEFAULT
