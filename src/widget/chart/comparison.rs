@@ -4,6 +4,7 @@ use crate::widget::chart::Zoom;
 use crate::widget::chart::domain;
 
 use data::UserTimezone;
+use data::chart::comparison::RectangleAnnotation;
 use exchange::{TickerInfo, Timeframe};
 
 use iced::advanced::widget::tree::{self, Tree};
@@ -46,6 +47,7 @@ pub enum LineComparisonEvent {
     SeriesCog(TickerInfo),
     SeriesRemove(TickerInfo),
     XAxisDoubleClick,
+    RectangleDrawn(RectangleAnnotation),
 }
 
 struct State {
@@ -53,11 +55,14 @@ struct State {
     y_axis_cache: canvas::Cache,
     x_axis_cache: canvas::Cache,
     overlay_cache: canvas::Cache,
+    annotations_cache: canvas::Cache,
     is_panning: bool,
     last_cursor: Option<Point>,
     last_cache_rev: u64,
+    last_annotation_domain: Option<(u64, u64, u32, u32)>,
     // Track previous click for double-click detection
     previous_click: Option<iced_core::mouse::Click>,
+    rectangle_start: Option<Point>,
 }
 
 impl Default for State {
@@ -67,16 +72,25 @@ impl Default for State {
             y_axis_cache: canvas::Cache::new(),
             x_axis_cache: canvas::Cache::new(),
             overlay_cache: canvas::Cache::new(),
+            annotations_cache: canvas::Cache::new(),
             is_panning: false,
             last_cursor: None,
             last_cache_rev: 0,
+            last_annotation_domain: None,
             previous_click: None,
+            rectangle_start: None,
         }
     }
 }
 
 impl State {
     fn clear_all_caches(&mut self) {
+        self.clear_data_caches();
+        self.annotations_cache.clear();
+        self.last_annotation_domain = None;
+    }
+
+    fn clear_data_caches(&mut self) {
         self.plot_cache.clear();
         self.y_axis_cache.clear();
         self.x_axis_cache.clear();
@@ -92,6 +106,8 @@ pub struct LineComparison<'a, S> {
     timeframe: Timeframe,
     timezone: UserTimezone,
     version: u64,
+    rectangles: &'a [RectangleAnnotation],
+    rectangle_tool_active: bool,
 }
 
 impl<'a, S> LineComparison<'a, S>
@@ -107,6 +123,8 @@ where
             pan: 0.0,
             timezone: UserTimezone::Utc,
             version: 0,
+            rectangles: &[],
+            rectangle_tool_active: false,
         }
     }
 
@@ -128,6 +146,79 @@ where
     pub fn version(mut self, rev: u64) -> Self {
         self.version = rev;
         self
+    }
+
+    pub fn with_rectangles(
+        mut self,
+        rectangles: &'a [RectangleAnnotation],
+        tool_active: bool,
+    ) -> Self {
+        self.rectangles = rectangles;
+        self.rectangle_tool_active = tool_active;
+        self
+    }
+
+    fn rectangle_from_points(
+        &self,
+        ctx: &PlotContext,
+        start: Point,
+        end: Point,
+    ) -> Option<RectangleAnnotation> {
+        let plot = ctx.plot_rect();
+        let anchor = |point: Point| {
+            let x_ratio = ((point.x - plot.x) / plot.width).clamp(0.0, 1.0);
+            let raw_interval = ctx.min_x as f64
+                + f64::from(x_ratio) * (ctx.max_x.saturating_sub(ctx.min_x) as f64);
+            let step = self.dt_ms_est().max(1);
+            let interval = ((raw_interval / step as f64).round() as u64).saturating_mul(step);
+            let y_ratio = ((point.y - plot.y) / plot.height).clamp(0.0, 1.0);
+            let percent = ctx.max_pct - y_ratio * (ctx.max_pct - ctx.min_pct);
+            (interval, percent)
+        };
+        let (start_interval, start_percent) = anchor(start);
+        let (end_interval, end_percent) = anchor(end);
+        if start_interval == end_interval || start_percent == end_percent {
+            return None;
+        }
+        Some(RectangleAnnotation {
+            start_interval,
+            end_interval,
+            start_percent,
+            end_percent,
+        })
+    }
+
+    fn fill_rectangles(
+        &self,
+        frame: &mut canvas::Frame,
+        ctx: &PlotContext,
+        palette: &Extended,
+        rectangles: impl IntoIterator<Item = (RectangleAnnotation, bool)>,
+    ) {
+        for (annotation, preview) in rectangles {
+            let start = Point::new(
+                ctx.map_x(annotation.start_interval),
+                ctx.map_y(annotation.start_percent),
+            );
+            let end = Point::new(
+                ctx.map_x(annotation.end_interval),
+                ctx.map_y(annotation.end_percent),
+            );
+            let top_left = Point::new(start.x.min(end.x), start.y.min(end.y));
+            let size = Size::new((end.x - start.x).abs(), (end.y - start.y).abs());
+            let color = palette.primary.base.color;
+            frame.fill_rectangle(
+                top_left,
+                size,
+                color.scale_alpha(if preview { 0.08 } else { 0.12 }),
+            );
+            frame.stroke(
+                &canvas::Path::rectangle(top_left, size),
+                canvas::Stroke::default()
+                    .with_color(color.scale_alpha(if preview { 0.7 } else { 0.9 }))
+                    .with_width(if preview { 1.0 } else { 1.25 }),
+            );
+        }
     }
 
     fn align_floor(ts: u64, dt: u64) -> u64 {
@@ -839,6 +930,12 @@ where
                             return;
                         }
 
+                        if self.rectangle_tool_active && matches!(zone, HitZone::Plot) {
+                            state.rectangle_start = Some(cursor_pos);
+                            state.overlay_cache.clear();
+                            return;
+                        }
+
                         if let Some(scene) = self.compute_scene(layout, cursor)
                             && let Some(legend) = scene.legend.as_ref()
                         {
@@ -866,11 +963,25 @@ where
                         }
                     }
                     mouse::Event::ButtonReleased(mouse::Button::Left) => {
+                        if let Some(start) = state.rectangle_start.take() {
+                            if let Some(scene) = self.compute_scene(layout, cursor)
+                                && let Some(annotation) =
+                                    self.rectangle_from_points(&scene.ctx, start, cursor_pos)
+                            {
+                                shell.publish(M::from(LineComparisonEvent::RectangleDrawn(
+                                    annotation,
+                                )));
+                            }
+                            state.overlay_cache.clear();
+                            return;
+                        }
                         state.is_panning = false;
                         state.last_cursor = None;
                     }
                     mouse::Event::CursorMoved { .. } => {
-                        if state.is_panning {
+                        if state.rectangle_start.is_some() {
+                            state.overlay_cache.clear();
+                        } else if state.is_panning {
                             let prev = state.last_cursor.unwrap_or(cursor_pos);
                             let dx_px = cursor_pos.x - prev.x;
 
@@ -898,7 +1009,16 @@ where
                 let state = tree.state.downcast_mut::<State>();
 
                 if state.last_cache_rev != self.version {
-                    state.clear_all_caches();
+                    let annotation_domain = self.compute_domains(self.pan).map(
+                        |((min_x, max_x), (min_pct, max_pct))| {
+                            (min_x, max_x, min_pct.to_bits(), max_pct.to_bits())
+                        },
+                    );
+                    if state.last_annotation_domain != annotation_domain {
+                        state.annotations_cache.clear();
+                        state.last_annotation_domain = annotation_domain;
+                    }
+                    state.clear_data_caches();
                     state.last_cache_rev = self.version;
                 }
             }
@@ -931,6 +1051,17 @@ where
 
             let plot_geom = state.plot_cache.draw(r, plot_rect.size(), |frame| {
                 self.fill_main_geometry(frame, &scene.ctx);
+            });
+            let annotations_geom = state.annotations_cache.draw(r, plot_rect.size(), |frame| {
+                self.fill_rectangles(
+                    frame,
+                    &scene.ctx,
+                    palette,
+                    self.rectangles
+                        .iter()
+                        .copied()
+                        .map(|annotation| (annotation, false)),
+                );
             });
 
             let splitter_color = palette.background.strong.color.scale_alpha(0.25);
@@ -978,6 +1109,14 @@ where
             });
 
             let overlay_geom = state.overlay_cache.draw(r, bounds.size(), |frame| {
+                if let Some(start) = state.rectangle_start
+                    && let Some(end) = cursor.position_in(bounds)
+                    && let Some(annotation) = self.rectangle_from_points(&scene.ctx, start, end)
+                {
+                    frame.translate(Vector::new(plot_rect.x, plot_rect.y));
+                    self.fill_rectangles(frame, &scene.ctx, palette, [(annotation, true)]);
+                    frame.translate(Vector::new(-plot_rect.x, -plot_rect.y));
+                }
                 self.fill_overlay_y_labels(
                     frame,
                     &scene.end_labels,
@@ -1008,6 +1147,7 @@ where
             r.with_translation(Vector::new(plot_rect.x, plot_rect.y), |r| {
                 use iced::advanced::graphics::geometry::Renderer as _;
                 r.draw_geometry(plot_geom);
+                r.draw_geometry(annotations_geom);
             });
             r.with_translation(Vector::new(y_rect.x, y_rect.y), |r| {
                 use iced::advanced::graphics::geometry::Renderer as _;

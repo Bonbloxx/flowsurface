@@ -54,6 +54,7 @@ pub struct CanvasCaches {
     pub x_axis: iced::widget::canvas::Cache,
     pub overlay: iced::widget::canvas::Cache,
     pub scale_labels: iced::widget::canvas::Cache,
+    pub annotations: iced::widget::canvas::Cache,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -62,6 +63,7 @@ pub struct CanvasInvalidation {
     y_axis: bool,
     overlay_tooltip: bool,
     overlay_scale_labels: bool,
+    annotations: bool,
 }
 
 impl Default for CanvasInvalidation {
@@ -71,6 +73,7 @@ impl Default for CanvasInvalidation {
             y_axis: true,
             overlay_tooltip: true,
             overlay_scale_labels: true,
+            annotations: true,
         }
     }
 }
@@ -81,6 +84,7 @@ impl CanvasInvalidation {
         self.y_axis = true;
         self.overlay_tooltip = true;
         self.overlay_scale_labels = true;
+        self.annotations = true;
     }
 
     pub fn mark_axis_x(&mut self) {
@@ -95,12 +99,14 @@ impl CanvasInvalidation {
         self.mark_axis_x();
         self.mark_overlay_tooltip();
         self.mark_overlay_scale_labels();
+        self.mark_annotations();
     }
 
     pub fn mark_axis_y_motion(&mut self) {
         self.mark_axis_y();
         self.mark_overlay_tooltip();
         self.mark_overlay_scale_labels();
+        self.mark_annotations();
     }
 
     pub fn mark_axes_motion(&mut self) {
@@ -127,6 +133,10 @@ impl CanvasInvalidation {
         self.overlay_tooltip = true;
     }
 
+    pub fn mark_annotations(&mut self) {
+        self.annotations = true;
+    }
+
     pub fn apply(&mut self, caches: &CanvasCaches) {
         if self.x_axis {
             caches.x_axis.clear();
@@ -146,6 +156,11 @@ impl CanvasInvalidation {
         if self.overlay_scale_labels {
             caches.scale_labels.clear();
             self.overlay_scale_labels = false;
+        }
+
+        if self.annotations {
+            caches.annotations.clear();
+            self.annotations = false;
         }
     }
 }
@@ -207,4 +222,32 @@ fn paused_control_rect(bounds: iced::Rectangle) -> iced::Rectangle {
 
 fn pause_icon_size(bounds: iced::Rectangle) -> f32 {
     (PAUSED_CTRL_ICON_SIZE_FRAC * bounds.height).min(32.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CanvasCaches, CanvasInvalidation};
+
+    #[test]
+    fn cursor_motion_does_not_invalidate_completed_rectangles() {
+        let caches = CanvasCaches::default();
+        let mut invalidation = CanvasInvalidation::default();
+        invalidation.apply(&caches);
+
+        invalidation.mark_cursor_moved(false);
+
+        assert!(!invalidation.annotations);
+        assert!(invalidation.overlay_tooltip);
+    }
+
+    #[test]
+    fn chart_motion_invalidates_completed_rectangles() {
+        let caches = CanvasCaches::default();
+        let mut invalidation = CanvasInvalidation::default();
+        invalidation.apply(&caches);
+
+        invalidation.mark_axis_x_motion();
+
+        assert!(invalidation.annotations);
+    }
 }

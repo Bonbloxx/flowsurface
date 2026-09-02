@@ -2,7 +2,7 @@ use super::KlineIndicatorImpl;
 use super::footprint_history::{DAY_MS, draw_text};
 use crate::chart::{Message, ViewState};
 
-use chrono::{Datelike, TimeZone, Utc};
+use chrono::{DateTime, Datelike, TimeZone, Utc};
 use data::aggr::ticks::TickAggr;
 use data::chart::PlotData;
 use data::chart::kline::KlineDataPoint;
@@ -54,6 +54,14 @@ struct ValueArea {
     low: Price,
 }
 
+struct DrawLevel {
+    line_start: f32,
+    price: Price,
+    label: String,
+    strong: bool,
+    color: Color,
+}
+
 /// Previous completed day/week/month/year value-area overlay.
 ///
 /// Profiles are built with the exact TPO machinery (`data::chart::tpo`) from
@@ -66,7 +74,7 @@ pub struct PreviousValueAreaIndicator {
     bars: Vec<Kline>,
     areas: Vec<(PeriodRange, ValueArea)>,
     built_with: Option<(TpoConfig, PriceStep)>,
-    range_key: Vec<(u64, u64)>,
+    range_key: Vec<(u64, u64, bool)>,
 }
 
 impl PreviousValueAreaIndicator {
@@ -97,6 +105,7 @@ impl KlineIndicatorImpl for PreviousValueAreaIndicator {
     fn sync_value_areas(
         &mut self,
         bars: Option<&[Kline]>,
+        complete_ranges: &[(UnixMs, UnixMs)],
         config: TpoConfig,
         row_step: PriceStep,
         now: UnixMs,
@@ -118,6 +127,7 @@ impl KlineIndicatorImpl for PreviousValueAreaIndicator {
                 (
                     period.previous_start.as_u64(),
                     period.current_start.as_u64(),
+                    complete_ranges.contains(&(period.previous_start, period.previous_end)),
                 )
             })
             .collect::<Vec<_>>();
@@ -132,6 +142,9 @@ impl KlineIndicatorImpl for PreviousValueAreaIndicator {
         }
         self.areas = ranges
             .iter()
+            .filter(|period| {
+                complete_ranges.contains(&(period.previous_start, period.previous_end))
+            })
             .filter_map(|period| {
                 profile_value_area(&self.bars, period, config, row_step).map(|area| (*period, area))
             })
@@ -157,24 +170,21 @@ impl KlineIndicatorImpl for PreviousValueAreaIndicator {
     ) {
         let scaling = chart.scaling.max(0.01);
         let line_end = region.x + region.width;
+        let mut levels = Vec::new();
         for (period, area) in &self.areas {
             let Some(line_start) = period_start_x(chart, data_source, region, period.current_start)
             else {
                 continue;
             };
-            let color = period_color(period.kind, palette);
-            draw_period_levels(
-                frame,
-                chart,
-                region,
-                scaling,
+            append_period_levels(
+                &mut levels,
                 line_start,
-                line_end,
                 period.kind,
                 *area,
-                color,
+                period_color(period.kind, palette),
             );
         }
+        draw_levels(frame, chart, region, scaling, line_end, &levels);
     }
 }
 
@@ -193,11 +203,17 @@ pub(crate) fn value_area_history_earliest(config: TpoConfig, now: UnixMs) -> Uni
     )
 }
 
+pub(crate) fn value_area_period_ranges(config: TpoConfig, now: UnixMs) -> Vec<(UnixMs, UnixMs)> {
+    period_ranges(config, now)
+        .into_iter()
+        .map(|period| (period.previous_start, period.previous_end))
+        .collect()
+}
+
 /// Completed previous periods relative to `now`.
 ///
-/// Day and week boundaries follow the TPO session anchoring
-/// (`Config::profile_start`) so they line up exactly with TPO profiles.
-/// Months and years have no TPO counterpart and use UTC calendar ranges.
+/// Day and week boundaries follow the TPO profile alignment. Month and year
+/// boundaries use the same UTC session anchor on their calendar rollover.
 fn period_ranges(config: TpoConfig, now: UnixMs) -> Vec<PeriodRange> {
     let mut week_config = config.normalized();
     week_config.profile_period = tpo::ProfilePeriod::Week;
@@ -212,28 +228,11 @@ fn period_ranges(config: TpoConfig, now: UnixMs) -> Vec<PeriodRange> {
         .timestamp_millis_opt(now.as_u64().min(i64::MAX as u64) as i64)
         .single()
         .unwrap_or_else(Utc::now);
-    let current_month = Utc
-        .with_ymd_and_hms(now_dt.year(), now_dt.month(), 1, 0, 0, 0)
-        .single()
-        .expect("current UTC month start is valid");
-    let (previous_month_year, previous_month_number) = if now_dt.month() == 1 {
-        (now_dt.year() - 1, 12)
-    } else {
-        (now_dt.year(), now_dt.month() - 1)
-    };
-    let previous_month = Utc
-        .with_ymd_and_hms(previous_month_year, previous_month_number, 1, 0, 0, 0)
-        .single()
-        .expect("previous UTC month start is valid");
-
-    let current_year = Utc
-        .with_ymd_and_hms(now_dt.year(), 1, 1, 0, 0, 0)
-        .single()
-        .expect("current UTC year start is valid");
-    let previous_year = Utc
-        .with_ymd_and_hms(now_dt.year() - 1, 1, 1, 0, 0, 0)
-        .single()
-        .expect("previous UTC year start is valid");
+    let session_anchor = config.normalized().session_start_minutes_utc;
+    let current_month = anchored_month_start(now_dt, session_anchor);
+    let previous_month = previous_month_start(current_month, session_anchor);
+    let current_year = anchored_year_start(now_dt, session_anchor);
+    let previous_year = calendar_start(current_year.year() - 1, 1, 1, session_anchor);
 
     vec![
         make_period(PeriodKind::Day, previous_day, current_day),
@@ -249,6 +248,41 @@ fn period_ranges(config: TpoConfig, now: UnixMs) -> Vec<PeriodRange> {
             UnixMs::new(current_year.timestamp_millis().max(0) as u64),
         ),
     ]
+}
+
+fn calendar_start(year: i32, month: u32, day: u32, anchor_minutes: u16) -> DateTime<Utc> {
+    let hour = u32::from(anchor_minutes / 60);
+    let minute = u32::from(anchor_minutes % 60);
+    Utc.with_ymd_and_hms(year, month, day, hour, minute, 0)
+        .single()
+        .expect("UTC calendar session start is valid")
+}
+
+fn anchored_month_start(now: DateTime<Utc>, anchor_minutes: u16) -> DateTime<Utc> {
+    let candidate = calendar_start(now.year(), now.month(), 1, anchor_minutes);
+    if now >= candidate {
+        candidate
+    } else {
+        previous_month_start(candidate, anchor_minutes)
+    }
+}
+
+fn previous_month_start(current: DateTime<Utc>, anchor_minutes: u16) -> DateTime<Utc> {
+    let (year, month) = if current.month() == 1 {
+        (current.year() - 1, 12)
+    } else {
+        (current.year(), current.month() - 1)
+    };
+    calendar_start(year, month, 1, anchor_minutes)
+}
+
+fn anchored_year_start(now: DateTime<Utc>, anchor_minutes: u16) -> DateTime<Utc> {
+    let candidate = calendar_start(now.year(), 1, 1, anchor_minutes);
+    if now >= candidate {
+        candidate
+    } else {
+        calendar_start(now.year() - 1, 1, 1, anchor_minutes)
+    }
 }
 
 fn make_period(kind: PeriodKind, previous_start: UnixMs, current_start: UnixMs) -> PeriodRange {
@@ -336,40 +370,68 @@ fn period_color(kind: PeriodKind, palette: &Extended) -> Color {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn draw_period_levels(
-    frame: &mut canvas::Frame,
-    chart: &ViewState,
-    region: Rectangle,
-    scaling: f32,
+fn append_period_levels(
+    levels: &mut Vec<DrawLevel>,
     line_start: f32,
-    line_end: f32,
     kind: PeriodKind,
     area: ValueArea,
     color: Color,
 ) {
-    let text_size = (9.0 / scaling).clamp(7.0, 11.0);
-    let label_x = line_end - 4.0 / scaling;
-    let levels = [
+    let period_levels = [
         Some((area.high, "VAH", false)),
         kind.includes_poc().then_some((area.poc, "POC", true)),
         Some((area.low, "VAL", false)),
     ];
-    for (price, suffix, strong) in levels.into_iter().flatten() {
-        let y = chart.price_to_y(price);
-        if y < region.y || y > region.y + region.height {
-            continue;
-        }
-        let ink = if strong {
-            color
+    levels.extend(
+        period_levels
+            .into_iter()
+            .flatten()
+            .map(|(price, suffix, strong)| DrawLevel {
+                line_start,
+                price,
+                label: format!("{} {suffix}", kind.short_name()),
+                strong,
+                color,
+            }),
+    );
+}
+
+fn draw_levels(
+    frame: &mut canvas::Frame,
+    chart: &ViewState,
+    region: Rectangle,
+    scaling: f32,
+    line_end: f32,
+    levels: &[DrawLevel],
+) {
+    let text_size = (9.0 / scaling).clamp(7.0, 11.0);
+    let visible = levels
+        .iter()
+        .filter_map(|level| {
+            let y = chart.price_to_y(level.price);
+            (y >= region.y && y <= region.y + region.height).then_some((level, y))
+        })
+        .collect::<Vec<_>>();
+    let slots = collision_slots(
+        &visible.iter().map(|(_, y)| *y).collect::<Vec<_>>(),
+        text_size + 2.0 / scaling,
+    );
+
+    for ((level, y), slot) in visible.into_iter().zip(slots) {
+        let ink = if level.strong {
+            level.color
         } else {
-            color.scale_alpha(0.72)
+            level.color.scale_alpha(0.72)
         };
         frame.stroke(
-            &Path::line(Point::new(line_start, y), Point::new(line_end, y)),
+            &Path::line(Point::new(level.line_start, y), Point::new(line_end, y)),
             Stroke::with_color(
                 Stroke {
-                    width: if strong { 2.0 / scaling } else { 1.0 / scaling },
+                    width: if level.strong {
+                        2.0 / scaling
+                    } else {
+                        1.0 / scaling
+                    },
                     ..Stroke::default()
                 },
                 ink,
@@ -377,13 +439,36 @@ fn draw_period_levels(
         );
         draw_text(
             frame,
-            &format!("{} {suffix}", kind.short_name()),
-            Point::new(label_x, y - 6.0 / scaling),
+            &level.label,
+            Point::new(
+                line_end - (4.0 + slot as f32 * 58.0) / scaling,
+                y - 6.0 / scaling,
+            ),
             text_size,
             ink,
             Alignment::End,
         );
     }
+}
+
+fn collision_slots(ys: &[f32], minimum_gap: f32) -> Vec<usize> {
+    let mut occupied = Vec::<Vec<f32>>::new();
+    let mut assignments = Vec::with_capacity(ys.len());
+    let minimum_gap = minimum_gap.max(0.0);
+
+    for &y in ys {
+        let slot = occupied
+            .iter()
+            .position(|slot| slot.iter().all(|other| (other - y).abs() >= minimum_gap))
+            .unwrap_or_else(|| {
+                occupied.push(Vec::new());
+                occupied.len() - 1
+            });
+        occupied[slot].push(y);
+        assignments.push(slot);
+    }
+
+    assignments
 }
 
 #[cfg(test)]
@@ -487,15 +572,17 @@ mod tests {
         let row_step = step(1.0);
         let day = 10 * DAY_MS;
         let now = UnixMs::new(day + 12 * 3_600_000);
+        let day_period = period_ranges(config, now).remove(0);
+        let complete_day = [(day_period.previous_start, day_period.previous_end)];
 
-        indicator.sync_value_areas(Some(&[]), config, row_step, now);
+        indicator.sync_value_areas(Some(&[]), &complete_day, config, row_step, now);
         assert!(indicator.areas.is_empty());
 
         let bars = vec![
             bar(day - DAY_MS, 101.0, 103.0, 100.0, 102.0),
             bar(day - DAY_MS + 30 * 60_000, 103.0, 104.0, 102.0, 103.5),
         ];
-        indicator.sync_value_areas(Some(&bars), config, row_step, now);
+        indicator.sync_value_areas(Some(&bars), &complete_day, config, row_step, now);
         let day_area = indicator
             .areas
             .iter()
@@ -503,13 +590,40 @@ mod tests {
             .map(|(_, area)| *area);
         assert_eq!(day_area.map(|area| area.poc), Some(Price::from_f64(102.0)));
 
-        indicator.sync_value_areas(None, config, row_step, now);
+        indicator.sync_value_areas(None, &complete_day, config, row_step, now);
         assert!(
             indicator
                 .areas
                 .iter()
                 .any(|(period, _)| period.kind == PeriodKind::Day)
         );
+    }
+
+    #[test]
+    fn incomplete_period_stays_hidden_until_coverage_is_complete() {
+        let mut indicator = PreviousValueAreaIndicator::new();
+        let config = TpoConfig::default();
+        let row_step = step(1.0);
+        let day = 10 * DAY_MS;
+        let now = UnixMs::new(day + 12 * 3_600_000);
+        let period = period_ranges(config, now).remove(0);
+        let bars = vec![
+            bar(day - DAY_MS, 101.0, 103.0, 100.0, 102.0),
+            bar(day - DAY_MS + 30 * 60_000, 103.0, 104.0, 102.0, 103.5),
+        ];
+
+        indicator.sync_value_areas(Some(&bars), &[], config, row_step, now);
+        assert!(indicator.areas.is_empty());
+
+        indicator.sync_value_areas(
+            None,
+            &[(period.previous_start, period.previous_end)],
+            config,
+            row_step,
+            now,
+        );
+        assert_eq!(indicator.areas.len(), 1);
+        assert_eq!(indicator.areas[0].0.kind, PeriodKind::Day);
     }
 
     #[test]
@@ -524,7 +638,7 @@ mod tests {
     }
 
     #[test]
-    fn session_anchor_shifts_day_boundary_like_tpo() {
+    fn session_anchor_shifts_every_period_boundary() {
         let now = UnixMs::new(
             Utc.with_ymd_and_hms(2026, 8, 20, 12, 0, 0)
                 .single()
@@ -536,13 +650,57 @@ mod tests {
             ..TpoConfig::default()
         };
         let ranges = period_ranges(config, now);
-        let to_hour = |time: UnixMs| {
+        let to_date_time = |time: UnixMs| {
             Utc.timestamp_millis_opt(time.as_u64() as i64)
                 .single()
                 .unwrap()
-                .hour()
         };
-        assert_eq!(to_hour(ranges[0].previous_start), 5);
-        assert_eq!(to_hour(ranges[0].current_start), 5);
+        for range in &ranges {
+            assert_eq!(to_date_time(range.previous_start).hour(), 5);
+            assert_eq!(to_date_time(range.current_start).hour(), 5);
+        }
+        assert_eq!(
+            to_date_time(ranges[1].current_start).weekday(),
+            chrono::Weekday::Mon
+        );
+        assert_eq!(to_date_time(ranges[2].previous_start).month(), 7);
+        assert_eq!(to_date_time(ranges[2].current_start).month(), 8);
+        assert_eq!(to_date_time(ranges[3].previous_start).year(), 2025);
+        assert_eq!(to_date_time(ranges[3].current_start).year(), 2026);
+    }
+
+    #[test]
+    fn month_and_year_roll_over_only_at_the_session_anchor() {
+        let now = UnixMs::new(
+            Utc.with_ymd_and_hms(2026, 1, 1, 2, 0, 0)
+                .single()
+                .unwrap()
+                .timestamp_millis() as u64,
+        );
+        let config = TpoConfig {
+            session_start_minutes_utc: 5 * 60,
+            ..TpoConfig::default()
+        };
+        let ranges = period_ranges(config, now);
+        let to_date_time = |time: UnixMs| {
+            Utc.timestamp_millis_opt(time.as_u64() as i64)
+                .single()
+                .unwrap()
+        };
+
+        let current_month = to_date_time(ranges[2].current_start);
+        assert_eq!((current_month.year(), current_month.month()), (2025, 12));
+        assert_eq!(current_month.hour(), 5);
+        let current_year = to_date_time(ranges[3].current_start);
+        assert_eq!((current_year.year(), current_year.month()), (2025, 1));
+        assert_eq!(current_year.hour(), 5);
+    }
+
+    #[test]
+    fn colliding_labels_receive_distinct_horizontal_slots() {
+        assert_eq!(
+            collision_slots(&[100.0, 100.0, 80.0, 85.0], 10.0),
+            vec![0, 1, 0, 1]
+        );
     }
 }

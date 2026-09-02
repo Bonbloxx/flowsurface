@@ -8,7 +8,9 @@ use crate::chart::indicator::kline::footprint_history::{
     DAYS as FOOTPRINT_HISTORY_DAYS, day_start, missing_day_range, utc_day_ranges,
 };
 use crate::chart::indicator::kline::large_trades::LARGE_TRADES_LOOKBACK_DAYS;
-use crate::chart::indicator::kline::previous_value_area::value_area_history_earliest;
+use crate::chart::indicator::kline::previous_value_area::{
+    value_area_history_earliest, value_area_period_ranges,
+};
 use crate::connector::fetcher::{
     FetchRange, FetchSpec, ReqError, RequestHandler, TradeFetchMode, is_trade_fetch_enabled,
     trade_fetch_mode,
@@ -234,7 +236,18 @@ impl Chart for KlineChart {
             .for_each(|indi| indi.clear_crosshair_caches());
     }
 
+    fn update_indicator_view(
+        &mut self,
+        indicator: KlineIndicator,
+        event: indicator::plot::IndicatorViewEvent,
+    ) -> bool {
+        self.indicators[indicator]
+            .as_mut()
+            .is_some_and(|indicator| indicator.update_view(event))
+    }
+
     fn invalidate_all(&mut self) {
+        self.chart.cache.annotations.clear();
         self.invalidate(None);
     }
 
@@ -483,6 +496,7 @@ impl KlineChart {
                     ViewConfig {
                         splits: layout.splits.clone(),
                         autoscale: Some(Autoscale::FitToVisible),
+                        rectangles: layout.rectangles.clone(),
                     },
                     cell_width,
                     cell_height,
@@ -577,6 +591,7 @@ impl KlineChart {
                     ViewConfig {
                         splits: layout.splits.clone(),
                         autoscale: Some(Autoscale::FitToVisible),
+                        rectangles: layout.rectangles.clone(),
                     },
                     cell_width,
                     cell_height,
@@ -823,6 +838,7 @@ impl KlineChart {
     }
 
     pub fn update_theme(&mut self, theme: &iced_core::Theme) {
+        self.chart.cache.annotations.clear();
         if let Some(runtime) = self.footprint_history.liquidity.as_mut() {
             runtime.heatmap.update_theme(theme);
         }
@@ -1695,10 +1711,24 @@ impl KlineChart {
             self.visual_config.previous_value_area_ticks,
         );
         let now = UnixMs::now();
+        let letter_ms = config.letter_timeframe().to_milliseconds();
+        let complete_ranges = value_area_period_ranges(config, now)
+            .into_iter()
+            .filter(|(start, end)| {
+                self.pva_klines
+                    .all_sources_cover_range(*start, *end, letter_ms)
+            })
+            .collect::<Vec<_>>();
         let dirty = std::mem::take(&mut self.pva_dirty);
         let bars = dirty.then(|| self.pva_klines.composite_klines());
         if let Some(indicator) = self.indicators[KlineIndicator::PreviousValueArea].as_mut() {
-            return indicator.sync_value_areas(bars.as_deref(), config, row_step, now);
+            return indicator.sync_value_areas(
+                bars.as_deref(),
+                &complete_ranges,
+                config,
+                row_step,
+                now,
+            );
         }
         false
     }
@@ -2047,7 +2077,7 @@ impl KlineChart {
             config.order_size_filter = self.visual_config.liquidity_heatmap_order_size_filter;
             runtime.heatmap.set_visual_config(config);
         }
-        self.chart.cache.clear_all();
+        self.chart.clear_render_caches();
         self.indicators
             .values_mut()
             .filter_map(Option::as_mut)
@@ -2379,7 +2409,7 @@ impl KlineChart {
         if force {
             self.invalidate(None);
         } else {
-            self.chart.cache.clear_all();
+            self.chart.clear_render_caches();
         }
     }
 
@@ -2983,7 +3013,7 @@ impl KlineChart {
             }
         }
 
-        chart.cache.clear_all();
+        chart.clear_render_caches();
         if clear_indicator_caches {
             for indi in self.indicators.values_mut().filter_map(Option::as_mut) {
                 indi.clear_all_caches();
@@ -3431,11 +3461,21 @@ impl canvas::Program<Message> for KlineChart {
             chart.draw_last_price_line(frame, palette, region);
         });
 
+        let annotations = chart
+            .cache
+            .annotations
+            .draw(renderer, bounds_size, |frame| {
+                chart.draw_persisted_rectangles(frame, palette, bounds_size);
+            });
+
         let crosshair = chart.cache.crosshair.draw(renderer, bounds_size, |frame| {
             let visible_region = chart.visible_region(bounds_size);
             let visible_range = chart.interval_range(&visible_region);
+            let cursor_position = cursor.position_in(bounds);
 
-            if let Some(cursor_position) = cursor.position_in(bounds) {
+            chart.draw_rectangle_preview(frame, palette, bounds_size, interaction, cursor_position);
+
+            if let Some(cursor_position) = cursor_position {
                 let (_, rounded_aggregation) =
                     chart.draw_crosshair(frame, theme, bounds_size, cursor_position, interaction);
 
@@ -3473,7 +3513,7 @@ impl canvas::Program<Message> for KlineChart {
                 );
             }
 
-            if let Some(cursor_position) = cursor.position_in(bounds) {
+            if let Some(cursor_position) = cursor_position {
                 let center = Vector::new(bounds.width / 2.0, bounds.height / 2.0);
                 frame.translate(center);
                 frame.scale(chart.scaling);
@@ -3507,7 +3547,7 @@ impl canvas::Program<Message> for KlineChart {
             }
         });
 
-        vec![klines, crosshair]
+        vec![klines, annotations, crosshair]
     }
 
     fn mouse_interaction(
@@ -3519,7 +3559,7 @@ impl canvas::Program<Message> for KlineChart {
         match interaction {
             Interaction::Panning { .. } => mouse::Interaction::Grabbing,
             Interaction::Zoomin { .. } => mouse::Interaction::ZoomIn,
-            Interaction::None | Interaction::Ruler { .. } => {
+            Interaction::None | Interaction::Ruler { .. } | Interaction::Rectangle { .. } => {
                 if cursor.is_over(bounds) {
                     mouse::Interaction::Crosshair
                 } else {
@@ -7391,7 +7431,7 @@ mod tests {
         let delta_label_size = cluster_label_size(delta_width, 18.0, scaling)
             .expect("default Bid x Ask delta labels should be readable");
 
-        assert_eq!(cell_width, 166.0);
+        assert_eq!(cell_width, 180.0);
         assert_eq!(cell_width, ClusterKind::BidAsk.min_footprint_width());
         assert!(
             (area.ask_area_right - area.bid_area_left).abs() < f32::EPSILON,
@@ -7427,9 +7467,9 @@ mod tests {
             right_width >= 40.0,
             "right histogram width was {right_width}"
         );
-        assert!(label_size >= 11.0, "label size was {label_size}");
+        assert!(label_size >= 12.5, "label size was {label_size}");
         assert!(
-            delta_label_size >= 9.0,
+            delta_label_size >= 10.0,
             "delta label size was {delta_label_size}"
         );
 

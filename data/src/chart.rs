@@ -212,10 +212,20 @@ impl From<exchange::Timeframe> for Basis {
     }
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+pub struct RectangleAnnotation {
+    pub start_interval: u64,
+    pub end_interval: u64,
+    pub start_price: Price,
+    pub end_price: Price,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct ViewConfig {
     pub splits: Vec<f32>,
     pub autoscale: Option<Autoscale>,
+    #[serde(default, deserialize_with = "crate::util::ok_or_default")]
+    pub rectangles: Vec<RectangleAnnotation>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, Default, PartialEq)]
@@ -229,4 +239,27 @@ pub enum Autoscale {
 pub enum Study {
     Heatmap(Vec<heatmap::HeatmapStudy>),
     Footprint(Vec<kline::FootprintStudy>),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ViewConfig;
+
+    #[test]
+    fn legacy_view_config_defaults_to_no_rectangles() {
+        let config: ViewConfig = serde_json::from_str(r#"{"splits":[],"autoscale":null}"#)
+            .expect("legacy chart layout should deserialize");
+
+        assert!(config.rectangles.is_empty());
+    }
+
+    #[test]
+    fn malformed_rectangles_do_not_break_the_saved_layout() {
+        let config: ViewConfig =
+            serde_json::from_str(r#"{"splits":[0.8],"autoscale":null,"rectangles":"invalid"}"#)
+                .expect("invalid drawings should fall back without discarding the layout");
+
+        assert_eq!(config.splits, vec![0.8]);
+        assert!(config.rectangles.is_empty());
+    }
 }

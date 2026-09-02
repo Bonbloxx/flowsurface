@@ -333,6 +333,7 @@ pub enum Event {
     FootprintHistoryAggregationToggled(bool),
     FootprintHistorySourceToggled(TickerInfo, bool),
     LiquidityHeatmapSourceToggled(TickerInfo, bool),
+    LargeTradesThresholdInputChanged(String),
     StudyConfigurator(modal::pane::settings::study::StudyMessage),
     StreamModifierChanged(modal::stream::Message),
     ComparisonChartInteraction(super::chart::comparison::Message),
@@ -349,11 +350,18 @@ pub struct State {
     pub streams: ResolvedStream,
     pub status: Status,
     pub link_group: Option<LinkGroup>,
+    large_trades_threshold_input: String,
 }
 
 impl State {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub(super) fn sync_large_trades_threshold_input_from_config(&mut self, config: &VisualConfig) {
+        if let VisualConfig::Kline(config) = config {
+            self.large_trades_threshold_input = format!("{:.0}", config.large_trades_min_usd);
+        }
     }
 
     pub fn from_config(
@@ -782,9 +790,10 @@ impl State {
                         .basis
                         .unwrap_or(Basis::default_heatmap_time(Some(derived_plan.ticker_info)));
 
-                    let (studies, indicators) = if let Content::ShaderHeatmap {
+                    let (studies, indicators, layout) = if let Content::ShaderHeatmap {
                         chart,
                         indicators,
+                        layout,
                         studies,
                     } = &self.content
                     {
@@ -793,6 +802,7 @@ impl State {
                                 .as_ref()
                                 .map_or(studies.clone(), |c| c.studies.clone()),
                             indicators.clone(),
+                            chart.as_ref().map_or(layout.clone(), |c| c.chart_layout()),
                         )
                     } else {
                         (
@@ -800,6 +810,7 @@ impl State {
                                 data::chart::heatmap::ProfileKind::default(),
                             )],
                             vec![HeatmapIndicator::Volume],
+                            ViewConfig::default(),
                         )
                     };
 
@@ -816,10 +827,12 @@ impl State {
                             base_ticker,
                             studies.clone(),
                             indicators.clone(),
+                            layout.clone(),
                             config,
                         ))),
                         studies,
                         indicators,
+                        layout,
                     };
 
                     let streams = vec![depth_stream(&derived_plan), trades_stream(&derived_plan)];
@@ -1872,6 +1885,7 @@ impl State {
                             indicators
                                 .contains(&KlineIndicator::LargeTrades)
                                 .then(|| chart.visual_config().large_trades_min_usd),
+                            &self.large_trades_threshold_input,
                             indicators
                                 .contains(&KlineIndicator::VisibleRangeProfile)
                                 .then(|| chart.visual_config().vpvr_ticks),
@@ -2115,6 +2129,7 @@ impl State {
             Content::ShaderHeatmap {
                 chart: Some(c),
                 indicators,
+                layout,
                 studies,
                 ..
             } => {
@@ -2125,8 +2140,10 @@ impl State {
                     c.ticker_info,
                     studies.clone(),
                     indicators.clone(),
+                    c.chart_layout(),
                     Some(saved_config),
                 );
+                *layout = c.chart_layout();
             }
             _ => {}
         }
@@ -2614,6 +2631,9 @@ impl State {
                 self.sync_liquidity_heatmap_streams();
                 return Some(Effect::RefreshStreams);
             }
+            Event::LargeTradesThresholdInputChanged(value) => {
+                self.large_trades_threshold_input = value.chars().take(24).collect();
+            }
             Event::StudyConfigurator(study_msg) => match study_msg {
                 modal::pane::settings::study::StudyMessage::Footprint(m) => {
                     if let Content::Kline { chart, kind, .. } = &mut self.content
@@ -2687,6 +2707,7 @@ impl State {
                                     Content::ShaderHeatmap {
                                         chart: Some(c),
                                         indicators,
+                                        layout,
                                         ..
                                     } => {
                                         let saved_config = c.config;
@@ -2697,8 +2718,10 @@ impl State {
                                             c.ticker_info,
                                             saved_studies,
                                             indicators.clone(),
+                                            c.chart_layout(),
                                             Some(saved_config),
                                         );
+                                        *layout = c.chart_layout();
 
                                         if let Some(stream_type) =
                                             self.streams.ready_iter_mut().and_then(|mut it| {
@@ -3104,6 +3127,15 @@ impl State {
             return None;
         }
 
+        if requested_modal == Modal::Settings
+            && let Content::Kline {
+                chart: Some(chart), ..
+            } = &self.content
+        {
+            self.large_trades_threshold_input =
+                format!("{:.0}", chart.visual_config().large_trades_min_usd);
+        }
+
         let focus_widget_id = match &requested_modal {
             Modal::MiniTickersList(m) => Some(m.search_box_id.clone()),
             _ => None,
@@ -3274,6 +3306,7 @@ impl Default for State {
             notifications: vec![],
             status: Status::Ready,
             link_group: None,
+            large_trades_threshold_input: String::new(),
         }
     }
 }
@@ -3291,6 +3324,7 @@ pub enum Content {
     ShaderHeatmap {
         chart: Option<Box<HeatmapShader>>,
         indicators: Vec<HeatmapIndicator>,
+        layout: data::chart::ViewConfig,
         studies: Vec<data::chart::heatmap::HeatmapStudy>,
     },
     Kline {
@@ -3335,6 +3369,7 @@ impl Content {
                 ViewConfig {
                     splits: vec![],
                     autoscale: Some(data::chart::Autoscale::CenterLatest),
+                    rectangles: vec![],
                 },
                 vec![],
             )
@@ -3493,6 +3528,7 @@ impl Content {
             .unwrap_or(ViewConfig {
                 splits,
                 autoscale: Some(data::chart::Autoscale::FitToVisible),
+                rectangles: vec![],
             });
         let visual_config = settings.visual_config.as_ref().and_then(|cfg| cfg.kline());
 
@@ -3527,6 +3563,7 @@ impl Content {
                 layout: ViewConfig {
                     splits: vec![],
                     autoscale: Some(data::chart::Autoscale::FitToVisible),
+                    rectangles: vec![],
                 },
             },
             ContentKind::RenkoChart => Content::Kline {
@@ -3538,6 +3575,7 @@ impl Content {
                 layout: ViewConfig {
                     splits: vec![0.8],
                     autoscale: Some(data::chart::Autoscale::FitToVisible),
+                    rectangles: vec![],
                 },
             },
             ContentKind::TpoChart => Content::Kline {
@@ -3549,6 +3587,7 @@ impl Content {
                 layout: ViewConfig {
                     splits: vec![],
                     autoscale: Some(data::chart::Autoscale::FitToVisible),
+                    rectangles: vec![],
                 },
             },
             ContentKind::FootprintChart => Content::Kline {
@@ -3562,11 +3601,13 @@ impl Content {
                 layout: ViewConfig {
                     splits: vec![],
                     autoscale: Some(data::chart::Autoscale::FitToVisible),
+                    rectangles: vec![],
                 },
             },
             ContentKind::ShaderHeatmap => Content::ShaderHeatmap {
                 chart: None,
                 indicators: vec![HeatmapIndicator::Volume],
+                layout: ViewConfig::default(),
                 studies: vec![data::chart::heatmap::HeatmapStudy::VolumeProfile(
                     data::chart::heatmap::ProfileKind::default(),
                 )],
@@ -3578,6 +3619,7 @@ impl Content {
                 layout: ViewConfig {
                     splits: vec![],
                     autoscale: Some(data::chart::Autoscale::CenterLatest),
+                    rectangles: vec![],
                 },
             },
             ContentKind::ComparisonChart => Content::Comparison(None),
@@ -3812,6 +3854,8 @@ impl Content {
         match self {
             Content::ShaderHeatmap { chart: Some(c), .. } => c.update_theme(theme),
             Content::Kline { chart: Some(c), .. } => c.update_theme(theme),
+            Content::Heatmap { chart: Some(c), .. } => c.update_theme(),
+            Content::Comparison(Some(c)) => c.update_theme(),
             _ => {}
         }
     }

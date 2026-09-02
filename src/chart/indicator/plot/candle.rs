@@ -17,7 +17,7 @@ pub struct CandlePlot<O, H, L, C, T> {
     bar_width_factor: f32,
 }
 
-const MIN_BODY_HEIGHT_PX: f32 = 3.0;
+const MIN_BODY_HEIGHT_PX: f32 = 5.0;
 
 fn emphasized_body(open_y: f32, close_y: f32, scaling: f32) -> (f32, f32) {
     let actual_top = open_y.min(close_y);
@@ -126,11 +126,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn short_candle_bodies_keep_a_three_pixel_screen_height() {
+    fn short_candle_bodies_keep_a_five_pixel_screen_height() {
         let (top, height) = emphasized_body(10.0, 11.0, 2.0);
 
-        assert_eq!(top, 9.75);
-        assert_eq!(height, 1.5);
+        assert_eq!(top, 9.25);
+        assert_eq!(height, 2.5);
         assert_eq!(height * 2.0, MIN_BODY_HEIGHT_PX);
     }
 

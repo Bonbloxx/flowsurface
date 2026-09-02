@@ -51,6 +51,7 @@ pub struct ComparisonChart {
     pub config: data::chart::comparison::Config,
     pub series_editor: series_editor::TickerSeriesEditor,
     cache_rev: u64,
+    rectangle_tool_active: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -59,6 +60,8 @@ pub enum Message {
     JumpToLatest,
     Editor(series_editor::Message),
     OpenEditorFor(TickerInfo),
+    RectangleToolToggled,
+    RectanglesCleared,
 }
 
 impl ComparisonChart {
@@ -104,6 +107,7 @@ impl ComparisonChart {
             config: cfg,
             series_editor: series_editor::TickerSeriesEditor::default(),
             cache_rev: 0,
+            rectangle_tool_active: false,
         }
     }
 
@@ -129,6 +133,11 @@ impl ComparisonChart {
                     self.pan = DEFAULT_PAN_POINTS;
                     None
                 }
+                LineComparisonEvent::RectangleDrawn(annotation) => {
+                    self.config.rectangles.push(annotation);
+                    self.cache_rev = self.cache_rev.wrapping_add(1);
+                    None
+                }
             },
             Message::JumpToLatest => {
                 self.pan = DEFAULT_PAN_POINTS;
@@ -137,6 +146,15 @@ impl ComparisonChart {
             }
             Message::Editor(msg) => self.series_editor.update(msg),
             Message::OpenEditorFor(ticker_info) => self.open_editor_for_ticker(ticker_info),
+            Message::RectangleToolToggled => {
+                self.rectangle_tool_active = !self.rectangle_tool_active;
+                None
+            }
+            Message::RectanglesCleared => {
+                self.config.rectangles.clear();
+                self.cache_rev = self.cache_rev.wrapping_add(1);
+                None
+            }
         }
     }
 
@@ -153,11 +171,44 @@ impl ComparisonChart {
             .with_zoom(self.zoom)
             .with_pan(self.pan)
             .version(self.cache_rev)
+            .with_rectangles(&self.config.rectangles, self.rectangle_tool_active)
             .into();
+        let active = self.rectangle_tool_active;
+        let rectangle_button = iced::widget::button(
+            iced::widget::text("▭")
+                .font(crate::style::AZERET_MONO)
+                .size(crate::style::text_size::SECTION),
+        )
+        .on_press(Message::RectangleToolToggled)
+        .style(move |theme, status| crate::style::button::transparent(theme, status, active));
+        let clear_button =
+            iced::widget::button(crate::style::icon_text(crate::style::Icon::TrashBin, 10))
+                .on_press_maybe(
+                    (!self.config.rectangles.is_empty()).then_some(Message::RectanglesCleared),
+                )
+                .style(|theme, status| crate::style::button::transparent(theme, status, false));
+        let tools = iced::widget::row![
+            iced::widget::tooltip(
+                rectangle_button,
+                "Rectangle · drag on chart",
+                iced::widget::tooltip::Position::Top,
+            ),
+            iced::widget::tooltip(
+                clear_button,
+                "Clear rectangles",
+                iced::widget::tooltip::Position::Top,
+            )
+        ]
+        .spacing(2);
 
-        iced::widget::container(chart.map(Message::Chart))
-            .padding(1)
-            .into()
+        iced::widget::stack![
+            iced::widget::container(chart.map(Message::Chart)).padding(1),
+            iced::widget::container(tools)
+                .align_right(iced::Length::Fill)
+                .align_bottom(iced::Length::Fill)
+                .padding(3),
+        ]
+        .into()
     }
 
     pub fn insert_history(
@@ -465,7 +516,15 @@ impl ComparisonChart {
                 names.push((ser_ticker, name.clone()));
             }
         }
-        data::chart::comparison::Config { colors, names }
+        data::chart::comparison::Config {
+            colors,
+            names,
+            rectangles: self.config.rectangles.clone(),
+        }
+    }
+
+    pub fn update_theme(&mut self) {
+        self.cache_rev = self.cache_rev.wrapping_add(1);
     }
 
     fn color_for_or_default(&self, ticker_info: &TickerInfo) -> iced::Color {

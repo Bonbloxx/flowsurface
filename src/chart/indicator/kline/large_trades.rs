@@ -597,8 +597,8 @@ mod tests {
         indicator.on_source_trades(
             binance(),
             &[
-                trade(base + 1_000, 60_000.0, 0.05, false), // $3k — dropped
-                trade(base + 1_001, 60_000.0, 25.0, true),  // $1.5M — kept
+                trade(base + 1_000, 50_000.0, 1.999, false), // $99,950 — dropped
+                trade(base + 1_001, 50_000.0, 2.0, true),    // $100k — kept
             ],
             false,
         );
@@ -617,6 +617,24 @@ mod tests {
                 .inner
                 .display_large_trades(day, 5_000_000.0)
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn configured_floor_and_presets_cover_the_requested_range() {
+        assert_eq!(capture_floor_usd(), 100_000.0);
+        assert_eq!(
+            KlineChartConfig::LARGE_TRADES_MIN_USD_PRESETS,
+            [
+                100_000.0,
+                250_000.0,
+                500_000.0,
+                750_000.0,
+                1_000_000.0,
+                3_000_000.0,
+                5_000_000.0,
+                10_000_000.0,
+            ]
         );
     }
 

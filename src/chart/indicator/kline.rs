@@ -92,6 +92,10 @@ pub trait KlineIndicatorImpl {
     /// e.g. tooltips and scale labels for a partial redraw
     fn clear_crosshair_caches(&mut self);
 
+    fn update_view(&mut self, _event: super::plot::IndicatorViewEvent) -> bool {
+        false
+    }
+
     fn element<'a>(
         &'a self,
         chart: &'a ViewState,
@@ -221,6 +225,7 @@ pub trait KlineIndicatorImpl {
     fn sync_value_areas(
         &mut self,
         _bars: Option<&[Kline]>,
+        _complete_ranges: &[(UnixMs, UnixMs)],
         _config: data::chart::tpo::Config,
         _row_step: PriceStep,
         _now: UnixMs,

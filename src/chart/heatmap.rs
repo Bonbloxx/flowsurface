@@ -70,6 +70,7 @@ impl Chart for HeatmapChart {
     }
 
     fn invalidate_all(&mut self) {
+        self.chart.cache.annotations.clear();
         self.invalidate(None);
     }
 
@@ -187,6 +188,7 @@ impl HeatmapChart {
             ViewConfig {
                 splits: layout.splits.clone(),
                 autoscale: Some(Autoscale::CenterLatest),
+                rectangles: layout.rectangles.clone(),
             },
             DEFAULT_CELL_WIDTH,
             4.0,
@@ -350,6 +352,10 @@ impl HeatmapChart {
         self.chart.layout()
     }
 
+    pub fn update_theme(&mut self) {
+        self.chart.cache.annotations.clear();
+    }
+
     pub fn change_tick_size(&mut self, step: PriceStep) {
         let chart_state = self.mut_state();
 
@@ -388,7 +394,7 @@ impl HeatmapChart {
             );
         }
 
-        chart.cache.clear_all();
+        chart.clear_render_caches();
 
         if let Some(t) = now {
             self.last_tick = t;
@@ -777,8 +783,24 @@ impl canvas::Program<Message> for HeatmapChart {
         });
 
         if !self.is_empty() {
+            let annotations = chart
+                .cache
+                .annotations
+                .draw(renderer, bounds_size, |frame| {
+                    chart.draw_persisted_rectangles(frame, palette, bounds_size);
+                });
+
             let crosshair = chart.cache.crosshair.draw(renderer, bounds_size, |frame| {
-                if let Some(cursor_position) = cursor.position_in(bounds) {
+                let cursor_position = cursor.position_in(bounds);
+                chart.draw_rectangle_preview(
+                    frame,
+                    palette,
+                    bounds_size,
+                    interaction,
+                    cursor_position,
+                );
+
+                if let Some(cursor_position) = cursor_position {
                     let (cursor_at_price, cursor_at_time) = chart.draw_crosshair(
                         frame,
                         theme,
@@ -900,7 +922,7 @@ impl canvas::Program<Message> for HeatmapChart {
                 }
             });
 
-            vec![heatmap, crosshair]
+            vec![heatmap, annotations, crosshair]
         } else {
             vec![heatmap]
         }
@@ -915,7 +937,7 @@ impl canvas::Program<Message> for HeatmapChart {
         match interaction {
             Interaction::Panning { .. } => mouse::Interaction::Grabbing,
             Interaction::Zoomin { .. } => mouse::Interaction::ZoomIn,
-            Interaction::None | Interaction::Ruler { .. } => {
+            Interaction::None | Interaction::Ruler { .. } | Interaction::Rectangle { .. } => {
                 if cursor.is_over(bounds) {
                     return mouse::Interaction::Crosshair;
                 }

@@ -6,9 +6,9 @@ use super::footprint_history::{
 use crate::chart::{
     Basis, Caches, Message, ViewState,
     indicator::{
-        indicator_row,
+        interactive_indicator_row,
         kline::{AvailabilityCause, IndicatorAvailability},
-        plot::{AnySeries, PlotTooltip, candle::CandlePlot},
+        plot::{AnySeries, IndicatorView, IndicatorViewEvent, PlotTooltip, candle::CandlePlot},
     },
 };
 
@@ -17,7 +17,7 @@ use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use data::chart::{PlotData, kline::KlineDataPoint};
+use data::chart::{PlotData, indicator::KlineIndicator, kline::KlineDataPoint};
 use data::util::format_with_commas;
 use exchange::{
     SizeUnit, Ticker, TickerInfo, Timeframe, Trade, UnixMs, adapter::MarketKind,
@@ -361,6 +361,7 @@ fn change_text(candle: &DeltaCandle) -> String {
 
 pub struct CumulativeDeltaIndicator {
     cache: Caches,
+    view: IndicatorView,
     inner: FootprintHistoryIndicator,
     minute_history: MinuteDeltaHistory,
     lookback_days: usize,
@@ -379,6 +380,7 @@ impl CumulativeDeltaIndicator {
         inner.set_day_book_retain(DayBookRetain::CVD_DELTAS_ONLY);
         Self {
             cache: Caches::default(),
+            view: IndicatorView::default(),
             inner,
             minute_history: MinuteDeltaHistory::default(),
             lookback_days: LOOKBACK_DAYS,
@@ -426,13 +428,15 @@ impl CumulativeDeltaIndicator {
         )
         .with_tooltip(tooltip);
 
-        indicator_row(
+        interactive_indicator_row(
             main_chart,
             &self.cache,
             data_labels_always_visible,
             plot,
             AnySeries::forward_unix_ms(&self.candles),
             visible_range,
+            KlineIndicator::CumulativeDelta,
+            self.view,
         )
     }
 
@@ -575,6 +579,10 @@ impl KlineIndicatorImpl for CumulativeDeltaIndicator {
         self.cache.clear_crosshair();
     }
 
+    fn update_view(&mut self, event: IndicatorViewEvent) -> bool {
+        self.view.apply(event)
+    }
+
     fn element<'a>(
         &'a self,
         chart: &'a ViewState,
@@ -638,7 +646,7 @@ impl KlineIndicatorImpl for CumulativeDeltaIndicator {
                 day.as_u64().saturating_add(DAY_MS).saturating_sub(1),
             ));
         }
-        // Load the shared v7 book as an immediate coarse fallback, but only the
+        // Load the shared v8 book as an immediate coarse fallback, but only the
         // compact minute sidecar satisfies an M1/M3 CVD history request.
         let shared = self.inner.load_cached_footprint_day(source, day);
         if let Some(shared_through) = shared

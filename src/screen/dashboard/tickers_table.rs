@@ -332,7 +332,7 @@ impl TickersTable {
                     self.metadata_fetch_state.mark_fetched(venue);
                 }
 
-                if venue_complete && self.is_shown && self.selected_exchanges.contains(&venue) {
+                if venue_complete && self.selected_exchanges.contains(&venue) {
                     let venues = std::iter::once(venue).collect::<FxHashSet<_>>();
                     if let Some(task) = self.build_stats_fetch_task(venues) {
                         return Some(Action::Fetch(task));
@@ -1962,5 +1962,48 @@ mod tests {
         assert!(state.complete_market(Venue::Binance, MarketKind::InversePerps));
         assert!(!state.is_in_flight(Venue::Binance));
         assert!(!state.has_any_in_flight());
+    }
+
+    #[test]
+    fn hidden_table_fetches_initial_stats_after_metadata_completes() {
+        let settings = Settings {
+            selected_exchanges: vec![Venue::Hyperliquid],
+            selected_markets: vec![MarketKind::LinearPerps],
+            ..Settings::default()
+        };
+        let handles = AdapterHandles::spawn_venues(
+            &reqwest::Client::new(),
+            std::iter::empty::<Venue>(),
+            None,
+        );
+        let (mut table, _initial_fetch) = TickersTable::new_with_settings(&settings, handles);
+        let ticker_info = TickerInfo::new(
+            Ticker::new("BTC", Exchange::HyperliquidLinear),
+            0.1,
+            0.001,
+            None,
+        );
+        let mut metadata = HashMap::new();
+        metadata.insert(ticker_info.ticker, Some(ticker_info));
+
+        assert!(!table.is_shown);
+        assert!(
+            table
+                .update(Message::UpdateMetadata(
+                    Venue::Hyperliquid,
+                    MarketKind::LinearPerps,
+                    metadata,
+                    true,
+                ))
+                .is_none()
+        );
+
+        let action = table.update(Message::UpdateMetadata(
+            Venue::Hyperliquid,
+            MarketKind::Spot,
+            HashMap::new(),
+            true,
+        ));
+        assert!(matches!(action, Some(Action::Fetch(_))));
     }
 }

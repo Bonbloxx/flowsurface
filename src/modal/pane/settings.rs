@@ -22,7 +22,7 @@ use iced::widget::{checkbox, space};
 use iced::{
     Alignment, Element, Length,
     widget::{
-        button, column, container, pane_grid, pick_list, radio, row, slider, text,
+        button, column, container, pane_grid, pick_list, radio, row, slider, text, text_input,
         tooltip::Position as TooltipPosition,
     },
 };
@@ -38,6 +38,20 @@ where
         .max_width(max_width)
         .style(style::chart_modal)
         .into()
+}
+
+pub(crate) fn parse_large_trades_threshold_input(input: &str) -> Option<f32> {
+    use data::chart::kline::Config as KlineConfig;
+
+    let normalized = input
+        .trim()
+        .chars()
+        .filter(|ch| !matches!(ch, '$' | ',' | '_' | ' '))
+        .collect::<String>();
+    let value = normalized.parse::<f64>().ok()?;
+    let allowed = f64::from(KlineConfig::LARGE_TRADES_MIN_USD_MIN)
+        ..=f64::from(KlineConfig::LARGE_TRADES_MIN_USD_MAX);
+    (value.is_finite() && allowed.contains(&value)).then_some(value as f32)
 }
 
 pub fn heatmap_cfg_view<'a>(
@@ -648,6 +662,7 @@ pub fn kline_cfg_view<'a>(
     daily_delta: Option<(u16, u16)>,
     previous_value_area: Option<u16>,
     large_trades: Option<f32>,
+    large_trades_input: &'a str,
     vpvr_ticks: Option<u16>,
 ) -> Element<'a, Message> {
     let uses_shared_price_grid = !aggregate_sources.is_empty();
@@ -1284,7 +1299,7 @@ pub fn kline_cfg_view<'a>(
         content = content.push(
             column![
                 text("Previous Value Areas").size(crate::style::text_size::SECTION),
-                text("Plots prior completed day, week, month, and year VAH/POC/VAL. Profiles reuse the TPO engine on exchange OHLC bars, so values match a TPO pane with the same settings."),
+                text("Plots prior-day VAH/VAL plus prior week, month, and year VAH/POC/VAL. Profiles reuse the TPO engine on exchange OHLC bars, so values match a TPO pane with the same settings."),
                 row![text("Ticks per row"), space::horizontal(), tick_choices]
                     .align_y(Alignment::Center),
                 row![text("Letter period"), space::horizontal(), block_choices]
@@ -1418,11 +1433,81 @@ pub fn kline_cfg_view<'a>(
             |value| format!("${}", format_with_commas(*value as f64)),
             Some(KlineConfig::LARGE_TRADES_MIN_USD_STEP),
         );
+
+        let preset_button = |value: f32, label: &'static str| {
+            let is_selected = (min_usd - value).abs() < 0.5;
+            button(text(label).align_x(Alignment::Center))
+                .on_press(Message::VisualConfigChanged(
+                    pane,
+                    VisualConfig::Kline(data::chart::kline::Config {
+                        large_trades_min_usd: value,
+                        ..cfg
+                    }),
+                    false,
+                ))
+                .style(move |theme, status| {
+                    style::button::bordered_toggle(theme, status, is_selected)
+                })
+                .width(Length::Fill)
+        };
+        let presets = KlineConfig::LARGE_TRADES_MIN_USD_PRESETS;
+        let preset_grid = column![
+            row![
+                preset_button(presets[0], "$100k"),
+                preset_button(presets[1], "$250k"),
+                preset_button(presets[2], "$500k"),
+                preset_button(presets[3], "$750k"),
+            ]
+            .spacing(4),
+            row![
+                preset_button(presets[4], "$1m"),
+                preset_button(presets[5], "$3m"),
+                preset_button(presets[6], "$5m"),
+                preset_button(presets[7], "$10m"),
+            ]
+            .spacing(4),
+        ]
+        .spacing(4);
+
+        let exact_value = parse_large_trades_threshold_input(large_trades_input);
+        let exact_value_valid = large_trades_input.trim().is_empty() || exact_value.is_some();
+        let apply_exact = exact_value.map(|value| {
+            Message::VisualConfigChanged(
+                pane,
+                VisualConfig::Kline(data::chart::kline::Config {
+                    large_trades_min_usd: value,
+                    ..cfg
+                }),
+                false,
+            )
+        });
+        let exact_input = text_input("e.g. 125000", large_trades_input)
+            .on_input(move |value| {
+                Message::PaneEvent(pane, Event::LargeTradesThresholdInputChanged(value))
+            })
+            .on_submit_maybe(apply_exact.clone())
+            .style(move |theme, status| {
+                style::validated_text_input(theme, status, exact_value_valid)
+            })
+            .width(Length::Fill);
+        let exact_value_row = row![
+            exact_input,
+            button("Apply")
+                .on_press_maybe(apply_exact)
+                .height(iced::Length::Fixed(32.0)),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center);
+
         content = content.push(
             column![
                 text("Large Trades").size(crate::style::text_size::SECTION),
                 text("Circles mark executed trades above the threshold. Same-side prints within 100ms — including across selected venues — are drawn as one bubble at VWAP. Buy markers use bid color, sells use ask color; size scales with notional. Hover a circle to see its value."),
+                text("Presets"),
+                preset_grid,
                 threshold_slider,
+                text("Exact value (USD)"),
+                exact_value_row,
             ]
             .spacing(8),
         );
@@ -1914,5 +1999,34 @@ pub mod study {
 
             container(column).style(style::modal_container).into()
         }
+    }
+}
+
+#[cfg(test)]
+mod large_trades_threshold_tests {
+    use super::parse_large_trades_threshold_input;
+
+    #[test]
+    fn exact_threshold_accepts_plain_and_formatted_dollar_values() {
+        assert_eq!(
+            parse_large_trades_threshold_input("100000"),
+            Some(100_000.0)
+        );
+        assert_eq!(
+            parse_large_trades_threshold_input("$1,250,000"),
+            Some(1_250_000.0)
+        );
+        assert_eq!(
+            parse_large_trades_threshold_input("750_000.50"),
+            Some(750_000.5)
+        );
+    }
+
+    #[test]
+    fn exact_threshold_rejects_empty_invalid_and_out_of_range_values() {
+        assert_eq!(parse_large_trades_threshold_input(""), None);
+        assert_eq!(parse_large_trades_threshold_input("100k"), None);
+        assert_eq!(parse_large_trades_threshold_input("99999"), None);
+        assert_eq!(parse_large_trades_threshold_input("40000001"), None);
     }
 }

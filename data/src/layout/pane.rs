@@ -47,6 +47,8 @@ pub enum Pane {
     },
     ShaderHeatmap {
         #[serde(deserialize_with = "ok_or_default", default)]
+        layout: ViewConfig,
+        #[serde(deserialize_with = "ok_or_default", default)]
         studies: Vec<HeatmapStudy>,
         #[serde(deserialize_with = "ok_or_default", default)]
         stream_type: Vec<PersistStreamKind>,

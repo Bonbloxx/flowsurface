@@ -5,12 +5,12 @@ use crate::widget::chart::heatmap::scene::depth_grid::GridRing;
 use crate::widget::chart::heatmap::ui;
 use crate::widget::chart::heatmap::view;
 
-use data::util::abbr_large_numbers;
+use data::{chart::RectangleAnnotation, util::abbr_large_numbers};
 use exchange::unit::Qty;
 use exchange::unit::{Price, PriceStep};
 
 use iced::widget::canvas::Path;
-use iced::{Alignment, Point, Rectangle, Renderer, Theme, mouse, widget::canvas};
+use iced::{Alignment, Point, Rectangle, Renderer, Size, Theme, mouse, widget::canvas};
 
 const TOOLTIP_WIDTH: f32 = 204.0;
 const TOOLTIP_HEIGHT: f32 = 66.0;
@@ -38,6 +38,9 @@ pub enum Interaction {
     Hovering,
     Panning {
         last_position: iced::Point,
+    },
+    Rectangle {
+        start: iced::Point,
     },
 }
 
@@ -138,11 +141,13 @@ impl TooltipLayout {
 pub struct OverlayCanvas<'a> {
     pub tooltip_cache: &'a iced::widget::canvas::Cache,
     pub scale_labels_cache: &'a iced::widget::canvas::Cache,
+    pub annotations_cache: &'a iced::widget::canvas::Cache,
 
     pub scene: &'a Scene,
     pub depth_grid: &'a GridRing,
     pub base_price: Option<Price>,
     pub step: PriceStep,
+    pub aggr_time: u64,
     pub scroll_ref_bucket: i64,
     pub qty_scale: f32,
 
@@ -156,6 +161,8 @@ pub struct OverlayCanvas<'a> {
     pub volume_profile_max_qty: Option<Qty>,
 
     pub is_paused: bool,
+    pub rectangles: &'a [RectangleAnnotation],
+    pub rectangle_tool_active: bool,
 }
 
 impl<'a> canvas::Program<Message> for OverlayCanvas<'a> {
@@ -175,13 +182,33 @@ impl<'a> canvas::Program<Message> for OverlayCanvas<'a> {
                         return Some(canvas::Action::publish(Message::JumpToLatest));
                     }
 
-                    *interaction = Interaction::Panning {
-                        last_position: cursor_in_abs,
-                    };
+                    if self.rectangle_tool_active {
+                        *interaction = Interaction::Rectangle {
+                            start: Point::new(
+                                cursor_in_abs.x - bounds.x,
+                                cursor_in_abs.y - bounds.y,
+                            ),
+                        };
+                    } else {
+                        *interaction = Interaction::Panning {
+                            last_position: cursor_in_abs,
+                        };
+                    }
                 }
                 None
             }
             iced::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
+                if let Interaction::Rectangle { start } = *interaction {
+                    let end_abs = cursor.position_over(bounds)?;
+                    let end = Point::new(end_abs.x - bounds.x, end_abs.y - bounds.y);
+                    *interaction = Interaction::Hovering;
+                    return self
+                        .rectangle_from_screen_points(start, end, bounds.size())
+                        .map(|annotation| {
+                            canvas::Action::publish(Message::RectangleDrawn(annotation))
+                                .and_capture()
+                        });
+                }
                 *interaction = Interaction::Hovering;
                 None
             }
@@ -314,15 +341,35 @@ impl<'a> canvas::Program<Message> for OverlayCanvas<'a> {
                 }
             });
 
+        let annotations = self
+            .annotations_cache
+            .draw(renderer, bounds.size(), |frame| {
+                let palette = theme.extended_palette();
+                for annotation in self.rectangles {
+                    self.draw_rectangle(frame, palette, bounds.size(), *annotation, false);
+                }
+            });
+
         let Some(pos) = cursor.position_over(bounds) else {
-            return vec![scale_labels];
+            return vec![annotations, scale_labels];
         };
 
         if self.is_paused && self.paused_control_contains(bounds, pos) {
-            return vec![scale_labels];
+            return vec![annotations, scale_labels];
         }
 
         let tooltip = self.tooltip_cache.draw(renderer, bounds.size(), |frame| {
+            if let Interaction::Rectangle { start } = *interaction {
+                let palette = theme.extended_palette();
+                let end = Point::new(pos.x - bounds.x, pos.y - bounds.y);
+                if let Some(annotation) =
+                    self.rectangle_from_screen_points(start, end, bounds.size())
+                {
+                    self.draw_rectangle(frame, palette, bounds.size(), annotation, true);
+                }
+                return;
+            }
+
             let cell_width = self.scene.cell.width_world();
             let cell_height = self.scene.cell.height_world();
 
@@ -480,7 +527,7 @@ impl<'a> canvas::Program<Message> for OverlayCanvas<'a> {
             }
         });
 
-        vec![tooltip, scale_labels]
+        vec![annotations, tooltip, scale_labels]
     }
 
     fn mouse_interaction(
@@ -494,7 +541,7 @@ impl<'a> canvas::Program<Message> for OverlayCanvas<'a> {
                 return mouse::Interaction::Pointer;
             }
 
-            if let Interaction::Panning { .. } = interaction {
+            if matches!(interaction, Interaction::Panning { .. }) {
                 mouse::Interaction::Grabbing
             } else {
                 mouse::Interaction::Crosshair
@@ -506,6 +553,105 @@ impl<'a> canvas::Program<Message> for OverlayCanvas<'a> {
 }
 
 impl<'a> OverlayCanvas<'a> {
+    fn rectangle_from_screen_points(
+        &self,
+        start: Point,
+        end: Point,
+        bounds: Size,
+    ) -> Option<RectangleAnnotation> {
+        let base_price = self.base_price?;
+        if self.aggr_time == 0 || bounds.width <= 1.0 || bounds.height <= 1.0 {
+            return None;
+        }
+
+        let anchor = |point: Point| {
+            let [world_x, world_y] =
+                self.scene
+                    .camera
+                    .screen_to_world(point.x, point.y, bounds.width, bounds.height);
+            let cell_width = self.scene.cell.width_world();
+            let row_height = self.scene.cell.height_world();
+            let relative_bucket =
+                ((world_x / cell_width) + self.scene.params.origin_x()).round() as i64;
+            let absolute_bucket = self.scroll_ref_bucket.saturating_add(relative_bucket);
+            let interval = (absolute_bucket.max(0) as u64).saturating_mul(self.aggr_time);
+            let price_steps = super::step_floor_from_world_y(world_y, row_height);
+            let price = base_price.add_steps(price_steps, self.step);
+            (interval, price)
+        };
+
+        let (start_interval, start_price) = anchor(start);
+        let (end_interval, end_price) = anchor(end);
+        if start_interval == end_interval || start_price == end_price {
+            return None;
+        }
+
+        Some(RectangleAnnotation {
+            start_interval,
+            end_interval,
+            start_price,
+            end_price,
+        })
+    }
+
+    fn annotation_screen_point(&self, interval: u64, price: Price, bounds: Size) -> Option<Point> {
+        let base_price = self.base_price?;
+        if self.aggr_time == 0 || self.step.units <= 0 {
+            return None;
+        }
+
+        let absolute_bucket = (interval / self.aggr_time) as i64;
+        let relative_bucket = absolute_bucket.saturating_sub(self.scroll_ref_bucket);
+        let world_x =
+            (relative_bucket as f32 - self.scene.params.origin_x()) * self.scene.cell.width_world();
+        let price_steps = (price.units - base_price.units).div_euclid(self.step.units);
+        let world_y = super::world_y_for_step_center(price_steps, self.scene.cell.height_world());
+        let [x, y] =
+            self.scene
+                .camera
+                .world_to_screen(world_x, world_y, bounds.width, bounds.height);
+        Some(Point::new(x, y))
+    }
+
+    fn draw_rectangle(
+        &self,
+        frame: &mut canvas::Frame,
+        palette: &iced::theme::palette::Extended,
+        bounds: Size,
+        annotation: RectangleAnnotation,
+        preview: bool,
+    ) {
+        let Some(start) =
+            self.annotation_screen_point(annotation.start_interval, annotation.start_price, bounds)
+        else {
+            return;
+        };
+        let Some(end) =
+            self.annotation_screen_point(annotation.end_interval, annotation.end_price, bounds)
+        else {
+            return;
+        };
+        let top_left = Point::new(start.x.min(end.x), start.y.min(end.y));
+        let size = Size::new((end.x - start.x).abs(), (end.y - start.y).abs());
+        let color = palette.primary.base.color;
+
+        frame.fill_rectangle(
+            top_left,
+            size,
+            color.scale_alpha(if preview { 0.08 } else { 0.12 }),
+        );
+        frame.stroke(
+            &Path::rectangle(top_left, size),
+            canvas::Stroke::with_color(
+                canvas::Stroke {
+                    width: if preview { 1.0 } else { 1.25 },
+                    ..canvas::Stroke::default()
+                },
+                color.scale_alpha(if preview { 0.7 } else { 0.9 }),
+            ),
+        );
+    }
+
     fn paused_control_contains(&self, bounds: Rectangle, point_abs: Point) -> bool {
         ui::paused_control_rect(bounds).contains(point_abs)
     }

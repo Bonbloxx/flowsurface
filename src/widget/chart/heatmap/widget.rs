@@ -304,9 +304,10 @@ impl<'a> Widget<Message, Theme, Renderer> for HeatmapShaderWidget<'a> {
                 State::apply_action(shell, a);
             }
 
-            if let Some(a) = self
-                .scene
-                .update(&mut state.scene_state, event, plot_bounds, cursor)
+            if !self.overlay.rectangle_tool_active
+                && let Some(a) =
+                    self.scene
+                        .update(&mut state.scene_state, event, plot_bounds, cursor)
             {
                 State::apply_action(shell, a);
             }
@@ -334,9 +335,10 @@ impl<'a> Widget<Message, Theme, Renderer> for HeatmapShaderWidget<'a> {
         {
             State::apply_action(shell, a);
         } else if over_plot || plot_dragging {
-            if let Some(a) = self
-                .scene
-                .update(&mut state.scene_state, event, plot_bounds, cursor)
+            if !self.overlay.rectangle_tool_active
+                && let Some(a) =
+                    self.scene
+                        .update(&mut state.scene_state, event, plot_bounds, cursor)
             {
                 State::apply_action(shell, a);
             }

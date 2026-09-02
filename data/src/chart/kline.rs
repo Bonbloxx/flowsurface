@@ -635,9 +635,9 @@ impl ClusterKind {
     pub fn min_footprint_width(self) -> f32 {
         match self {
             ClusterKind::VolumeProfile | ClusterKind::DeltaProfile => 80.0,
-            // Bid x Ask adds a compact per-row delta value after the two
-            // histogram halves, while keeping both volume labels readable.
-            ClusterKind::BidAsk => 166.0,
+            // Bid x Ask adds a per-row delta value after the two histogram
+            // halves. Give each lane enough room for slightly larger labels.
+            ClusterKind::BidAsk => 180.0,
             ClusterKind::Table => 100.0,
         }
     }
@@ -680,7 +680,7 @@ pub struct Config {
     pub previous_value_area_ticks: u16,
     /// Previous Value Areas letter/block size (TPO block size).
     pub previous_value_area_block_size: super::tpo::BlockSize,
-    /// UTC minute-of-day anchoring Previous Value Areas day/week periods.
+    /// UTC minute-of-day anchoring every Previous Value Areas calendar period.
     pub previous_value_area_session_start_minutes_utc: u16,
     /// Previous Value Areas value-area coverage percent.
     pub previous_value_area_value_area_percent: u8,
@@ -704,10 +704,20 @@ impl Config {
     /// Large Trades capture floor. Every trade at or above this notional is
     /// retained while it is in the retention window, so lowering the visible
     /// threshold never needs a re-backfill.
-    pub const LARGE_TRADES_MIN_USD_MIN: f32 = 1_000_000.0;
+    pub const LARGE_TRADES_MIN_USD_MIN: f32 = 100_000.0;
     pub const LARGE_TRADES_MIN_USD_MAX: f32 = 40_000_000.0;
     pub const LARGE_TRADES_MIN_USD_DEFAULT: f32 = 1_000_000.0;
-    pub const LARGE_TRADES_MIN_USD_STEP: f32 = 1_000_000.0;
+    pub const LARGE_TRADES_MIN_USD_STEP: f32 = 100_000.0;
+    pub const LARGE_TRADES_MIN_USD_PRESETS: [f32; 8] = [
+        100_000.0,
+        250_000.0,
+        500_000.0,
+        750_000.0,
+        1_000_000.0,
+        3_000_000.0,
+        5_000_000.0,
+        10_000_000.0,
+    ];
 
     /// TPO config used to build Previous Value Areas profiles.
     ///

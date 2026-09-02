@@ -460,6 +460,7 @@ impl Dashboard {
                                     };
 
                                     if should_apply {
+                                        state.sync_large_trades_threshold_input_from_config(&cfg);
                                         state.settings.visual_config = Some(cfg.clone());
                                         state.content.change_visual_config(cfg.clone());
 
@@ -468,6 +469,7 @@ impl Dashboard {
                                 });
                         }
                     } else if let Some(state) = self.get_mut_pane(main_window.id, window, pane) {
+                        state.sync_large_trades_threshold_input_from_config(&cfg);
                         state.settings.visual_config = Some(cfg.clone());
                         state.content.change_visual_config(cfg);
                     }

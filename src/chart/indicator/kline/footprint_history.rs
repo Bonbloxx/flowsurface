@@ -44,7 +44,9 @@ pub(crate) const DAYS: usize = 3;
 /// tape had already stored. Those files must be dropped and re-fetched.
 /// v7: quote-normalized and inverse trades are no longer multiplied by price
 /// a second time when producing USD notionals.
-pub(crate) const CACHE_SCHEMA_VERSION: u16 = 7;
+/// v8: Large Trades lowers its capture floor from $1M to $100k. Older complete
+/// day books do not contain the newly eligible prints and must be re-fetched.
+pub(crate) const CACHE_SCHEMA_VERSION: u16 = 8;
 const MAX_LOOKBACK_DAYS: usize = 732;
 // v2 invalidates any completion proof produced before Hyperliquid replay IDs
 // were deduplicated and its legacy recorder coverage was retired. Valid days
@@ -120,8 +122,8 @@ pub(crate) fn trade_notional(trade: Trade, qty_is_quote: bool) -> f64 {
 /// Hard per-day ceiling so busy symbols cannot grow the shared day book
 /// without bound. Retention is by notional, not recency: when the cap is hit
 /// the smallest stored prints are dropped so a $10k flood cannot evict the
-/// $1M+ trades the overlay is for. The $1_000_000 capture floor on BTCUSDT
-/// still fills this cap on the busiest sessions.
+/// largest trades the overlay is for. The $100_000 capture floor can still
+/// fill this cap on the busiest sessions.
 const MAX_LARGE_TRADES_PER_DAY: usize = 100_000;
 /// Compact only after this many extras have accumulated, so a busy tape is
 /// not sorted on every insert.
@@ -260,7 +262,7 @@ pub(crate) struct DayStats {
     notional: f64,
     pub levels: BTreeMap<i64, LevelStats>,
     /// Session-local minute resolution for CVD. This is deliberately omitted
-    /// from the shared v7 footprint cache so existing day books remain valid;
+    /// from the shared v8 footprint cache so existing day books remain valid;
     /// cached history stays at its truthful five-minute source resolution.
     #[serde(skip)]
     one_min_delta: BTreeMap<u64, f64>,
@@ -1208,7 +1210,7 @@ impl FootprintHistoryIndicator {
     }
 
     /// Add execution-derived minute deltas for one source/day. Once an exact
-    /// minute cache is present, its covered tape supersedes the coarse v7
+    /// minute cache is present, its covered tape supersedes the coarse v8
     /// five-minute fallback for CVD; keeping both would count it twice.
     pub(crate) fn merge_exact_cvd_minutes(
         &mut self,

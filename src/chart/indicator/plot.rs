@@ -1,5 +1,6 @@
 use crate::chart::{Basis, Interaction, Message, ViewState, active_crosshair_x};
 use crate::style::{self, dashed_line};
+use data::chart::indicator::KlineIndicator;
 use data::util::{guesstimate_ticks, round_to_tick};
 use exchange::UnixMs;
 use iced::theme::palette::Extended;
@@ -273,6 +274,79 @@ pub struct YScale {
     pub px_height: f32,
 }
 
+const MAX_INDICATOR_Y_ZOOM: f32 = 32.0;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum IndicatorViewEvent {
+    Zoom { factor: f32, anchor_y: f32 },
+    PanTo(f32),
+    Reset,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct IndicatorView {
+    zoom: f32,
+    center_offset: f32,
+}
+
+impl Default for IndicatorView {
+    fn default() -> Self {
+        Self {
+            zoom: 1.0,
+            center_offset: 0.0,
+        }
+    }
+}
+
+impl IndicatorView {
+    pub fn visible_extents(self, min: f32, max: f32) -> (f32, f32) {
+        if !min.is_finite() || !max.is_finite() || max <= min {
+            return (min, max);
+        }
+
+        let span = max - min;
+        let center = (min + max) / 2.0 + self.center_offset * span;
+        let half_visible_span = span / self.zoom / 2.0;
+        (center - half_visible_span, center + half_visible_span)
+    }
+
+    pub fn apply(&mut self, event: IndicatorViewEvent) -> bool {
+        let before = *self;
+
+        match event {
+            IndicatorViewEvent::Zoom { factor, anchor_y } => {
+                if !factor.is_finite() || factor <= 0.0 {
+                    return false;
+                }
+
+                let old_zoom = self.zoom;
+                self.zoom = (self.zoom * factor).clamp(1.0, MAX_INDICATOR_Y_ZOOM);
+                let anchor_from_center = 0.5 - anchor_y.clamp(0.0, 1.0);
+                self.center_offset += anchor_from_center * (1.0 / old_zoom - 1.0 / self.zoom);
+            }
+            IndicatorViewEvent::PanTo(center_offset) => {
+                if !center_offset.is_finite() {
+                    return false;
+                }
+                self.center_offset = center_offset;
+            }
+            IndicatorViewEvent::Reset => *self = Self::default(),
+        }
+
+        let max_offset = (1.0 - 1.0 / self.zoom) / 2.0;
+        self.center_offset = self.center_offset.clamp(-max_offset, max_offset);
+        if self.zoom <= 1.0 {
+            self.center_offset = 0.0;
+        }
+
+        *self != before
+    }
+}
+
+fn indicator_pan_offset(start_offset: f32, delta_y: f32, height: f32, zoom: f32) -> f32 {
+    start_offset + delta_y / height.max(1.0) / zoom.max(1.0)
+}
+
 impl YScale {
     pub fn to_y(&self, v: f32) -> f32 {
         if self.max <= self.min {
@@ -340,6 +414,7 @@ where
     pub max_for_labels: f32,
     pub min_for_labels: f32,
     pub visible_range: RangeInclusive<u64>,
+    pub indicator_view: Option<(KlineIndicator, IndicatorView)>,
 }
 
 impl<P, S> canvas::Program<Message> for ChartCanvas<'_, P, S>
@@ -357,7 +432,46 @@ where
         cursor: mouse::Cursor,
     ) -> Option<canvas::Action<Message>> {
         match event {
+            canvas::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
+                let (_, view) = self.indicator_view?;
+                let position = cursor.position_in(bounds)?;
+                *interaction = Interaction::Panning {
+                    translation: Vector::new(0.0, view.center_offset),
+                    start: position,
+                };
+                Some(canvas::Action::request_redraw())
+            }
+            canvas::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
+                if matches!(interaction, Interaction::Panning { .. }) =>
+            {
+                *interaction = Interaction::None;
+                Some(canvas::Action::request_redraw().and_capture())
+            }
             canvas::Event::Mouse(mouse::Event::CursorMoved { .. }) => {
+                if let (
+                    Interaction::Panning { translation, start },
+                    Some((indicator, view)),
+                    Some(position),
+                ) = (
+                    *interaction,
+                    self.indicator_view,
+                    cursor.position_in(bounds),
+                ) {
+                    let center_offset = indicator_pan_offset(
+                        translation.y,
+                        position.y - start.y,
+                        bounds.height,
+                        view.zoom,
+                    );
+                    return Some(
+                        canvas::Action::publish(Message::IndicatorViewChanged(
+                            indicator,
+                            IndicatorViewEvent::PanTo(center_offset),
+                        ))
+                        .and_capture(),
+                    );
+                }
+
                 let msg = matches!(*interaction, Interaction::None)
                     .then(|| cursor.is_over(bounds))
                     .and_then(|over| over.then_some(Message::CrosshairMoved));
@@ -366,6 +480,21 @@ where
                     Interaction::None => action,
                     _ => action.and_capture(),
                 })
+            }
+            canvas::Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
+                let (indicator, _) = self.indicator_view?;
+                let position = cursor.position_in(bounds)?;
+                let factor = crate::widget::chart::wheel_zoom_factor(*delta);
+                Some(
+                    canvas::Action::publish(Message::IndicatorViewChanged(
+                        indicator,
+                        IndicatorViewEvent::Zoom {
+                            factor,
+                            anchor_y: position.y / bounds.height.max(1.0),
+                        },
+                    ))
+                    .and_capture(),
+                )
             }
             _ => None,
         }
@@ -737,5 +866,56 @@ impl PlotTooltip {
             align_x: Alignment::Start.into(),
             ..canvas::Text::default()
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn indicator_zoom_keeps_the_cursor_anchor_stable() {
+        let mut view = IndicatorView::default();
+
+        assert!(view.apply(IndicatorViewEvent::Zoom {
+            factor: 2.0,
+            anchor_y: 0.0,
+        }));
+        assert_eq!(view.visible_extents(0.0, 100.0), (50.0, 100.0));
+    }
+
+    #[test]
+    fn indicator_pan_stays_inside_the_autoscaled_range() {
+        let mut view = IndicatorView::default();
+        view.apply(IndicatorViewEvent::Zoom {
+            factor: 2.0,
+            anchor_y: 0.5,
+        });
+
+        assert!(view.apply(IndicatorViewEvent::PanTo(10.0)));
+        assert_eq!(view.visible_extents(0.0, 100.0), (50.0, 100.0));
+
+        assert!(view.apply(IndicatorViewEvent::Zoom {
+            factor: 0.1,
+            anchor_y: 0.5,
+        }));
+        assert_eq!(view, IndicatorView::default());
+    }
+
+    #[test]
+    fn indicator_view_can_reset_to_fit() {
+        let mut view = IndicatorView::default();
+        view.apply(IndicatorViewEvent::Zoom {
+            factor: 4.0,
+            anchor_y: 0.25,
+        });
+
+        assert!(view.apply(IndicatorViewEvent::Reset));
+        assert_eq!(view, IndicatorView::default());
+    }
+
+    #[test]
+    fn indicator_drag_distance_tracks_the_zoomed_visible_span() {
+        assert_eq!(indicator_pan_offset(0.0, 20.0, 100.0, 2.0), 0.1);
     }
 }

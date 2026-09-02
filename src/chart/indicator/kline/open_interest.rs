@@ -1,14 +1,14 @@
 use crate::chart::{
     Basis, Caches, Message, ViewState,
     indicator::{
-        indicator_row,
+        interactive_indicator_row,
         kline::{AvailabilityCause, FetchCtx, IndicatorAvailability, KlineIndicatorImpl},
-        plot::{AnySeries, PlotTooltip, candle::CandlePlot},
+        plot::{AnySeries, IndicatorView, IndicatorViewEvent, PlotTooltip, candle::CandlePlot},
     },
 };
 use crate::connector::fetcher::FetchRange;
 
-use data::chart::{PlotData, kline::KlineDataPoint};
+use data::chart::{PlotData, indicator::KlineIndicator, kline::KlineDataPoint};
 use data::util::format_with_commas;
 use exchange::adapter::{Exchange, Venue};
 use exchange::{Kline, TickerInfo, Timeframe, Trade, UnixMs};
@@ -39,6 +39,7 @@ fn change_text(value: &OpenInterestCandle) -> String {
 
 pub struct OpenInterestIndicator {
     cache: Caches,
+    view: IndicatorView,
     pub data: BTreeMap<UnixMs, OpenInterestCandle>,
     sources: Vec<TickerInfo>,
     source_data: FxHashMap<TickerInfo, BTreeMap<UnixMs, f64>>,
@@ -89,6 +90,7 @@ impl OpenInterestIndicator {
     pub fn new() -> Self {
         Self {
             cache: Caches::default(),
+            view: IndicatorView::default(),
             data: BTreeMap::new(),
             sources: Vec::new(),
             source_data: FxHashMap::default(),
@@ -167,13 +169,15 @@ impl OpenInterestIndicator {
         )
         .with_tooltip(tooltip);
 
-        indicator_row(
+        interactive_indicator_row(
             main_chart,
             &self.cache,
             data_labels_always_visible,
             plot,
             AnySeries::forward_unix_ms(&self.data),
             visible_range,
+            KlineIndicator::OpenInterest,
+            self.view,
         )
     }
 
@@ -385,6 +389,10 @@ impl KlineIndicatorImpl for OpenInterestIndicator {
 
     fn clear_crosshair_caches(&mut self) {
         self.cache.clear_crosshair();
+    }
+
+    fn update_view(&mut self, event: IndicatorViewEvent) -> bool {
+        self.view.apply(event)
     }
 
     fn element<'a>(

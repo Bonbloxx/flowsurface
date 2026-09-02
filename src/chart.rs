@@ -10,7 +10,10 @@ use crate::style;
 use crate::widget::multi_split::{DRAG_SIZE, MultiSplit};
 use crate::widget::tooltip;
 use data::aggr::ticks::TickAccumulation;
-use data::chart::{Autoscale, Basis, PlotData, ViewConfig, indicator::Indicator};
+use data::chart::{
+    Autoscale, Basis, PlotData, RectangleAnnotation, ViewConfig,
+    indicator::{Indicator, KlineIndicator},
+};
 use exchange::unit::{Price, PriceStep};
 use exchange::{TickerInfo, UnixMs};
 use scale::linear::PriceInfoLabel;
@@ -53,6 +56,9 @@ pub enum Interaction {
     Ruler {
         start: Option<Point>,
     },
+    Rectangle {
+        start: Point,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -74,6 +80,10 @@ pub enum Message {
     BoundsChanged(Rectangle),
     SplitDragged(usize, f32),
     DoubleClick(AxisScaleClicked),
+    IndicatorViewChanged(KlineIndicator, indicator::plot::IndicatorViewEvent),
+    RectangleToolToggled,
+    RectangleDrawn(RectangleAnnotation),
+    RectanglesCleared,
 }
 
 pub trait Chart: PlotConstants + canvas::Program<Message> {
@@ -86,6 +96,14 @@ pub trait Chart: PlotConstants + canvas::Program<Message> {
     fn invalidate_all(&mut self);
 
     fn invalidate_crosshair(&mut self);
+
+    fn update_indicator_view(
+        &mut self,
+        _indicator: KlineIndicator,
+        _event: indicator::plot::IndicatorViewEvent,
+    ) -> bool {
+        false
+    }
 
     fn view_indicators(&'_ self, enabled: &[Self::IndicatorKind]) -> Vec<Element<'_, Message>>;
 
@@ -120,7 +138,28 @@ fn canvas_interaction<T: Chart>(
     }
 
     let shrunken_bounds = bounds.shrink(DRAG_SIZE * 4.0);
-    let cursor_position = cursor.position_in(shrunken_bounds);
+    let cursor_position = cursor
+        .position_in(bounds)
+        .filter(|_| cursor.position_in(shrunken_bounds).is_some());
+
+    if let Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) = event
+        && let Interaction::Rectangle { start } = *interaction
+    {
+        let end = cursor_position?;
+        *interaction = Interaction::None;
+
+        if let Some(annotation) =
+            chart
+                .state()
+                .rectangle_from_screen_points(start, end, bounds.size())
+        {
+            return Some(
+                canvas::Action::publish(Message::RectangleDrawn(annotation)).and_capture(),
+            );
+        }
+
+        return Some(canvas::Action::request_redraw().and_capture());
+    }
 
     if let Event::Mouse(mouse::Event::ButtonReleased(_)) = event {
         match interaction {
@@ -131,8 +170,10 @@ fn canvas_interaction<T: Chart>(
         }
     }
 
-    if let Interaction::Ruler { .. } = interaction
-        && cursor_position.is_none()
+    if matches!(
+        interaction,
+        Interaction::Ruler { .. } | Interaction::Rectangle { .. }
+    ) && cursor_position.is_none()
     {
         *interaction = Interaction::None;
     }
@@ -146,6 +187,13 @@ fn canvas_interaction<T: Chart>(
                     let cursor_in_bounds = cursor_position?;
 
                     if let mouse::Button::Left = button {
+                        if state.rectangle_tool_active {
+                            *interaction = Interaction::Rectangle {
+                                start: cursor_in_bounds,
+                            };
+                            return Some(canvas::Action::request_redraw().and_capture());
+                        }
+
                         match interaction {
                             Interaction::None
                             | Interaction::Panning { .. }
@@ -163,6 +211,7 @@ fn canvas_interaction<T: Chart>(
                             Interaction::Ruler { .. } => {
                                 *interaction = Interaction::None;
                             }
+                            Interaction::Rectangle { .. } => {}
                         }
                     }
                     Some(canvas::Action::request_redraw().and_capture())
@@ -175,7 +224,9 @@ fn canvas_interaction<T: Chart>(
                         );
                         Some(canvas::Action::publish(msg).and_capture())
                     }
-                    Interaction::None | Interaction::Ruler { .. } => {
+                    Interaction::None
+                    | Interaction::Ruler { .. }
+                    | Interaction::Rectangle { .. } => {
                         Some(canvas::Action::publish(Message::CrosshairMoved))
                     }
                     _ => None,
@@ -294,8 +345,12 @@ fn canvas_interaction<T: Chart>(
             match keyboard_event {
                 iced::keyboard::Event::KeyPressed { key, .. } => match key.as_ref() {
                     keyboard::Key::Named(keyboard::key::Named::Shift) => {
-                        *interaction = Interaction::Ruler { start: None };
-                        Some(canvas::Action::request_redraw().and_capture())
+                        if chart.state().rectangle_tool_active {
+                            None
+                        } else {
+                            *interaction = Interaction::Ruler { start: None };
+                            Some(canvas::Action::request_redraw().and_capture())
+                        }
                     }
                     keyboard::Key::Named(keyboard::key::Named::Escape) => {
                         *interaction = Interaction::None;
@@ -560,6 +615,28 @@ pub fn update<T: Chart>(chart: &mut T, message: &Message) {
             state.crosshair_x = normalize_crosshair_x(*crosshair_x, state.bounds.width);
             return chart.invalidate_crosshair();
         }
+        Message::IndicatorViewChanged(indicator, event) => {
+            if !chart.update_indicator_view(*indicator, *event) {
+                return;
+            }
+        }
+        Message::RectangleToolToggled => {
+            let state = chart.mut_state();
+            state.rectangle_tool_active = !state.rectangle_tool_active;
+            return chart.invalidate_crosshair();
+        }
+        Message::RectangleDrawn(annotation) => {
+            let state = chart.mut_state();
+            state.layout.rectangles.push(*annotation);
+            state.cache.annotations.clear();
+            return chart.invalidate_crosshair();
+        }
+        Message::RectanglesCleared => {
+            let state = chart.mut_state();
+            state.layout.rectangles.clear();
+            state.cache.annotations.clear();
+            return chart.invalidate_crosshair();
+        }
     }
     chart.invalidate_all();
 }
@@ -609,8 +686,38 @@ pub fn view<'a, T: Chart>(
         .on_press(Message::AutoscaleToggled)
         .style(move |theme: &Theme, status| style::button::transparent(theme, status, is_active));
 
+        let rectangle_tool_active = state.rectangle_tool_active;
+        let rectangle_button = button(
+            text("▭")
+                .font(style::AZERET_MONO)
+                .size(crate::style::text_size::SECTION)
+                .align_x(Alignment::Center)
+                .align_y(Alignment::Center),
+        )
+        .height(Length::Fill)
+        .on_press(Message::RectangleToolToggled)
+        .style(move |theme: &Theme, status| {
+            style::button::transparent(theme, status, rectangle_tool_active)
+        });
+
+        let clear_button = button(style::icon_text(style::Icon::TrashBin, 10))
+            .height(Length::Fill)
+            .on_press_maybe(
+                (!state.layout.rectangles.is_empty()).then_some(Message::RectanglesCleared),
+            )
+            .style(|theme: &Theme, status| style::button::transparent(theme, status, false));
+
         row![
-            iced::widget::space::horizontal(),
+            tooltip(
+                rectangle_button,
+                Some("Rectangle · drag on chart"),
+                iced::widget::tooltip::Position::Top
+            ),
+            tooltip(
+                clear_button,
+                Some("Clear rectangles"),
+                iced::widget::tooltip::Position::Top
+            ),
             tooltip(
                 autoscale_button,
                 autoscale_btn_tooltip,
@@ -711,6 +818,7 @@ pub trait PlotConstants {
 #[derive(Default)]
 pub struct Caches {
     main: Cache,
+    annotations: Cache,
     x_labels: Cache,
     y_labels: Cache,
     crosshair: Cache,
@@ -718,6 +826,11 @@ pub struct Caches {
 
 impl Caches {
     fn clear_all(&self) {
+        self.clear_data();
+        self.annotations.clear();
+    }
+
+    fn clear_data(&self) {
         self.main.clear();
         self.x_labels.clear();
         self.y_labels.clear();
@@ -747,6 +860,8 @@ pub struct ViewState {
     ticker_info: TickerInfo,
     layout: ViewConfig,
     crosshair_x: Option<f32>,
+    rectangle_tool_active: bool,
+    last_annotation_transform: Option<[u64; 10]>,
 }
 
 impl ViewState {
@@ -775,11 +890,34 @@ impl ViewState {
             ticker_info,
             layout,
             crosshair_x: None,
+            rectangle_tool_active: false,
+            last_annotation_transform: None,
         }
     }
 
     pub(crate) fn crosshair_x(&self) -> Option<f32> {
         self.crosshair_x
+    }
+
+    fn clear_render_caches(&mut self) {
+        let transform = [
+            self.latest_x,
+            self.base_price_y.units as u64,
+            u64::from(self.translation.x.to_bits()),
+            u64::from(self.translation.y.to_bits()),
+            u64::from(self.scaling.to_bits()),
+            u64::from(self.cell_width.to_bits()),
+            u64::from(self.cell_height.to_bits()),
+            u64::from(self.bounds.width.to_bits()),
+            u64::from(self.bounds.height.to_bits()),
+            self.effective_tick_units() as u64,
+        ];
+
+        self.cache.clear_data();
+        if self.last_annotation_transform != Some(transform) {
+            self.cache.annotations.clear();
+            self.last_annotation_transform = Some(transform);
+        }
     }
 
     fn effective_tick_units(&self) -> i64 {
@@ -919,6 +1057,104 @@ impl ViewState {
         let ticks = y / self.cell_height;
         let delta_units = (ticks * self.effective_tick_units() as f32).round() as i64;
         Price::from_units(self.base_price_y.units - delta_units)
+    }
+
+    fn rectangle_from_screen_points(
+        &self,
+        start: Point,
+        end: Point,
+        bounds: Size,
+    ) -> Option<RectangleAnnotation> {
+        if bounds.width <= 1.0 || bounds.height <= 1.0 {
+            return None;
+        }
+
+        let region = self.visible_region(bounds);
+        let anchor = |point: Point| {
+            let (interval, _) = self.snap_x_to_index(point.x, bounds, region);
+            let chart_y = region.y + (point.y / bounds.height) * region.height;
+            let step = if self.tick_size.units > 0 {
+                self.tick_size
+            } else {
+                self.ticker_info.min_ticksize.into()
+            };
+            let price = self.y_to_price(chart_y).round_to_step(step);
+            (interval, price)
+        };
+
+        let (start_interval, start_price) = anchor(start);
+        let (end_interval, end_price) = anchor(end);
+        if start_interval == end_interval || start_price == end_price {
+            return None;
+        }
+
+        Some(RectangleAnnotation {
+            start_interval,
+            end_interval,
+            start_price,
+            end_price,
+        })
+    }
+
+    fn annotation_screen_point(&self, interval: u64, price: Price, bounds: Size) -> Point {
+        Point::new(
+            (self.interval_to_x(interval) + self.translation.x) * self.scaling + bounds.width / 2.0,
+            (self.price_to_y(price) + self.translation.y) * self.scaling + bounds.height / 2.0,
+        )
+    }
+
+    fn draw_rectangle(
+        &self,
+        frame: &mut Frame,
+        palette: &Extended,
+        bounds: Size,
+        annotation: RectangleAnnotation,
+        preview: bool,
+    ) {
+        let start =
+            self.annotation_screen_point(annotation.start_interval, annotation.start_price, bounds);
+        let end =
+            self.annotation_screen_point(annotation.end_interval, annotation.end_price, bounds);
+        let top_left = Point::new(start.x.min(end.x), start.y.min(end.y));
+        let size = Size::new((end.x - start.x).abs(), (end.y - start.y).abs());
+
+        let color = palette.primary.base.color;
+        frame.fill_rectangle(
+            top_left,
+            size,
+            color.scale_alpha(if preview { 0.08 } else { 0.12 }),
+        );
+        frame.stroke(
+            &Path::rectangle(top_left, size),
+            Stroke::with_color(
+                Stroke {
+                    width: if preview { 1.0 } else { 1.25 },
+                    ..Stroke::default()
+                },
+                color.scale_alpha(if preview { 0.7 } else { 0.9 }),
+            ),
+        );
+    }
+
+    fn draw_persisted_rectangles(&self, frame: &mut Frame, palette: &Extended, bounds: Size) {
+        for annotation in &self.layout.rectangles {
+            self.draw_rectangle(frame, palette, bounds, *annotation, false);
+        }
+    }
+
+    fn draw_rectangle_preview(
+        &self,
+        frame: &mut Frame,
+        palette: &Extended,
+        bounds: Size,
+        interaction: &Interaction,
+        cursor_position: Option<Point>,
+    ) {
+        if let (Interaction::Rectangle { start }, Some(end)) = (interaction, cursor_position)
+            && let Some(annotation) = self.rectangle_from_screen_points(*start, end, bounds)
+        {
+            self.draw_rectangle(frame, palette, bounds, annotation, true);
+        }
     }
 
     fn draw_vertical_crosshair(
@@ -1216,6 +1452,7 @@ impl ViewState {
         ViewConfig {
             splits: layout.splits.clone(),
             autoscale: layout.autoscale,
+            rectangles: layout.rectangles.clone(),
         }
     }
 

@@ -549,6 +549,36 @@ impl KlineAggregator {
             .all(|source| self.source_is_complete(source, need_earliest))
     }
 
+    /// Whether every selected source spans the full half-open bar range.
+    ///
+    /// A composite profile must not be published while one venue only has a
+    /// recent page or is still paging toward the period start. Interior gaps
+    /// remain the exchange adapter's responsibility; this guards the paging
+    /// boundaries that the aggregator can prove from its stored bars.
+    pub fn all_sources_cover_range(
+        &self,
+        start: exchange::UnixMs,
+        end: exchange::UnixMs,
+        bar_ms: u64,
+    ) -> bool {
+        start < end
+            && bar_ms > 0
+            && !self.sources.is_empty()
+            && self.sources.iter().all(|source| {
+                let Some(source_bars) = self.bars.get(source) else {
+                    return false;
+                };
+                let Some((earliest, _)) = source_bars.first_key_value() else {
+                    return false;
+                };
+                let Some((latest, _)) = source_bars.last_key_value() else {
+                    return false;
+                };
+
+                *earliest <= start && latest.saturating_add(bar_ms) >= end
+            })
+    }
+
     pub fn composite_klines(&self) -> Vec<Kline> {
         let mut composite = BTreeMap::<exchange::UnixMs, Kline>::new();
 
@@ -1029,5 +1059,33 @@ mod tests {
         assert_eq!(merged[0].low, Price::from_f64(101.0));
         assert_eq!(merged[0].volume.total(), Qty::from_f64(16.0));
         assert_eq!(merged[1].time, exchange::UnixMs::new(3_000));
+    }
+
+    #[test]
+    fn complete_range_requires_every_source_to_span_both_boundaries() {
+        let primary = ticker_info(Exchange::BinanceLinear, "BTCUSDT");
+        let secondary = ticker_info(Exchange::BybitLinear, "BTCUSDT");
+        let feed = ResolvedFeed {
+            id: Some(AggregateFeedId::BtcUsdtPerpetual),
+            available_sources: vec![primary, secondary],
+            sources: vec![primary, secondary],
+        };
+        let mut aggregator = KlineAggregator::new(&feed);
+        let start = exchange::UnixMs::new(1_000);
+        let end = exchange::UnixMs::new(4_000);
+
+        aggregator.insert(
+            primary,
+            &[
+                kline(1_000, 100.0, 101.0, 99.0, 100.0, 1.0),
+                kline(3_000, 100.0, 101.0, 99.0, 100.0, 1.0),
+            ],
+        );
+        aggregator.insert(secondary, &[kline(3_000, 100.0, 101.0, 99.0, 100.0, 1.0)]);
+        assert!(!aggregator.all_sources_cover_range(start, end, 1_000));
+
+        aggregator.insert(secondary, &[kline(1_000, 100.0, 101.0, 99.0, 100.0, 1.0)]);
+        assert!(aggregator.all_sources_cover_range(start, end, 1_000));
+        assert!(!aggregator.all_sources_cover_range(start, end, 0));
     }
 }

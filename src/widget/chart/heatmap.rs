@@ -19,10 +19,11 @@ use widget::{DEFAULT_Y_AXIS_GUTTER, HeatmapShaderLayer, HeatmapShaderWidget};
 use crate::{
     chart::{Action, HeatmapOverlayTransform},
     modal::pane::settings::study::{self, Study},
+    style,
 };
 use data::aggr::time::TimeSeries;
 use data::chart::{
-    Basis,
+    Basis, RectangleAnnotation, ViewConfig as ChartViewConfig,
     heatmap::{HeatmapDataPoint, HeatmapStudy, HistoricalDepth},
     indicator::HeatmapIndicator,
 };
@@ -75,6 +76,9 @@ pub enum Message {
     },
     CursorMoved,
     JumpToLatest,
+    RectangleToolToggled,
+    RectangleDrawn(RectangleAnnotation),
+    RectanglesCleared,
 }
 
 pub struct HeatmapShader {
@@ -107,6 +111,8 @@ pub struct HeatmapShader {
     indicators: Vec<HeatmapIndicator>,
     pub studies: Vec<HeatmapStudy>,
     pub study_configurator: study::Configurator<HeatmapStudy>,
+    rectangle_layout: ChartViewConfig,
+    rectangle_tool_active: bool,
 }
 
 impl HeatmapShader {
@@ -116,6 +122,7 @@ impl HeatmapShader {
         ticker_info: TickerInfo,
         studies: Vec<HeatmapStudy>,
         indicators: Vec<HeatmapIndicator>,
+        rectangle_layout: ChartViewConfig,
         config: Option<data::chart::heatmap::Config>,
     ) -> Self {
         let depth_history = HistoricalDepth::new(ticker_info.min_qty, step, basis);
@@ -156,6 +163,8 @@ impl HeatmapShader {
             config: config.unwrap_or_default(),
             studies,
             study_configurator: study::Configurator::new(),
+            rectangle_layout,
+            rectangle_tool_active: false,
         }
     }
 
@@ -165,7 +174,15 @@ impl HeatmapShader {
         ticker_info: TickerInfo,
         config: Option<data::chart::heatmap::Config>,
     ) -> Self {
-        let mut overlay = Self::new(basis, step, ticker_info, vec![], vec![], config);
+        let mut overlay = Self::new(
+            basis,
+            step,
+            ticker_info,
+            vec![],
+            vec![],
+            ChartViewConfig::default(),
+            config,
+        );
         // The embedded layer only needs the chart's visible history. The
         // standalone 8,192 x 2,048 ring wastes hundreds of MB once CPU upload
         // copies and GPU textures are included.
@@ -218,7 +235,11 @@ impl HeatmapShader {
         self.anchor.set_scroll_ref_bucket_if_zero(latest_bucket);
         let scroll_ref_bucket = self.anchor.scroll_ref_bucket();
         let origin_x = overlay_origin_x(latest_bucket, scroll_ref_bucket);
+        let previous_origin_x = self.scene.params.origin_x();
         self.scene.params.set_origin_x(origin_x);
+        if previous_origin_x.to_bits() != origin_x.to_bits() {
+            self.canvas_invalidation.mark_annotations();
+        }
         let window = self.compute_view_window(transform.viewport)?;
         let previous_steps_per_y_bin = self.scene.params.steps_per_y_bin();
         let next_steps_per_y_bin = window.steps_per_y_bin.max(1);
@@ -414,7 +435,24 @@ impl HeatmapShader {
                 self.canvas_invalidation
                     .mark_cursor_moved(self.anchor.is_paused());
             }
+            Message::RectangleToolToggled => {
+                self.rectangle_tool_active = !self.rectangle_tool_active;
+                self.canvas_invalidation.mark_overlay_tooltip();
+            }
+            Message::RectangleDrawn(annotation) => {
+                self.rectangle_layout.rectangles.push(annotation);
+                self.canvas_invalidation.mark_annotations();
+                self.canvas_invalidation.mark_overlay_tooltip();
+            }
+            Message::RectanglesCleared => {
+                self.rectangle_layout.rectangles.clear();
+                self.canvas_invalidation.mark_annotations();
+            }
         }
+    }
+
+    pub fn chart_layout(&self) -> ChartViewConfig {
+        self.rectangle_layout.clone()
     }
 
     pub fn view(&self, timezone: data::UserTimezone) -> iced::Element<'_, Message> {
@@ -473,21 +511,62 @@ impl HeatmapShader {
             depth_grid: &self.depth_grid,
             base_price: render_base_price,
             step: self.step,
+            aggr_time,
             scroll_ref_bucket,
             qty_scale: self.qty_scale,
             tooltip_cache: &self.canvas_caches.overlay,
             scale_labels_cache: &self.canvas_caches.scale_labels,
+            annotations_cache: &self.canvas_caches.annotations,
             geometry: overlay_geometry,
             is_paused: false,
             volume_strip_max_qty: self.instances.volume_strip_scale_max_qty,
             depth_profile_max_qty: self.instances.depth_profile_scale_max_qty,
             volume_profile_max_qty: self.instances.volume_profile_scale_max_qty,
+            rectangles: &self.rectangle_layout.rectangles,
+            rectangle_tool_active: self.rectangle_tool_active,
         };
 
         let chart = HeatmapShaderWidget::new(&self.scene, x_axis, y_axis, overlay)
             .with_y_axis_gutter(self.y_axis_gutter);
 
-        iced::widget::container(chart).padding(1).into()
+        let rectangle_tool_active = self.rectangle_tool_active;
+        let rectangle_button = iced::widget::button(
+            iced::widget::text("▭")
+                .font(style::AZERET_MONO)
+                .size(style::text_size::SECTION),
+        )
+        .on_press(Message::RectangleToolToggled)
+        .style(move |theme, status| {
+            style::button::transparent(theme, status, rectangle_tool_active)
+        });
+        let clear_button = iced::widget::button(style::icon_text(style::Icon::TrashBin, 10))
+            .on_press_maybe(
+                (!self.rectangle_layout.rectangles.is_empty())
+                    .then_some(Message::RectanglesCleared),
+            )
+            .style(|theme, status| style::button::transparent(theme, status, false));
+        let tools = iced::widget::row![
+            iced::widget::tooltip(
+                rectangle_button,
+                "Rectangle · drag on chart",
+                iced::widget::tooltip::Position::Top,
+            ),
+            iced::widget::tooltip(
+                clear_button,
+                "Clear rectangles",
+                iced::widget::tooltip::Position::Top,
+            )
+        ]
+        .spacing(2);
+
+        iced::widget::stack![
+            iced::widget::container(chart).padding(1),
+            iced::widget::container(tools)
+                .align_right(iced::Length::Fill)
+                .align_bottom(iced::Length::Fill)
+                .padding(3),
+        ]
+        .into()
     }
 
     pub fn update_theme(&mut self, theme: &iced_core::Theme) {
@@ -591,6 +670,7 @@ impl HeatmapShader {
         if self.anchor.effective_base_price(self.base_price) != prev_effective_base {
             self.refresh_y_axis_gutter();
             self.canvas_invalidation.mark_axis_y();
+            self.canvas_invalidation.mark_annotations();
         }
     }
 
@@ -1003,7 +1083,11 @@ impl HeatmapShader {
             latest_time
         };
 
+        let previous_origin_x = self.scene.params.origin_x();
         self.scene.params.set_origin_x(origin_x);
+        if previous_origin_x.to_bits() != origin_x.to_bits() {
+            self.canvas_invalidation.mark_annotations();
+        }
         self.scene.sync_heatmap_texture(
             &self.depth_grid,
             base_price,

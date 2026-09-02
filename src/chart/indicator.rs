@@ -9,6 +9,7 @@ use crate::chart::{
     scale::{AxisLabel, LabelContent, calc_label_rect},
 };
 use data::chart::Basis;
+use data::chart::indicator::KlineIndicator;
 use data::util::{abbr_large_numbers, round_to_tick};
 
 use iced::{
@@ -16,7 +17,7 @@ use iced::{
     widget::{
         Canvas,
         canvas::{self, Cache, Geometry},
-        container, row, rule,
+        container, mouse_area, row, rule,
     },
 };
 use std::ops::RangeInclusive;
@@ -29,6 +30,54 @@ pub fn indicator_row<'a, P, Y>(
     plot: P,
     series: AnySeries<'a, Y>,
     visible_range: RangeInclusive<u64>,
+) -> Element<'a, Message>
+where
+    P: Plot<AnySeries<'a, Y>> + 'a,
+{
+    indicator_row_with_view(
+        main_chart,
+        cache,
+        data_labels_always_visible,
+        plot,
+        series,
+        visible_range,
+        None,
+    )
+}
+
+/// Creates an indicator plot with an independently navigable vertical scale.
+pub fn interactive_indicator_row<'a, P, Y>(
+    main_chart: &'a ViewState,
+    cache: &'a Caches,
+    data_labels_always_visible: bool,
+    plot: P,
+    series: AnySeries<'a, Y>,
+    visible_range: RangeInclusive<u64>,
+    indicator: KlineIndicator,
+    view: plot::IndicatorView,
+) -> Element<'a, Message>
+where
+    P: Plot<AnySeries<'a, Y>> + 'a,
+{
+    indicator_row_with_view(
+        main_chart,
+        cache,
+        data_labels_always_visible,
+        plot,
+        series,
+        visible_range,
+        Some((indicator, view)),
+    )
+}
+
+fn indicator_row_with_view<'a, P, Y>(
+    main_chart: &'a ViewState,
+    cache: &'a Caches,
+    data_labels_always_visible: bool,
+    plot: P,
+    series: AnySeries<'a, Y>,
+    visible_range: RangeInclusive<u64>,
+    indicator_view: Option<(KlineIndicator, plot::IndicatorView)>,
 ) -> Element<'a, Message>
 where
     P: Plot<AnySeries<'a, Y>> + 'a,
@@ -78,6 +127,9 @@ where
         .y_extents(&series, earliest..=latest)
         .map(|(min, max)| plot.adjust_extents(min, max))
         .unwrap_or((0.0, 0.0));
+    let (min, max) = indicator_view
+        .map(|(_, view)| view.visible_extents(min, max))
+        .unwrap_or((min, max));
 
     let canvas = Canvas::new(ChartCanvas::<P, AnySeries<'a, Y>> {
         indicator_cache: &cache.main,
@@ -89,9 +141,20 @@ where
         max_for_labels: max,
         min_for_labels: min,
         visible_range: earliest..=latest,
+        indicator_view,
     })
     .height(Length::Fill)
     .width(Length::Fill);
+    let canvas: Element<'a, Message> = if let Some((indicator, _)) = indicator_view {
+        mouse_area(canvas)
+            .on_double_click(Message::IndicatorViewChanged(
+                indicator,
+                plot::IndicatorViewEvent::Reset,
+            ))
+            .into()
+    } else {
+        canvas.into()
+    };
 
     let labels = Canvas::new(IndicatorLabel {
         label_cache: &cache.y_labels,
