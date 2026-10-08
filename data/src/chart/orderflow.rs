@@ -30,6 +30,32 @@ pub struct Config {
     pub rejection_bands: f64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Preset {
+    Balanced,
+    SelectiveAbsorption,
+}
+
+impl Preset {
+    pub const ALL: [Self; 2] = [Self::Balanced, Self::SelectiveAbsorption];
+
+    pub fn config(self) -> Config {
+        match self {
+            Self::Balanced => Config::default(),
+            Self::SelectiveAbsorption => Config::selective(),
+        }
+    }
+}
+
+impl std::fmt::Display for Preset {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Balanced => "Balanced",
+            Self::SelectiveAbsorption => "Selective absorption",
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -53,7 +79,7 @@ mod tests {
         second
     }
     fn approaching() -> Detector {
-        let mut detector = Detector::new(Config::default(), tick());
+        let mut detector = Detector::new(Config::selective(), tick());
         for t in 0..300 {
             detector.process(&second(t, 1_000.0, 100.0, t % 2 == 0));
         }
@@ -224,18 +250,33 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             absorption: true,
-            exhaustion: false,
+            exhaustion: true,
             show_observed: false,
             band_ticks: 50,
             window_seconds: 15,
-            min_absorption_usd: 250_000.0,
+            min_absorption_usd: 1_000_000.0,
             sensitivity: 2.0,
-            rejection_bands: 3.0,
+            rejection_bands: 4.0,
         }
     }
 }
 
 impl Config {
+    pub fn selective() -> Self {
+        Self {
+            exhaustion: false,
+            min_absorption_usd: 250_000.0,
+            rejection_bands: 3.0,
+            ..Self::default()
+        }
+    }
+
+    pub fn preset(self) -> Option<Preset> {
+        Preset::ALL
+            .into_iter()
+            .find(|preset| preset.config() == self)
+    }
+
     pub fn normalized(self) -> Self {
         let defaults = Self::default();
         let finite = |value: f64, fallback: f64, low: f64, high: f64| {

@@ -1,5 +1,5 @@
 //! Replay an immutable Binance aggTrades CSV with the production detector.
-//! Usage: cargo run -p flowsurface-data --release --example orderflow_replay -- file.csv [config.json]
+//! Usage: cargo run -p flowsurface-data --release --example orderflow_replay -- file.csv [config.json|default] [session_from_ms session_to_ms]
 //! Outcomes start AFTER confirmation plus the live two-second publication buffer, not at the earlier extreme. This is a
 //! diagnostic event study; fees/slippage and portfolio execution are not modeled.
 use exchange::{
@@ -51,10 +51,22 @@ fn outcome(
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
-    let config = if let Some(path) = args.get(2) {
+    let config = if let Some(path) = args.get(2).filter(|path| path.as_str() != "default") {
         serde_json::from_reader(File::open(path)?)?
     } else {
         Config::default()
+    };
+    let session = match (args.get(3), args.get(4)) {
+        (Some(from), Some(to)) => {
+            let from: u64 = from.parse()?;
+            let to: u64 = to.parse()?;
+            if from >= to || to - from > 24 * 3_600_000 {
+                return Err("session must be an increasing range of at most 24 hours".into());
+            }
+            Some((from, to))
+        }
+        (None, None) => None,
+        _ => return Err("both session bounds are required".into()),
     };
     let mut detector = Detector::new(
         config,
@@ -65,12 +77,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut events: Vec<Event> = Vec::new();
     let mut current = None;
     let mut count = 0u64;
+    let mut session_prints = 0u64;
     let mut last_ms = 0;
     let mut line = String::new();
     let mut reader = BufReader::new(File::open(args.get(1).ok_or("CSV required")?)?);
     let started = Instant::now();
     let mut detect_time = Duration::ZERO;
     let mut process = |second: &Second, detector: &mut Detector| {
+        if seconds.len() >= 90_000 {
+            return Err("replay input exceeds the bounded one-day second book");
+        }
         let before = Instant::now();
         detector.process(second);
         detect_time += before.elapsed();
@@ -82,6 +98,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .cloned(),
         );
         seconds.push(second.clone());
+        Ok(())
     };
     while reader.read_line(&mut line)? != 0 {
         let fields: Vec<&str> = line.trim().split(',').collect();
@@ -94,10 +111,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return Err("CSV not ordered".into());
             }
             last_ms = ms;
+            if session.is_none_or(|(from, to)| ms >= from && ms < to) {
+                session_prints += 1;
+            }
             let time = ms / 1_000 * 1_000;
             if current.is_some_and(|old| old != time) {
                 for second in tape.seconds.values() {
-                    process(second, &mut detector);
+                    process(second, &mut detector)?;
                 }
                 tape.seconds.clear();
             }
@@ -117,7 +137,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         line.clear();
     }
     for second in tape.seconds.values() {
-        process(second, &mut detector);
+        process(second, &mut detector)?;
     }
     let mut samples = Vec::new();
     let mut wins = 0;
@@ -126,6 +146,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut invalid_before_entry = 0;
     let first = seconds.first().ok_or("empty archive")?.time;
     let span = seconds.last().unwrap().time - first;
+    if let Some((from, to)) = session
+        && (first > from.saturating_sub(300_000)
+            || seconds.last().unwrap().time + 999 < to + 300_000)
+    {
+        return Err("session replay requires five minutes of warm-up and outcome tail".into());
+    }
+    let (control_from, control_to) = session.unwrap_or((first, first + span));
+    let control_span = control_to - control_from;
+    events.retain(|event| {
+        session.is_none_or(|(from, to)| event.confirmed.is_some_and(|t| t >= from && t < to))
+    });
     for event in &events {
         let confirmed = event.confirmed.unwrap();
         let index = seconds.partition_point(|second| second.time + 999 < confirmed + 2_000);
@@ -147,8 +178,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             eligible += 1;
             wins += usize::from(hit);
             // Time-shifted control, retaining direction and identical dollar risk.
-            let shifted =
-                first + ((time - first + 1_200_000) % span.saturating_sub(300_000).max(1));
+            let shifted = control_from
+                + ((time.saturating_sub(control_from) + 1_200_000)
+                    % control_span.saturating_sub(300_000).max(1));
             let index = seconds
                 .partition_point(|second| second.time < shifted)
                 .min(seconds.len() - 1);
@@ -166,6 +198,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             samples.push(json!({"kind":format!("{:?}",event.kind), "bullish":event.bullish, "observed":event.observed,
                 "confirmed":confirmed, "entry_time":time, "anchor":event.price.to_f64(), "entry":entry, "risk_usd":risk,
+                "band_buy_usd":event.buy_usd,"band_sell_usd":event.sell_usd,"threshold_usd":event.threshold_usd,"pace_ratio":event.pace_ratio,
                 "target_1r_before_stop_5m":hit, "mfe_r_5m":mfe, "mae_r_5m":mae}));
         }
     }
@@ -179,7 +212,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 + s.levels.capacity() * std::mem::size_of::<(Price, Sides)>()
         })
         .sum();
-    let report = json!({"input":args[1], "config":config, "prints":count,"seconds":seconds.len(),"hours":span as f64/3_600_000.0,
+    let report = json!({"input":args[1], "config":config, "prints":count,"session_prints":session_prints,"session":session,"first_second":first,"last_second":first+span,"seconds":seconds.len(),"hours":span as f64/3_600_000.0,
         "parse_aggregate_detect_ms":started.elapsed().as_millis(),"detector_ms":detect_time.as_millis(),
         "retained_4h10m_estimated_bytes":compact_bytes,"gap_resets":detector.gap_resets,
         "signals":events.len(),"eligible_5m":eligible,"invalid_before_entry":invalid_before_entry,"publication_buffer_ms":2_000,"target_1r_before_stop_5m":wins,"shifted_control_wins":baseline_wins,

@@ -5,9 +5,30 @@ time-based footprint pane. Pane settings contain its controls. Analysis uses
 executions, not inferred candle volume. Other markets and tick/Renko/TPO charts
 do not offer this indicator yet.
 
-Confirmed absorption is enabled by default. Exhaustion is an optional
-experimental detector: its forward results were weaker, so it is disabled by
-default. This is a context indicator, not an automated entry strategy.
+The **Balanced** preset enables absorption and experimental exhaustion, using
+a $1 million activity floor and four-band confirmation. **Selective absorption**
+preserves the original absorption-only configuration. The preset picker is in
+pane settings; individual controls produce a Custom configuration. Existing
+saved settings are preserved on restart. This is a context indicator, not an
+automated entry strategy.
+
+Balanced was calibrated for a useful session frequency rather than a high
+percentage from very few marks. The
+[New York session receipt](evidence/orderflow-ny-session-2026-10-08.json) records
+the complete inputs, settings search, every assessed signal and resource checks:
+
+| NY session, 09:30–16:00 EDT | Selective marks | Balanced marks | Balanced 1R reactions / marks |
+| --- | ---: | ---: | ---: |
+| October 7, calibration | 3 | 10 | 7 / 10 |
+| October 6, comparison | 3 | 9 | 5 / 9 |
+| October 2, frozen holdout | 1 | 12 | 5 / 12 |
+
+Reactions are a 1R target reached before a 1R stop within five minutes, with the
+two-second publication delay included. The calibration result is in-sample.
+The other two sessions passed 10 of 21 versus 8 of 21 for one time-shifted
+control; evidence of an edge is weak. Fees, spread, slippage and fills are not
+modeled. Signal frequency varies with market activity; there is no daily quota.
+Exhaustion remains experimental, and losing marks are retained.
 
 ## Evidence and confirmation
 
@@ -19,9 +40,11 @@ default. This is a context indicator, not an automated entry strategy.
 - Exhaustion requires an established approach, declining aggressor volume
   through three bands toward the extreme, and a substantial fall in execution
   pace. Low total volume by itself is insufficient.
-- Both require a later rejection of at least three analysis bands by default
+- Both require a later rejection of at least four analysis bands in Balanced
   (or 15% of the three-minute range, whichever is larger), plus opposing
-  aggressive flow. Unconfirmed observations expire after 45 seconds or an
+  aggressive flow. Selective absorption uses three bands. Balanced exhaustion
+  requires at least $500,000 of prior aggressive flow and a taper from a band
+  with at least $200,000. Unconfirmed observations expire after 45 seconds or an
   invalidating extension. Same-side cooldowns suppress clusters of repeats.
 
 Squares mean absorption; diamonds mean exhaustion. Blue/positive marks expect
@@ -71,28 +94,46 @@ Runtime measurements and their limitations are in the
 The [replay receipt](evidence/orderflow-btc-replay-2026-10-08.json) contains input
 URLs, verified Binance SHA-256 checksums, configuration, every evaluated mark
 and failures. Four full archive days contain 4,051,539 aggregate executions.
-With the final default detector, 20 of 32 observations reached a 1R target
+With the original Selective absorption detector, 20 of 32 observations reached a 1R target
 before a 1R stop within five minutes; a single time-shifted control reached
 16 of 32. The entry calculation includes the two-second publication buffer.
 The frozen-detector fourth day produced four marks, three of which passed that
 criterion, including substantial reactions in both directions.
 
-These are small, selected event-study samples. They do not establish a stable
+Both sets of results are small, selected event-study samples. They do not establish a stable
 edge or profitability. Calibration used October 5; October 6 and September 30
 informed the decision to disable exhaustion by default. October 4 was evaluated
-after the detector was frozen. Fees, slippage, fill quality, and actual trade
+after the original detector was frozen. Balanced was calibrated later on October 7.
+Fees, slippage, fill quality, and actual trade
 execution are not modeled. The control is descriptive, not statistical
 qualification. Timeout and same-second ambiguous barriers count conservatively.
 
-Reproduce using an extracted Binance USD-M aggTrades CSV:
+Reproduce the original Selective results using an extracted Binance USD-M aggTrades CSV:
 
 ```powershell
-cargo run -p flowsurface-data --release --example orderflow_replay -- BTCUSDT-aggTrades-2026-10-04.csv
+cargo run -p flowsurface-data --release --example orderflow_replay -- BTCUSDT-aggTrades-2026-10-04.csv docs/presets/orderflow-selective.json
 ```
 
-An optional second argument is a JSON detector configuration, e.g.
-`{"exhaustion":true}` to inspect the experimental detector. CSV/archive files
-are not checked into Git. The replay harness calls the production detector.
+An optional second argument is a JSON detector configuration or `default`.
+Optional third and fourth arguments restrict evaluated confirmation times to
+an explicit session `[from_ms, to_ms)`; the input must include warm-up and
+five minutes of outcome data. CSV/archive files are not checked into Git.
+The replay harness calls the production detector and bounds its second book.
+
+When an official daily archive is not published yet, export existing recorder
+history with the application's actual `ServerClient` and OS-keychain token:
+
+```powershell
+cargo run --release --example orderflow_history -- https://your-recorder 1791378000000 1791403560000 session.csv
+cargo run -p flowsurface-data --release --example orderflow_replay -- session.csv default 1791379800000 1791403200000
+```
+
+The exporter refuses incomplete recorder coverage, never writes to the server,
+uses sequential 50,000-row pages with 200ms spacing, and preserves timestamp
+ties at page boundaries. It caps input at one day, two million executions and
+128 MiB of local CSV output. The session replay used about 10 MiB peak RAM;
+the live four-hour compact book remained around 3 MiB. The server recorder's
+memory peak and restart count were unchanged during the queries.
 
 ## Adding Bybit and Hyperliquid later
 

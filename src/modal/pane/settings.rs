@@ -1596,6 +1596,8 @@ pub fn kline_cfg_view<'a>(
         content = content.push(column![
             text("Absorption & Exhaustion").size(crate::style::text_size::SECTION),
             text("Binance BTC perpetuals · 4h execution history. Squares: absorption; diamonds: exhaustion. Filled marks are confirmed; faded marks broke their level within 5 minutes. Hover for evidence."),
+            text("Signal preset"),
+            pick_list(data::chart::orderflow::Preset::ALL, flow.preset(), move |preset| change(preset.config())).placeholder("Custom"),
             checkbox(flow.absorption).label("Absorption").on_toggle(move |absorption| change(data::chart::orderflow::Config { absorption, ..flow })),
             checkbox(flow.exhaustion).label("Exhaustion (experimental)").on_toggle(move |exhaustion| change(data::chart::orderflow::Config { exhaustion, ..flow })),
             checkbox(flow.show_observed).label("Show unconfirmed observations").on_toggle(move |show_observed| change(data::chart::orderflow::Config { show_observed, ..flow })),
@@ -1603,7 +1605,8 @@ pub fn kline_cfg_view<'a>(
             slider(10..=500, flow.band_ticks, move |band_ticks| change(data::chart::orderflow::Config { band_ticks, ..flow })).step(10u16),
             text(format!("Window: {} seconds", flow.window_seconds)),
             slider(5..=60, flow.window_seconds, move |window_seconds| change(data::chart::orderflow::Config { window_seconds, ..flow })),
-            text(format!("Minimum absorption: ${:.0}", flow.min_absorption_usd)),
+            text(format!("Minimum activity: ${:.0}", flow.min_absorption_usd)),
+            text("Absorption uses this floor. Exhaustion needs at least half this amount of prior aggressive flow and a volume taper."),
             slider(50_000.0..=2_000_000.0, flow.min_absorption_usd, move |min_absorption_usd| change(data::chart::orderflow::Config { min_absorption_usd, ..flow })).step(50_000.0),
             text(format!("Unusual volume threshold: {:.2}", flow.sensitivity)),
             slider(1.0..=5.0, flow.sensitivity, move |sensitivity| change(data::chart::orderflow::Config { sensitivity, ..flow })).step(0.25),
