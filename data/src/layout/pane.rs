@@ -118,6 +118,9 @@ pub struct Settings {
     pub aggregate_sources: Option<Vec<Ticker>>,
     /// Venue sources used by the independent Footprint History indicator.
     pub footprint_history_sources: Option<Vec<Ticker>>,
+    /// Independent execution sources for Absorption & Exhaustion. Old layouts
+    /// keep their original single primary venue until explicitly changed.
+    pub orderflow_sources: Option<Vec<Ticker>>,
     /// Combine selected Footprint History venues into one composite footprint.
     pub footprint_history_aggregate: bool,
     /// Venue sources used by the Open Interest indicator.

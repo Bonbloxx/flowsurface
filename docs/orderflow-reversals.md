@@ -1,12 +1,13 @@
 # Absorption & Exhaustion
 
-Enable **Absorption & Exhaustion** in a Binance **BTCUSDT perpetual** candle or
-time-based footprint pane. Analysis uses executions, not inferred candle volume.
+Enable **Absorption & Exhaustion** in a BTC perpetual candle or time-based
+footprint pane on Binance, Bybit or Hyperliquid. Analysis uses executions, not inferred candle volume.
 Other markets and tick/Renko/TPO charts do not offer this indicator yet.
 
 The current policy is **adaptive-v1**. There are no user-adjustable detection
 presets, dollar floors, sensitivity sliders or price-band widths. Settings only
-show/hide absorption, exhaustion and unconfirmed observations. Both families
+show/hide absorption, exhaustion and unconfirmed observations, and independently
+select execution venues. Both families
 are always calculated with the same automatic rules. Old saved tuning values
 still deserialize for layout compatibility but do not affect the detector.
 Automatic does not mean parameter-free: internal ratios, time windows and
@@ -132,16 +133,16 @@ four-day Daily Delta span in the current layout, through the
 existing connector and recorder coverage protocol. Binance's existing bounded
 archive/REST path fills missing coverage or supplies the range when general
 trade backfill is Off. This exception remains scoped to this Binance indicator.
-Partial history stays incomplete and retries through the existing cooldown.
+Binance-only partial history stays incomplete and retries through the existing cooldown.
 
-History is replayed in chronological minute slices inside the existing
+Binance-only history is replayed in chronological minute slices inside the existing
 10,000-trade messages. Only ten minutes of staging summaries are kept, while
 the rolling detector retains four days of signal records. Partial loads stay
 private until complete coverage succeeds. Replay and live use the same
 two-second publication buffer; previously processed seconds are immutable.
 
 Only one-second summaries and band totals are retained, not raw executions or
-a second footprint day book. The live summary book retains its existing bound
+a second footprint day book. The Binance-only live summary book retains its existing bound
 of 24 hours plus ten minutes, with **16 bands per second**. Signals retain four
 days plus ten minutes, capped at **2,048 events**. Overflowing seconds widen
 their storage grid and merge adjacent bands in place, preserving all buying
@@ -204,24 +205,56 @@ Older [Selective replay](evidence/orderflow-btc-replay-2026-10-08.json),
 receipts describe earlier policies. Reproduce from their recorded commits;
 old preset JSON does not restore the old detector in current code.
 
-## Bybit and Hyperliquid later
+## Independent Binance / Bybit / Hyperliquid aggregation
 
-The domain is venue-neutral. Runtime currently accepts Binance BTCUSDT through
-existing `TickerInfo` and trade streams. Extend through `data::aggregation` and
-recorder history with common quote-notional units and UTC seconds. Keep venue
-readiness/gaps/deduplication separate, and define an explicit price reference.
-Do not sum differently priced venue extrema or reinterpret a venue failure as
-exhaustion. No new transport, database, GUI framework or crate is needed now.
+Pane settings expose three **Execution venues** checkboxes. All seven non-empty
+combinations work, including Bybit-only and Hyperliquid-only. The last venue
+cannot be disabled. Selections persist independently of the main candle feed,
+Footprint History, Daily Delta and other indicators. Old layouts retain their
+single primary source. Existing unique-stream de-duplication shares subscriptions.
 
-Aggregation is feasible through the existing Binance/Bybit/Hyperliquid BTC feed.
-The current layout already subscribes to their trades for other surfaces, so
-subscriptions can be shared. A merged capped summary book can keep the same
-per-second band and history bounds instead of retaining three full books.
-Processing and historical transfer costs still grow with total execution count;
-an exact overhead needs measurement on the implemented aggregate path.
-Sequential recorder backfill, per-venue coverage/watermarks and reconnect
-deduplication are needed. The Binance archive fallback cannot fill Bybit or
-Hyperliquid coverage gaps. Quote-currency differences and venue price premiums
-need an explicit common reference before combining bands. These correctness
-rules are the main additional implementation work. Aggregation is not enabled
-by the four-day-history or fixed-marker presentation change.
+The first enabled venue in catalog order supplies the **reference price path**:
+Binance, then Bybit, then Hyperliquid. For each closed UTC second, another
+venue's bands are shifted by the difference between its close and the reference
+close, in exact integer price units. The reference OHLC remains unchanged;
+foreign venue premiums cannot fabricate a price extension or inflate the
+volatility bands. Side notional is preserved using each execution's native
+price and the adapter's base/quote convention. USDT and USDC notional are treated
+as nominal dollars, without a stablecoin FX feed. Seconds without reference
+executions are excluded. No future second or outcome enters this alignment.
+The detector's adaptive coefficients, marker colors and severity sizing are unchanged.
+
+Bybit and Hyperliquid historical input requires **Server** trade backfill.
+The Binance archive exception does not extend to them. Multi-venue history
+loads one hour and one venue at a time through the existing fetcher, with only
+one shared merged summary book and one current-source book. These are discarded
+after replay; only two boundary seconds carry into the next hour. Failed pages
+discard only the current source's staged book and retry with the existing
+cooldown. Final publication occurs after all selected source windows finish.
+Known gaps are explicitly displayed, excluded from detection, and restart the
+five-minute warm-up. Valid segments remain usable without claiming full coverage.
+
+Live processing waits for the slowest selected venue's timestamp, with the same
+two-second reordering buffer. A lag over ten seconds or a selected disconnect
+cancels pending observations and resets warm-up while retaining published
+signals. Per-source unprocessed summaries retain at most ten seconds; the
+merged live tail retains ten minutes. Missing venue traffic cannot masquerade
+as a fall in aggressor pace. No raw-trade store, server file, new protocol or
+dependency is added. CPU and transfer still scale with combined execution count.
+
+The [aggregation receipt](evidence/orderflow-aggregation-2026-10-08.json) records
+the frozen Binance baseline, full-evidence equality after an aggregation
+on/off round trip, independent-selection tests and native resource measurements.
+The frozen October 7 recorder export contains **1,213,267 executions and 27
+confirmed signals**. Binance-only output retains every signal timestamp,
+anchor, evidence value and severity size. This is an equivalence check, not a
+claim that aggregation improves trading hit rate.
+
+The final restarted four-day three-venue run processed **10,506,497 executions
+into 148 signals**, excluding nine reported recorder gap segments. Peak compact
+replay books were **3.00 MiB**, and the largest window-finish message took
+**12.3 ms**. Whole-app peak working set on restart was **413 MiB** with the
+preserved four-pane layout; the earlier source-switching run peaked at
+**369 MiB**. Loading took about four minutes because hourly requests run
+sequentially. Recorder peak memory did not increase. These are measured runs,
+not hard process limits; transfer and CPU scale with selected execution count.

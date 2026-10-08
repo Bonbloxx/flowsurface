@@ -86,6 +86,9 @@ impl IndicatorAvailability {
 }
 
 pub trait KlineIndicatorImpl {
+    fn orderflow_sources(&self) -> &[exchange::TickerInfo] {
+        &[]
+    }
     fn orderflow(&mut self) -> Option<&mut orderflow::OrderflowIndicator> {
         None
     }

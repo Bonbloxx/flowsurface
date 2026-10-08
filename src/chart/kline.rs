@@ -752,15 +752,30 @@ impl KlineChart {
     }
 
     pub fn orderflow_disconnected(&mut self, source: TickerInfo) {
-        if source != self.feed.primary() {
-            return;
-        }
         if let Some(indicator) = self.indicators[KlineIndicator::OrderflowReversals]
             .as_mut()
             .and_then(|indicator| indicator.orderflow())
+            .filter(|indicator| indicator.accepts(source))
         {
             self.request_handler.drop_orderflow_requests();
             indicator.continuity_lost();
+            self.chart.clear_render_caches();
+        }
+    }
+
+    pub fn orderflow_sources(&self) -> &[TickerInfo] {
+        self.indicators[KlineIndicator::OrderflowReversals]
+            .as_ref()
+            .map_or(&[], |indicator| indicator.orderflow_sources())
+    }
+
+    pub fn configure_orderflow(&mut self, sources: Vec<TickerInfo>) {
+        if let Some(indicator) = self.indicators[KlineIndicator::OrderflowReversals]
+            .as_mut()
+            .and_then(|indicator| indicator.orderflow())
+            && indicator.configure_sources(sources)
+        {
+            self.request_handler.drop_orderflow_requests();
             self.chart.clear_render_caches();
         }
     }
@@ -1347,9 +1362,9 @@ impl KlineChart {
         let indicator = self.indicators[KlineIndicator::OrderflowReversals]
             .as_mut()?
             .orderflow()?;
-        let (from, to) = indicator.plan_history(UnixMs::now())?;
+        let (source, from, to) = indicator.plan_fetch(UnixMs::now())?;
         let stream = StreamKind::Trades {
-            ticker_info: self.feed.primary(),
+            ticker_info: source,
         };
         let fetch = FetchRange::OrderflowTrades(from, to);
         let id = self
@@ -1925,8 +1940,18 @@ impl KlineChart {
         source: TickerInfo,
         missing_ranges: &[(UnixMs, UnixMs)],
     ) {
-        if self.finish_orderflow_history(req_id, false) {
-            self.request_handler.mark_failed(req_id);
+        if let Some(indicator) = self.indicators[KlineIndicator::OrderflowReversals]
+            .as_mut()
+            .and_then(|indicator| indicator.orderflow())
+            && indicator.finish_partial(req_id, missing_ranges)
+        {
+            let retry = indicator.binance_only();
+            self.chart.clear_render_caches();
+            if retry {
+                self.request_handler.mark_failed(req_id);
+            } else {
+                self.request_handler.mark_completed(req_id);
+            }
             return;
         }
         log::debug!(
@@ -1989,6 +2014,16 @@ impl KlineChart {
     /// Mark a fetch request as having no data. The source confirmed the
     /// range is empty and it should never be retried.
     pub fn mark_fetch_no_data(&mut self, req_id: uuid::Uuid) {
+        if let Some(indicator) = self.indicators[KlineIndicator::OrderflowReversals]
+            .as_mut()
+            .and_then(|indicator| indicator.orderflow())
+            .filter(|indicator| indicator.owns(req_id) && !indicator.binance_only())
+        {
+            indicator.finish(req_id, true);
+            self.chart.clear_render_caches();
+            self.request_handler.mark_completed(req_id);
+            return;
+        }
         if self.finish_orderflow_history(req_id, false) {
             self.request_handler.mark_failed(req_id);
             return;
@@ -8540,5 +8575,63 @@ mod tests {
             chart.fetch_orderflow_history().is_some(),
             "destroyed overlay cannot reuse its completed request coverage"
         );
+    }
+    #[test]
+    fn partial_orderflow_history_retries_binance_but_advances_explicit_aggregate_gaps() {
+        let source = TickerInfo::new(
+            Ticker::new("BTCUSDT", Exchange::BinanceLinear),
+            0.1,
+            0.001,
+            None,
+        );
+        let bybit = TickerInfo::new(
+            Ticker::new("BTCUSDT", Exchange::BybitLinear),
+            0.1,
+            0.001,
+            None,
+        );
+        for aggregate in [false, true] {
+            let mut chart = KlineChart::new(
+                ViewConfig::default(),
+                Basis::Time(Timeframe::M1),
+                source.min_ticksize.into(),
+                &[],
+                Vec::new(),
+                &[KlineIndicator::OrderflowReversals],
+                source,
+                &KlineChartKind::Candles,
+                None,
+            );
+            if aggregate {
+                chart.configure_orderflow(vec![source, bybit]);
+            }
+            let Action::RequestFetch(specs) = chart.fetch_orderflow_history().unwrap() else {
+                panic!("history action")
+            };
+            let spec = &specs[0];
+            let FetchRange::OrderflowTrades(from, to) = spec.fetch else {
+                panic!("dedicated range")
+            };
+            chart.finalize_partial_trade_fetch(spec.req_id, source, &[(from, to)]);
+            let status = chart.request_handler.add_request(spec.fetch, spec.stream);
+            if aggregate {
+                assert!(
+                    matches!(status, Ok(None)),
+                    "excluded source window completed"
+                );
+                let Action::RequestFetch(next) = chart.fetch_orderflow_history().unwrap() else {
+                    panic!("next source action")
+                };
+                assert_eq!(
+                    next[0].stream,
+                    Some(StreamKind::Trades { ticker_info: bybit })
+                );
+            } else {
+                assert!(
+                    matches!(status, Err(ReqError::Failed)),
+                    "Binance retains retry cooldown"
+                );
+            }
+        }
     }
 }

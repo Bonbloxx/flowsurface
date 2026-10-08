@@ -647,6 +647,11 @@ pub fn footprint_history_cfg_view(
     )
 }
 
+type OrderflowSettings = (
+    data::chart::orderflow::Config,
+    Vec<(exchange::TickerInfo, String, bool)>,
+);
+
 pub fn kline_cfg_view<'a>(
     study_config: &'a study::Configurator<FootprintStudy>,
     cfg: data::chart::kline::Config,
@@ -663,7 +668,7 @@ pub fn kline_cfg_view<'a>(
     previous_value_area: Option<u16>,
     large_trades: Option<f32>,
     large_trades_input: &'a str,
-    trade_overlays: (Option<u16>, Option<data::chart::orderflow::Config>),
+    trade_overlays: (Option<u16>, Option<OrderflowSettings>),
 ) -> Element<'a, Message> {
     let (vpvr_ticks, orderflow) = trade_overlays;
     let uses_shared_price_grid = !aggregate_sources.is_empty();
@@ -1585,7 +1590,7 @@ pub fn kline_cfg_view<'a>(
         );
     }
 
-    if let Some(flow) = orderflow {
+    if let Some((flow, sources)) = orderflow {
         let flow = flow.normalized();
         let change = move |orderflow| {
             Message::VisualConfigChanged(
@@ -1596,12 +1601,21 @@ pub fn kline_cfg_view<'a>(
         };
         content = content.push(column![
             text("Absorption & Exhaustion").size(crate::style::text_size::SECTION),
-            text("Binance BTC perpetuals · 4-day execution history. Squares: absorption; diamonds: exhaustion. Every confirmed mark keeps its original color and size, regardless of its later outcome. Hover for evidence."),
+            text("BTC perpetuals · 4-day execution history. Squares: absorption; diamonds: exhaustion. Every confirmed mark keeps its original color and size, regardless of its later outcome. Hover for evidence."),
             text("Automatic analysis adapts activity and price bands to recent executions and volatility. Detection is identical across chart timeframes and display settings; these switches only control visibility."),
             checkbox(flow.absorption).label("Show absorption").on_toggle(move |absorption| change(data::chart::orderflow::Config { absorption, ..flow })),
             checkbox(flow.exhaustion).label("Show exhaustion (experimental)").on_toggle(move |exhaustion| change(data::chart::orderflow::Config { exhaustion, ..flow })),
             checkbox(flow.show_observed).label("Show unconfirmed observations").on_toggle(move |show_observed| change(data::chart::orderflow::Config { show_observed, ..flow })),
         ].spacing(8));
+        let mut source_controls =
+            column![text("Execution venues").size(crate::style::text_size::BODY)].spacing(6);
+        for (source, label, selected) in sources {
+            source_controls =
+                source_controls.push(checkbox(selected).label(label).on_toggle(move |enabled| {
+                    Message::PaneEvent(pane, Event::OrderflowSourceToggled(source, enabled))
+                }));
+        }
+        content = content.push(source_controls).push(text("Select venues independently. Bybit and Hyperliquid history require Server backfill. Gaps are excluded; live detection waits for every selected venue. The first selected venue supplies prices; other venues' bands are aligned to it. Notional uses native USDT/USDC values."));
     }
 
     cfg_view_container(360, content)

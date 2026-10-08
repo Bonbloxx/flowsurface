@@ -237,6 +237,21 @@ fn restore_configured_liquidity_heatmap_streams(
     }
 }
 
+fn configured_orderflow_sources(
+    settings: &data::layout::pane::Settings,
+    primary: TickerInfo,
+    candidates: &[TickerInfo],
+) -> Vec<TickerInfo> {
+    let Some(id) = data::aggregation::AggregateFeedId::for_seed_ticker(primary.ticker) else {
+        return vec![primary];
+    };
+    let default = [primary.ticker];
+    let selected = settings.orderflow_sources.as_deref().unwrap_or(&default);
+    data::aggregation::ResolvedFeed::aggregated_selected(id, primary, candidates, Some(selected))
+        .sources()
+        .to_vec()
+}
+
 fn default_footprint_history_sources(available: &[TickerInfo]) -> Vec<TickerInfo> {
     let mut selected = match trade_fetch_mode() {
         // Direct Hyperliquid public history is not available. Leaving it off by
@@ -328,6 +343,7 @@ pub enum Event {
     RenkoConfigChanged(data::chart::kline::RenkoConfig),
     TpoConfigChanged(data::chart::tpo::Config),
     AggregateSourceToggled(TickerInfo, bool),
+    OrderflowSourceToggled(TickerInfo, bool),
     OpenInterestAggregationToggled(bool, Vec<TickerInfo>),
     OpenInterestSourceToggled(TickerInfo, bool),
     FootprintHistoryAggregationToggled(bool),
@@ -929,6 +945,14 @@ impl State {
             chart.configure_liquidity_heatmap(selected);
         }
 
+        if let Content::Kline {
+            chart: Some(chart), ..
+        } = &mut content
+        {
+            let sources =
+                configured_orderflow_sources(&self.settings, chart.feed().primary(), &tickers);
+            chart.configure_orderflow(sources);
+        }
         self.content = content;
         self.streams = ResolvedStream::Ready(streams.clone());
         self.sync_footprint_history_streams();
@@ -978,8 +1002,7 @@ impl State {
                 | data::chart::KlineChartKind::Renko { .. }
                 | data::chart::KlineChartKind::Tpo { .. }
         ) || matches!(chart.basis(), Basis::Tick(_))
-            || indicators.contains(&KlineIndicator::VisibleRangeProfile)
-            || indicators.contains(&KlineIndicator::OrderflowReversals);
+            || indicators.contains(&KlineIndicator::VisibleRangeProfile);
         let main_sources = if !main_uses_trades {
             Vec::new()
         } else if matches!(
@@ -990,7 +1013,7 @@ impl State {
         } else {
             vec![chart.feed().primary()]
         };
-        let indicator_sources = if has_trade_history_indicator(indicators) {
+        let mut indicator_sources = if has_trade_history_indicator(indicators) {
             if chart.footprint_history_aggregate() {
                 chart.footprint_history_sources().to_vec()
             } else {
@@ -1003,6 +1026,8 @@ impl State {
         } else {
             Vec::new()
         };
+
+        indicator_sources.extend_from_slice(chart.orderflow_sources());
 
         let ResolvedStream::Ready(streams) = &mut self.streams else {
             return;
@@ -1893,7 +1918,11 @@ impl State {
                                     .then(|| chart.visual_config().vpvr_ticks),
                                 indicators
                                     .contains(&KlineIndicator::OrderflowReversals)
-                                    .then(|| chart.visual_config().orderflow),
+                                    .then(|| (chart.visual_config().orderflow, footprint_history_available.iter().copied().filter(|source| crate::chart::indicator::kline::orderflow::OrderflowIndicator::supports(*source)).map(|source| {
+                                        let label = format!("{} · {}", source.exchange().venue(), source.ticker.display_symbol_and_type().0);
+                                        let selected = chart.orderflow_sources().contains(&source);
+                                        (source, label, selected)
+                                    }).collect())),
                             ),
                         )
                     };
@@ -2319,6 +2348,21 @@ impl State {
                 }
 
                 self.content.toggle_indicator(ind);
+                if matches!(ind, UiIndicator::Kline(KlineIndicator::OrderflowReversals)) {
+                    if let Content::Kline {
+                        chart: Some(chart), ..
+                    } = &mut self.content
+                    {
+                        let sources = configured_orderflow_sources(
+                            &self.settings,
+                            chart.feed().primary(),
+                            &available_sources,
+                        );
+                        chart.configure_orderflow(sources);
+                    }
+                    self.sync_footprint_history_streams();
+                    return Some(Effect::RefreshStreams);
+                }
                 if is_trade_history || is_visible_trades {
                     self.sync_footprint_history_streams();
                     return Some(Effect::RefreshStreams);
@@ -2398,6 +2442,37 @@ impl State {
                     c.set_tpo_config(config);
                     *kind = c.kind.clone();
                 }
+            }
+            Event::OrderflowSourceToggled(ticker_info, enabled) => {
+                let Content::Kline {
+                    chart: Some(chart), ..
+                } = &mut self.content
+                else {
+                    return None;
+                };
+                if !crate::chart::indicator::kline::orderflow::OrderflowIndicator::supports(
+                    ticker_info,
+                ) {
+                    return None;
+                }
+                let mut sources = chart.orderflow_sources().to_vec();
+                if enabled && !sources.contains(&ticker_info) {
+                    sources.push(ticker_info);
+                }
+                if !enabled {
+                    sources.retain(|source| source.ticker != ticker_info.ticker);
+                }
+                if sources.is_empty() {
+                    self.notifications.push(Toast::warn(
+                        "At least one orderflow venue must remain enabled",
+                    ));
+                    return None;
+                }
+                self.settings.orderflow_sources =
+                    Some(sources.iter().map(|source| source.ticker).collect());
+                chart.configure_orderflow(sources);
+                self.sync_footprint_history_streams();
+                return Some(Effect::RefreshStreams);
             }
             Event::AggregateSourceToggled(ticker_info, enabled) => {
                 let Content::Kline {
@@ -4483,6 +4558,107 @@ mod tests {
                 .filter(|stream| matches!(stream, StreamKind::Trades { .. }))
                 .count(),
             0
+        );
+    }
+
+    #[test]
+    fn orderflow_venue_toggles_persist_independently_and_restore_without_changing_candles() {
+        let sources = vec![
+            ticker_info(Exchange::BinanceLinear, "BTCUSDT", 0.1),
+            ticker_info(Exchange::BybitLinear, "BTCUSDT", 0.1),
+            ticker_info(Exchange::HyperliquidLinear, "BTC", 0.1),
+        ];
+        for mask in 1..8 {
+            let mut state = State::default();
+            state.set_content_and_streams(vec![sources[0]], ContentKind::CandlestickChart);
+            state.update(Event::ToggleIndicator(
+                UiIndicator::Kline(KlineIndicator::OrderflowReversals),
+                sources.clone(),
+            ));
+            let wanted = sources
+                .iter()
+                .enumerate()
+                .filter_map(|(i, source)| (mask & (1 << i) != 0).then_some(*source))
+                .collect::<Vec<_>>();
+            for &source in &wanted {
+                state.update(Event::OrderflowSourceToggled(source, true));
+            }
+            for (i, &source) in sources.iter().enumerate() {
+                if mask & (1 << i) == 0 {
+                    state.update(Event::OrderflowSourceToggled(source, false));
+                }
+            }
+            let Content::Kline {
+                chart: Some(chart), ..
+            } = &state.content
+            else {
+                panic!("chart");
+            };
+            assert_eq!(chart.orderflow_sources(), wanted);
+            assert_eq!(
+                chart.feed().sources(),
+                &sources[..1],
+                "candle identity is independent"
+            );
+            assert!(state.settings.footprint_history_sources.is_none());
+            assert!(state.settings.aggregate_sources.is_none());
+            let trades = state
+                .streams
+                .ready_iter()
+                .unwrap()
+                .filter_map(|stream| {
+                    if let StreamKind::Trades { ticker_info } = stream {
+                        Some(*ticker_info)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(trades, wanted, "only selected overlay trade streams");
+            let settings: Settings =
+                serde_json::from_str(&serde_json::to_string(&state.settings).unwrap()).unwrap();
+            assert_eq!(
+                configured_orderflow_sources(&settings, sources[0], &sources),
+                wanted
+            );
+            let last = wanted[0];
+            for &source in &wanted[1..] {
+                state.update(Event::OrderflowSourceToggled(source, false));
+            }
+            assert!(
+                state
+                    .update(Event::OrderflowSourceToggled(last, false))
+                    .is_none()
+            );
+            state.update(Event::ToggleIndicator(
+                UiIndicator::Kline(KlineIndicator::OrderflowReversals),
+                sources.clone(),
+            ));
+            assert_eq!(
+                state
+                    .streams
+                    .ready_iter()
+                    .unwrap()
+                    .filter(|stream| matches!(stream, StreamKind::Trades { .. }))
+                    .count(),
+                0
+            );
+            state.update(Event::ToggleIndicator(
+                UiIndicator::Kline(KlineIndicator::OrderflowReversals),
+                sources.clone(),
+            ));
+            let Content::Kline {
+                chart: Some(chart), ..
+            } = &state.content
+            else {
+                panic!("chart");
+            };
+            assert_eq!(chart.orderflow_sources(), &[last]);
+        }
+        let legacy: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            configured_orderflow_sources(&legacy, sources[0], &sources),
+            sources[..1]
         );
     }
 

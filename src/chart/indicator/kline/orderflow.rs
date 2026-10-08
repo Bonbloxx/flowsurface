@@ -18,6 +18,8 @@ use iced::{
     widget::canvas::{self, Path, Stroke},
 };
 use std::cell::RefCell;
+mod aggregation;
+use aggregation::Replay;
 
 struct History {
     id: uuid::Uuid,
@@ -33,6 +35,10 @@ struct History {
 
 pub struct OrderflowIndicator {
     source: Option<TickerInfo>,
+    sources: Vec<TickerInfo>,
+    watermarks: Vec<Option<u64>>,
+    source_tapes: Vec<Tape>,
+    aggregate_history: Option<Replay>,
     config: orderflow::Config,
     tape: Tape,
     detector: Option<Detector>,
@@ -47,6 +53,10 @@ impl Default for OrderflowIndicator {
     fn default() -> Self {
         Self {
             source: None,
+            sources: Vec::new(),
+            watermarks: Vec::new(),
+            source_tapes: Vec::new(),
+            aggregate_history: None,
             config: orderflow::Config::default(),
             tape: Tape::default(),
             detector: None,
@@ -61,12 +71,7 @@ impl Default for OrderflowIndicator {
 
 impl OrderflowIndicator {
     pub fn supports(source: TickerInfo) -> bool {
-        source.exchange() == Exchange::BinanceLinear
-            && source
-                .ticker
-                .to_full_symbol_and_type()
-                .0
-                .eq_ignore_ascii_case("BTCUSDT")
+        data::aggregation::AggregateFeedId::for_seed_ticker(source.ticker).is_some()
     }
     pub fn configure(&mut self, config: orderflow::Config, source: TickerInfo) {
         let config = config.normalized();
@@ -74,6 +79,10 @@ impl OrderflowIndicator {
         self.source = Some(source);
         self.config = config;
         if source_changed {
+            self.sources = vec![source];
+            self.watermarks = vec![None];
+            self.source_tapes = vec![Tape::default()];
+            self.aggregate_history = None;
             self.tape = Tape::default();
             self.history = None;
             self.covered_from = None;
@@ -125,6 +134,10 @@ impl OrderflowIndicator {
         Some((from, to))
     }
     pub fn begin_history(&mut self, id: uuid::Uuid, from: UnixMs, to: UnixMs) {
+        if let Some(replay) = self.aggregate_history.as_mut() {
+            replay.begin(id);
+            return;
+        }
         self.history = Some(History {
             id,
             from,
@@ -142,19 +155,47 @@ impl OrderflowIndicator {
         self.notice = Some("Loading 4-day execution history…".to_string());
     }
     pub fn owns(&self, id: uuid::Uuid) -> bool {
-        self.history
+        self.aggregate_history
             .as_ref()
-            .is_some_and(|history| history.id == id)
+            .is_some_and(|replay| replay.owns(id))
+            || self
+                .history
+                .as_ref()
+                .is_some_and(|history| history.id == id)
     }
     pub fn request_id(&self) -> Option<uuid::Uuid> {
-        self.history.as_ref().map(|history| history.id)
+        self.aggregate_history
+            .as_ref()
+            .and_then(|replay| replay.id)
+            .or_else(|| self.history.as_ref().map(|history| history.id))
     }
     pub fn set_handle(&mut self, id: uuid::Uuid, handle: iced::task::Handle) {
+        if let Some(replay) = self
+            .aggregate_history
+            .as_mut()
+            .filter(|replay| replay.owns(id))
+        {
+            replay.handle = Some(handle.abort_on_drop());
+            return;
+        }
         if let Some(history) = self.history.as_mut().filter(|history| history.id == id) {
             history.handle = Some(handle.abort_on_drop());
         }
     }
     pub fn stage(&mut self, id: uuid::Uuid, source: TickerInfo, trades: &[Trade]) {
+        if self
+            .aggregate_history
+            .as_ref()
+            .is_some_and(|replay| replay.owns(id))
+        {
+            let quote = self.qty_is_quote();
+            let sources = &self.sources;
+            self.aggregate_history
+                .as_mut()
+                .unwrap()
+                .stage(id, source, sources, trades, quote);
+            return;
+        }
         if self.source != Some(source) {
             return;
         }
@@ -199,6 +240,13 @@ impl OrderflowIndicator {
         }
     }
     pub fn finish(&mut self, id: uuid::Uuid, success: bool) -> bool {
+        if self
+            .aggregate_history
+            .as_ref()
+            .is_some_and(|replay| replay.owns(id))
+        {
+            return self.finish_aggregate(id, success, &[]);
+        }
         if !self.owns(id) {
             return false;
         }
@@ -248,6 +296,9 @@ impl OrderflowIndicator {
         true
     }
     pub fn insert_live(&mut self, source: TickerInfo, trades: &[Trade]) -> bool {
+        if !self.binance_only() {
+            return self.insert_aggregate_live(source, trades);
+        }
         if self.source != Some(source) || !Self::supports(source) {
             return false;
         }
@@ -268,6 +319,14 @@ impl OrderflowIndicator {
             detector.reset_continuity();
         }
         self.history = None;
+        self.aggregate_history = None;
+        self.watermarks.fill(None);
+        for tape in &mut self.source_tapes {
+            *tape = Tape::default();
+        }
+        if !self.binance_only() {
+            self.tape = Tape::default();
+        }
         self.covered_from = None;
         self.history_anchor = None;
     }
@@ -287,6 +346,9 @@ fn advance_detector(tape: &Tape, detector: &mut Detector) {
 }
 
 impl KlineIndicatorImpl for OrderflowIndicator {
+    fn orderflow_sources(&self) -> &[TickerInfo] {
+        &self.sources
+    }
     fn orderflow(&mut self) -> Option<&mut OrderflowIndicator> {
         Some(self)
     }
@@ -305,9 +367,7 @@ impl KlineIndicatorImpl for OrderflowIndicator {
     fn unavailable_message(&self, _chart: &ViewState, _indicator: &str) -> Option<String> {
         self.source
             .filter(|source| !Self::supports(*source))
-            .map(|_| {
-                "Absorption & Exhaustion currently supports Binance BTCUSDT perpetuals.".into()
-            })
+            .map(|_| "Absorption & Exhaustion supports the BTC perpetual feed catalog.".into())
     }
     fn draw_overlay(
         &self,
@@ -386,7 +446,7 @@ impl KlineIndicatorImpl for OrderflowIndicator {
             draw_text(
                 frame,
                 &notice,
-                Point::new(region.x + 8.0 / scale, region.y + 16.0 / scale),
+                Point::new(region.x + 8.0 / scale, region.y + 34.0 / scale),
                 10.0 / scale,
                 palette.background.base.text,
                 Alignment::Start,
@@ -415,13 +475,14 @@ impl KlineIndicatorImpl for OrderflowIndicator {
         };
         let labels = [
             format!(
-                "{} · {} · Binance BTC",
+                "{} · {} · {}",
                 event.label(),
                 if event.confirmed.is_some() {
                     "Confirmed"
                 } else {
                     "Observed"
-                }
+                },
+                self.source_label()
             ),
             format!(
                 "Band buys ${:.0} / sells ${:.0} · {}s",
@@ -772,7 +833,15 @@ mod tests {
             "ignored legacy settings do not cancel an automatic history load"
         );
         assert!(indicator.plan_history(UnixMs::new(21_000_000)).is_none());
-        indicator.configure(orderflow::Config::default(), source(Exchange::BybitLinear));
+        indicator.configure(
+            orderflow::Config::default(),
+            TickerInfo::new(
+                Ticker::new("ETHUSDT", Exchange::BybitLinear),
+                0.01,
+                0.001,
+                None,
+            ),
+        );
         assert!(indicator.plan_history(UnixMs::new(21_000_000)).is_none());
     }
 

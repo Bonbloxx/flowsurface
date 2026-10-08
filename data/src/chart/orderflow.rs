@@ -571,8 +571,30 @@ impl Second {
             }
         };
         self.volume.add(volume);
+        self.add_level(trade.price, volume);
+    }
+    /// Merge another venue's executed flow, aligning its closed-second price
+    /// premium in exact price units. Preserve quote notional and only this
+    /// reference venue's OHLC. No future second or published mark is consulted.
+    pub fn add_venue_flow(&mut self, other: &Self) {
+        let Some(offset) = self.last.units.checked_sub(other.last.units) else {
+            self.complete = false;
+            return;
+        };
+        self.complete &= other.complete;
+        self.storage_step.units = self.storage_step.units.max(other.storage_step.units);
+        self.volume.add(other.volume);
+        for &(price, volume) in &other.levels {
+            let Some(units) = price.units.checked_add(offset).filter(|units| *units > 0) else {
+                self.complete = false;
+                return;
+            };
+            self.add_level(Price { units }, volume);
+        }
+    }
+    fn add_level(&mut self, execution_price: Price, volume: Sides) {
         loop {
-            let price = trade.price.round_to_step(self.storage_step);
+            let price = execution_price.round_to_step(self.storage_step);
             match self
                 .levels
                 .binary_search_by_key(&price, |(price, _)| *price)

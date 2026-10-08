@@ -361,7 +361,7 @@ pub enum FetchRange {
     /// Complete executed-trade history for a visible Footprint chart range.
     /// Unlike generic seeds, this must not stop at a fixed trade-count cap.
     FootprintTrades(UnixMs, UnixMs),
-    /// Complete Binance execution replay for the bounded orderflow overlay.
+    /// Bounded execution replay for an independently selected BTC feed source.
     OrderflowTrades(UnixMs, UnixMs),
     /// Per-UTC-day trades requested by Footprint History / Daily Delta.
     FootprintHistoryTrades(UnixMs, UnixMs),
@@ -628,18 +628,13 @@ pub fn request_fetch(
                 );
                 let is_orderflow = matches!(fetch, FetchRange::OrderflowTrades(..));
                 if is_orderflow
-                    && (ticker_info.exchange() != Exchange::BinanceLinear
-                        || !ticker_info
-                            .ticker
-                            .to_full_symbol_and_type()
-                            .0
-                            .eq_ignore_ascii_case("BTCUSDT"))
+                    && data::aggregation::AggregateFeedId::for_seed_ticker(ticker_info.ticker)
+                        .is_none()
                 {
                     return Task::done(FetchUpdate::Error {
                         pane_id,
                         req_id: Some(req_id),
-                        error: "Orderflow history currently requires Binance BTC perpetuals."
-                            .into(),
+                        error: "Orderflow history requires a supported BTC perpetual feed.".into(),
                     });
                 }
                 // Reuse Binance's complete, rate-limited history path even when
@@ -649,6 +644,12 @@ pub fn request_fetch(
                 } else {
                     trade_fetch_mode()
                 };
+                if is_orderflow
+                    && ticker_info.exchange() != Exchange::BinanceLinear
+                    && mode != TradeFetchMode::Server
+                {
+                    return Task::done(FetchUpdate::Error { pane_id, req_id: Some(req_id), error: "Bybit and Hyperliquid orderflow history require Server backfill; live signals remain available.".into() });
+                }
                 let server = if is_orderflow {
                     sources
                         .server
@@ -1231,8 +1232,11 @@ fn fetch_trades_paged(
         // (TradeFetchMode::Exchange). The bounded orderflow request explicitly
         // opts into Binance gap filling to supply 24 hours even with an
         // incomplete recorder, without changing other indicators' policy.
-        let exchange_available =
-            (server.is_none() || orderflow_fallback) && supports_exchange_trade_fetch(ticker_info);
+        let binance_fallback =
+            orderflow_fallback && ticker_info.exchange() == Exchange::BinanceLinear;
+        let exchange_available = (server.is_none() || binance_fallback)
+            && supports_exchange_trade_fetch(ticker_info)
+            && (!orderflow_fallback || binance_fallback);
 
         // Durable footprint-derived caches may advance only after the whole
         // requested interval is accounted for. The recorder proves the exact
@@ -1268,7 +1272,7 @@ fn fetch_trades_paged(
                             (stored, gaps, Vec::new())
                         }
                     }
-                    Err(err) if orderflow_fallback => {
+                    Err(err) if binance_fallback => {
                         log::warn!(
                             "Orderflow recorder coverage unavailable; using Binance history: {err}"
                         );
