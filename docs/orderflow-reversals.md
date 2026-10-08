@@ -1,167 +1,191 @@
 # Absorption & Exhaustion
 
 Enable **Absorption & Exhaustion** in a Binance **BTCUSDT perpetual** candle or
-time-based footprint pane. Pane settings contain its controls. Analysis uses
-executions, not inferred candle volume. Other markets and tick/Renko/TPO charts
-do not offer this indicator yet.
+time-based footprint pane. Analysis uses executions, not inferred candle volume.
+Other markets and tick/Renko/TPO charts do not offer this indicator yet.
 
-The **Balanced** preset enables absorption and experimental exhaustion, using
-a $1 million activity floor and four-band confirmation. **Selective absorption**
-preserves the original absorption-only configuration. The preset picker is in
-pane settings; individual controls produce a Custom configuration. Existing
-saved settings are preserved on restart. This is a context indicator, not an
-automated entry strategy.
+The current policy is **adaptive-v1**. There are no user-adjustable detection
+presets, dollar floors, sensitivity sliders or price-band widths. Settings only
+show/hide absorption, exhaustion and unconfirmed observations. Both families
+are always calculated with the same automatic rules. Old saved tuning values
+still deserialize for layout compatibility but do not affect the detector.
+Automatic does not mean parameter-free: internal ratios, time windows and
+continuity rules define a versioned policy. This is a context indicator, not an
+automated entry strategy. Exhaustion remains experimental.
 
-Balanced was calibrated for a useful session frequency rather than a high
-percentage from very few marks. The
-[New York session receipt](evidence/orderflow-ny-session-2026-10-08.json) records
-the complete inputs, settings search, every assessed signal and resource checks:
+## Adaptive evidence and confirmation
 
-| NY session, 09:30–16:00 EDT | Selective marks | Balanced marks | Balanced 1R reactions / marks |
-| --- | ---: | ---: | ---: |
-| October 7, calibration | 3 | 10 | 7 / 10 |
-| October 6, comparison | 3 | 9 | 5 / 9 |
-| October 2, frozen holdout | 1 | 12 | 5 / 12 |
+- The grid follows the **preceding three-minute price range**, divided into 24
+  bands. Exchange tick precision and recent compressed-summary resolution set
+  the minimum width. There is no fixed BTC price or dollar-width floor.
+  Analysis is independent of candle timeframe, zoom and footprint display rows.
+- Activity baselines are past-only five-minute exponentially weighted means
+  and variances, separate for buying and selling. Absorption uses maximum
+  aggressor band volume; exhaustion uses three-second aggressor flow. There is
+  no minimum fixed dollar notional.
+- Absorption requires a directional approach to a three-minute extreme,
+  unusual aggressor volume (band baseline mean + two standard deviations),
+  at least 70% aggressor dominance, trading in at least three seconds there,
+  and concentration relative to surrounding flow.
+- Exhaustion requires a meaningful prior push (three-second baseline mean +
+  0.75 standard deviations), tapering through three bands toward the extreme,
+  and a **65% or greater fall** in three-second aggressor pace. A quiet market
+  or one low-volume print alone is insufficient.
+- Both require a later rejection of four observation-time bands or 15% of the
+  three-minute range, whichever is larger, plus opposing aggressive flow.
+  Exhaustion also needs **at least two opposing-flow seconds**, meaningful
+  opposing activity relative to its normal pace, and original pressure still
+  below half the prior push. Resumed original aggression blocks confirmation
+  even if price briefly bounces.
+- Unconfirmed observations expire after 45 seconds or an invalidating
+  extension. Same-side cooldowns suppress clusters. Upward and downward pushes
+  use symmetric rules. No session-specific tuning or daily quota is used.
 
-Reactions are a 1R target reached before a 1R stop within five minutes, with the
-two-second publication delay included. The calibration result is in-sample.
-The other two sessions passed 10 of 21 versus 8 of 21 for one time-shifted
-control; evidence of an edge is weak. Fees, spread, slippage and fills are not
-modeled. Signal frequency varies with market activity; there is no daily quota.
-Exhaustion remains experimental, and losing marks are retained.
-
-## Evidence and confirmation
-
-- Absorption requires an established directional approach to a three-minute
-  extreme, unusual aggressor volume concentrated in one narrow price band,
-  at least 70% aggressor dominance, repeated trading there, and concentration
-  relative to the surrounding flow. The threshold is the larger of the dollar
-  floor and a past-only five-minute adaptive volume baseline.
-- Exhaustion requires an established approach, declining aggressor volume
-  through three bands toward the extreme, and a substantial fall in execution
-  pace. Low total volume by itself is insufficient.
-- Both require a later rejection of at least four analysis bands in Balanced
-  (or 15% of the three-minute range, whichever is larger), plus opposing
-  aggressive flow. Selective absorption uses three bands. Balanced exhaustion
-  requires at least $500,000 of prior aggressive flow and a taper from a band
-  with at least $200,000. Unconfirmed observations expire after 45 seconds or an
-  invalidating extension. Same-side cooldowns suppress clusters of repeats.
+Band width, activity evidence and rejection requirements freeze at observation.
+Later volatility cannot resize old evidence. Prices and distance comparisons
+use integer exchange price units. Mirrored-trend tests and full-day
+price/activity unit rescaling produce identical sides and event timestamps;
+minimum exchange tick precision remains a physical resolution limit.
 
 Squares mean absorption; diamonds mean exhaustion. Blue/positive marks expect
 an upward reaction and red/negative marks expect a downward reaction, using the
-existing theme's orderflow colors. Filled marks have confirmed. A level breach
-within five minutes fades the mark rather than deleting it. A faded mark can
-still have produced an earlier reaction; this status is not a trade PnL result.
-Optional hollow observations have not confirmed yet.
+theme's orderflow colors. Filled marks have confirmed. A level breach within
+five minutes fades the mark rather than deleting it. Faded/white marks can still
+have produced an earlier reaction; this status is not trade PnL. Optional hollow
+observations have not confirmed yet.
 
-Markers span 18–28 screen pixels and retain that visible size when zooming.
-Absorption squares grow with aggressor notional relative to the adaptive
-threshold: 1× is smallest, 2× is halfway, and 4× or more reaches the cap.
-Exhaustion diamonds grow with the collapse in execution pace: a 65% drop is
-smallest and a 100% drop reaches the cap. Exhaustion does not use high volume
-at the extreme as a size measure, because the flow is tapering there.
-The tooltip explains each mark's sizing evidence. Size describes intensity,
-not probability or expected profit; the two shapes use different measures.
-Sizing uses evidence captured at observation and stays fixed after confirmation
-or failure. No additional market-data requests or retained trade history are
-needed for sizing.
+Markers span 18-28 screen pixels and retain that size when zooming. Absorption
+squares grow with aggressor notional relative to their adaptive threshold: 1x
+is smallest and 4x reaches the cap. Exhaustion diamonds grow with the pace
+collapse: a 65% drop is smallest and a 100% drop reaches the cap. Size describes
+intensity, not probability or profit, and stays fixed after observation.
 
-Marks sit on the **confirmation candle**, at the observed price extreme. Hover
-shows actual observation and confirmation times, side volumes, threshold,
-pace ratio and rejection distance. Confirmation uses the close of an execution
-second; live publication waits approximately two additional seconds to tolerate
-small batch reordering. Confirmed seconds are immutable. A configuration change
-recalculates the retained history; panning, chart timeframe and footprint display
-row changes do not change the detector's analysis grid.
+Marks sit on the **confirmation candle**, at the observed extreme. Hover shows
+observation/confirmation times, side volumes, adaptive threshold, pace and band
+width. Confirmation uses an execution-second close; publication waits about
+two additional seconds for small batch reordering. Visibility switches do not
+replay or refetch history. Panning and chart timeframe changes do not change
+evidence. Source changes rebuild through the existing indicator path.
 
 Executions support evidence of absorption; they cannot identify a hidden order
 or prove an iceberg without order-level data. Dollar amounts are BTCUSDT quote
 notional, normalized once from the adapter's base/quote quantity convention.
 
-## History and resource limits
+## Before/after comparison
 
-Enabling the indicator requests **24 hours plus five minutes of warm-up**.
-It uses the existing connector and recorder coverage protocol. Binance's
-existing rate-limited archive/REST path fills missing recorder coverage, or
-supplies the entire range when general trade backfill is Off. This exception
-is scoped to this bounded Binance indicator; other indicators retain their
-existing history policy. Network failures/partial history stay incomplete and
-retry with the existing cooldown. Initial direct Binance fetching can take
-longer than recorder fetching on a busy market.
+The [adaptive receipt](evidence/orderflow-adaptive-2026-10-08.json) contains
+baseline identity, verified archive checksums, 24 session comparisons, both
+families, every assessed full-day mark, rejected variants and resources.
+Six full UTC archives contain 6,357,227 aggregate executions. The baseline is
+the previous 24-hour **Balanced** detector at commit `94f735f`.
 
-The indicator retains one-second summaries and price-band totals, not raw
-executions or a second UTC-day footprint book. Retention is 24 hours plus ten
-minutes; each second has at most 32 bands, and confirmed events are capped at
-512. A band-overflow second, explicit disconnect, or silence exceeding ten
-seconds resets continuity and warm-up. Short genuine idle intervals do not
-count as exhaustion. Historical pages are staged and committed atomically;
-their overlap replaces the live book once. Fetch handles belong to this
-indicator and are cancelled on disable/grid/source changes.
+| NY session, 09:30-16:00 EDT | Previous marks | Adaptive marks | Previous 1R reactions | Adaptive 1R reactions |
+| --- | ---: | ---: | ---: | ---: |
+| September 28, separate validation | 7 | 9 | 2 / 7 | 8 / 9 |
+| September 29, separate validation | 10 | 8 | 5 / 10 | 4 / 8 |
+| October 1, development | 15 | 15 | 9 / 15 | 9 / 15 |
+| October 3, quiet weekend/development | 2 | 3 | 2 / 2 | 1 / 3 |
+| October 6, development | 9 | 10 | 5 / 9 | 6 / 10 |
+| October 7, development | 10 | 6 | 7 / 10 | 4 / 6 |
 
-Recorder loads use one shared orderflow history slot, sequential 50,000-row
-pages and a 200 ms pause per page; ingestion still yields in 10,000-trade UI
-messages. Capped pages re-fetch their final millisecond to preserve timestamp
-ties. The summary book is kept in memory and adds no raw-trade disk cache.
-The [24-hour resource receipt](evidence/orderflow-24h-resources-2026-10-08.json)
-compares the previous window with a full-day replay. Resource use depends on
-activity and analysis settings; the 32-band-per-second and 512-event caps remain.
+Reactions mean a 1R target before a 1R stop within five minutes, measured from
+an entry **after confirmation plus the two-second publication delay**.
+Same-second ambiguity and timeouts fail. Risk is distance to the observed
+extreme plus one observation-time band; risk widths differ between policies.
 
-Runtime measurements and their limitations are in the
-[verification report](evidence/orderflow-btc-verification-2026-10-08.json).
+All six NY sessions: **32/51 adaptive versus 30/53 previous** gross reactions.
+The two separate validation NY sessions: **12/17 versus 7/17**, with shifted
+controls of 7/17 and 4/17. At a hypothetical extra five-basis-point target hurdle,
+validation counts were 8/17 versus 4/17. Exhaustion alone produced 5/6 versus
+7/15 gross reactions on these two NY sessions. These are small selected samples,
+not stable hit-rate estimates.
 
-## Replay results
+Active-session usefulness is the primary comparison. Quieter periods are
+reported separately: weaker performance there is an expected operating
+limitation to assess, not automatically a detector defect. Session labels are
+for evaluation only; the detector follows observed flow without a clock-time
+gate. Execution count is an activity proxy, not a measurement of L2 liquidity.
 
-The [replay receipt](evidence/orderflow-btc-replay-2026-10-08.json) contains input
-URLs, verified Binance SHA-256 checksums, configuration, every evaluated mark
-and failures. Four full archive days contain 4,051,539 aggregate executions.
-With the original Selective absorption detector, 20 of 32 observations reached a 1R target
-before a 1R stop within five minutes; a single time-shifted control reached
-16 of 32. The entry calculation includes the two-second publication buffer.
-The frozen-detector fourth day produced four marks, three of which passed that
-criterion, including substantial reactions in both directions.
+**The wider result is mixed.** Full-day gross reactions were **91/166 adaptive
+versus 103/181 previous**. Validation full days were 26/58 versus 38/76; the
+adaptive shifted control was 27/58. Quiet-weekend frequency increased without
+better quality. This does not demonstrate universal improvement, a trading edge
+or profitability. No quota forces prints into quiet sessions. Fees, spread,
+slippage and fills are not modeled; 2/5 bps hurdles are hypothetical sensitivity
+scenarios, not net trading PnL.
 
-Both sets of results are small, selected event-study samples. They do not establish a stable
-edge or profitability. Calibration used October 5; October 6 and September 30
-informed the decision to disable exhaustion by default. October 4 was evaluated
-after the original detector was frozen. Balanced was calibrated later on October 7.
-Fees, slippage, fill quality, and actual trade
-execution are not modeled. The control is descriptive, not statistical
-qualification. Timeout and same-second ambiguous barriers count conservatively.
+Development examined 13 variants. Extra pre-observation delay made V-turns too
+rare; sustained weakening is instead checked at confirmation. Full-width outer
+bands corrected a directional boundary bias. Volume-conserving compaction
+avoids treating fast price movement as missing data. Policy coefficients froze
+before September 28/29 were inspected. Subsequent integer-price precision repairs
+changed boundary events; this table uses the corrected production result. No
+outcome-based coefficient tuning followed validation. This is not a fully
+untouched final-code holdout.
 
-Reproduce the original Selective results using an extracted Binance USD-M aggTrades CSV:
+## History and resources
+
+The indicator requests **24 hours plus five minutes of warm-up** through the
+existing connector and recorder coverage protocol. Binance's existing bounded
+archive/REST path fills missing coverage or supplies the range when general
+trade backfill is Off. This exception remains scoped to this Binance indicator.
+Partial history stays incomplete and retries through the existing cooldown.
+
+Only one-second summaries and band totals are retained, not raw executions or
+a second footprint day book. Retention is 24 hours plus ten minutes, with
+**16 bands per second and 512 confirmed events**. Overflowing seconds widen
+their storage grid and merge adjacent bands in place, preserving all buying
+and selling notional. Analysis respects the compressed resolution. Numerical
+overflow, disconnects or silence over ten seconds reset continuity and warm-up.
+Genuine idle intervals do not become exhaustion. History stages atomically.
+
+Recorder loads keep one shared history slot, sequential 50,000-row pages and
+a 200 ms pause per page. Ingestion yields in 10,000-trade UI messages. Capped
+pages re-fetch their final millisecond to preserve ties. No raw-trade disk
+cache or server-side export file is added.
+
+October 7 compact memory: **26.3 MiB versus 21.1 MiB previously**. The busier
+validation day uses 28.3 MiB. Release detector rebuilds take about 175-195 ms,
+versus roughly 60 ms previously; live summary processing p99 is 2.9-3.8
+microseconds. These are detector costs, not whole-app frame times. The 16-band
+cap lowers the estimated worst-case retained book from 77.7 to **46.5 MiB**.
+Atomic replacement can retain two books temporarily. Allocation estimates are
+not exact process bounds and are per indicator pane. Current process/runtime
+measurements are in the adaptive receipt; the
+[previous 24-hour receipt](evidence/orderflow-24h-resources-2026-10-08.json)
+provides the historical baseline.
+
+## Reproduce
+
+Using an extracted official Binance USD-M aggTrades CSV:
 
 ```powershell
-cargo run -p flowsurface-data --release --example orderflow_replay -- BTCUSDT-aggTrades-2026-10-04.csv docs/presets/orderflow-selective.json
+cargo run -p flowsurface-data --release --example orderflow_replay -- BTCUSDT-aggTrades-2026-10-07.csv default 1791379800000 1791403200000
 ```
 
-An optional second argument is a JSON detector configuration or `default`.
-Optional third and fourth arguments restrict evaluated confirmation times to
-an explicit session `[from_ms, to_ms)`; the input must include warm-up and
-five minutes of outcome data. CSV/archive files are not checked into Git.
-The replay harness calls the production detector and bounds its second book.
+Optional arguments: a legacy JSON configuration or `default`, a session
+`[from_ms,to_ms)`, then price/quantity unit scales. Legacy tuning fields are
+ignored. Include warm-up and five minutes of outcome tail. Input is capped at
+128 MiB, two million executions and 90,000 seconds; CSV/archive files are not
+committed. The harness calls production detection. Unit rescaling is diagnostic,
+not a simulation of a different real market.
 
-When an official daily archive is not published yet, export existing recorder
-history with the application's actual `ServerClient` and OS-keychain token:
+When an archive is unavailable, existing `orderflow_history` exports recorder
+coverage through `ServerClient` and OS-keychain credentials. It uses bounded
+sequential pages, rejects incomplete coverage, preserves ties and never writes
+to the server.
 
-```powershell
-cargo run --release --example orderflow_history -- https://your-recorder 1791378000000 1791403560000 session.csv
-cargo run -p flowsurface-data --release --example orderflow_replay -- session.csv default 1791379800000 1791403200000
-```
+Older [Selective replay](evidence/orderflow-btc-replay-2026-10-08.json),
+[Balanced NY](evidence/orderflow-ny-session-2026-10-08.json) and
+[runtime verification](evidence/orderflow-btc-verification-2026-10-08.json)
+receipts describe earlier policies. Reproduce from their recorded commits;
+old preset JSON does not restore the old detector in current code.
 
-The exporter refuses incomplete recorder coverage, never writes to the server,
-uses sequential 50,000-row pages with 200ms spacing, and preserves timestamp
-ties at page boundaries. It caps input at one day, two million executions and
-128 MiB of local CSV output. The session replay used about 10 MiB peak RAM;
-the live four-hour compact book remained around 3 MiB. The server recorder's
-memory peak and restart count were unchanged during the queries.
+## Bybit and Hyperliquid later
 
-## Adding Bybit and Hyperliquid later
-
-The analysis domain is venue-neutral. The first runtime explicitly accepts only
-Binance BTCUSDT and routes source identities through existing `TickerInfo` and
-trade streams. Extend it through `data::aggregation` and the existing recorder
-history, using a common BTC quote-notional grid and UTC seconds. Keep each
-venue's readiness/gaps/deduplication separate before combining volume, and
-define an explicit price reference. Do not simply sum differently priced venue
-extrema or reinterpret a venue failure as exhaustion. No additional transport,
-database, GUI framework, or crate is needed for the current implementation.
+The domain is venue-neutral. Runtime currently accepts Binance BTCUSDT through
+existing `TickerInfo` and trade streams. Extend through `data::aggregation` and
+recorder history with common quote-notional units and UTC seconds. Keep venue
+readiness/gaps/deduplication separate, and define an explicit price reference.
+Do not sum differently priced venue extrema or reinterpret a venue failure as
+exhaustion. No new transport, database, GUI framework or crate is needed now.

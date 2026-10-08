@@ -1,5 +1,5 @@
 //! Replay an immutable Binance aggTrades CSV with the production detector.
-//! Usage: cargo run -p flowsurface-data --release --example orderflow_replay -- file.csv [config.json|default] [session_from_ms session_to_ms]
+//! Usage: orderflow_replay CSV [config.json|default] [from_ms to_ms] [price_scale qty_scale]
 //! Outcomes start AFTER confirmation plus the live two-second publication buffer, not at the earlier extreme. This is a
 //! diagnostic event study; fees/slippage and portfolio execution are not modeled.
 use exchange::{
@@ -20,6 +20,7 @@ fn outcome(
     price: f64,
     bullish: bool,
     risk: f64,
+    cost_bps: f64,
 ) -> Option<(bool, f64, f64)> {
     if seconds.last()?.time < time + 300_000 {
         return None;
@@ -41,7 +42,7 @@ fn outcome(
         if hit.is_none() {
             if adverse >= risk {
                 hit = Some(false);
-            } else if favorable >= risk {
+            } else if favorable >= risk + price * cost_bps / 10_000.0 {
                 hit = Some(true);
             }
         }
@@ -68,9 +69,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         (None, None) => None,
         _ => return Err("both session bounds are required".into()),
     };
+    let price_scale: f64 = args.get(5).map_or(Ok(1.0), |s| s.parse())?;
+    let qty_scale: f64 = args.get(6).map_or(Ok(1.0), |s| s.parse())?;
+    if !price_scale.is_finite()
+        || !qty_scale.is_finite()
+        || !(0.01..=100.0).contains(&price_scale)
+        || !(0.01..=100.0).contains(&qty_scale)
+        || File::open(args.get(1).ok_or("CSV required")?)?
+            .metadata()?
+            .len()
+            > 128 * 1024 * 1024
+    {
+        return Err("bounded input and positive scales from 0.01 to 100 required".into());
+    }
     let mut detector = Detector::new(
         config,
-        PriceStep::from(exchange::unit::MinTicksize::from(0.1)),
+        PriceStep {
+            units: (Price::from_f64(0.1).units as f64 * price_scale) as i64,
+        },
     );
     let mut tape = Tape::default();
     let mut seconds = Vec::new();
@@ -125,14 +141,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             tape.insert(
                 &[Trade {
                     time: UnixMs::new(ms),
-                    price: Price::from_f64(fields[1].parse()?),
-                    qty: Qty::from_f64(fields[2].parse()?),
+                    price: Price::from_f64(fields[1].parse::<f64>()? * price_scale),
+                    qty: Qty::from_f64(fields[2].parse::<f64>()? * qty_scale),
                     is_sell: fields[6].eq_ignore_ascii_case("true"),
                 }],
                 detector.step(),
                 false,
             );
             count += 1;
+            if count > 2_000_000 {
+                return Err("two-million execution cap exceeded".into());
+            }
         }
         line.clear();
     }
@@ -169,12 +188,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             entry - event.price.to_f64()
         } else {
             event.price.to_f64() - entry
-        } + detector.step().to_f64_lossy();
+        } + event.band_width;
         if risk <= 0.0 {
             invalid_before_entry += 1;
             continue;
         }
-        if let Some((hit, mfe, mae)) = outcome(&seconds, time, entry, event.bullish, risk) {
+        if let Some((hit, mfe, mae)) = outcome(&seconds, time, entry, event.bullish, risk, 0.0) {
             eligible += 1;
             wins += usize::from(hit);
             // Time-shifted control, retaining direction and identical dollar risk.
@@ -191,6 +210,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 control.last.to_f64(),
                 event.bullish,
                 risk,
+                0.0,
             )
             .is_some_and(|o| o.0)
             {
@@ -199,13 +219,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             samples.push(json!({"kind":format!("{:?}",event.kind), "bullish":event.bullish, "observed":event.observed,
                 "confirmed":confirmed, "entry_time":time, "anchor":event.price.to_f64(), "entry":entry, "risk_usd":risk,
                 "band_buy_usd":event.buy_usd,"band_sell_usd":event.sell_usd,"threshold_usd":event.threshold_usd,"pace_ratio":event.pace_ratio,
+                "band_width":event.band_width,"activity_ratio":event.activity_ratio,
+                "confirmation_delay_ms":confirmed-event.observed,"risk_bps":risk/entry*10_000.0,
+                "mfe_bps_5m":mfe*risk/entry*10_000.0,"mae_bps_5m":mae*risk/entry*10_000.0,
+                "cost_hurdle_2bps_pass":outcome(&seconds,time,entry,event.bullish,risk,2.0).is_some_and(|o|o.0),
+                "cost_hurdle_5bps_pass":outcome(&seconds,time,entry,event.bullish,risk,5.0).is_some_and(|o|o.0),
                 "target_1r_before_stop_5m":hit, "mfe_r_5m":mfe, "mae_r_5m":mae}));
         }
     }
     let compact_bytes: usize = seconds
         .iter()
         .rev()
-        .take(15_001)
+        .take(87_001)
         .map(|s| {
             std::mem::size_of::<Second>()
                 + 64
@@ -214,7 +239,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .sum();
     let report = json!({"input":args[1], "config":config, "prints":count,"session_prints":session_prints,"session":session,"first_second":first,"last_second":first+span,"seconds":seconds.len(),"hours":span as f64/3_600_000.0,
         "parse_aggregate_detect_ms":started.elapsed().as_millis(),"detector_ms":detect_time.as_millis(),
-        "retained_4h10m_estimated_bytes":compact_bytes,"gap_resets":detector.gap_resets,
+        "retained_24h10m_estimated_bytes":compact_bytes,"gap_resets":detector.gap_resets,"price_scale":price_scale,"qty_scale":qty_scale,
         "signals":events.len(),"eligible_5m":eligible,"invalid_before_entry":invalid_before_entry,"publication_buffer_ms":2_000,"target_1r_before_stop_5m":wins,"shifted_control_wins":baseline_wins,
         "samples":samples});
     println!("{}", serde_json::to_string_pretty(&report)?);

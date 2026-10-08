@@ -69,18 +69,16 @@ impl OrderflowIndicator {
     pub fn configure(&mut self, config: orderflow::Config, source: TickerInfo) {
         let config = config.normalized();
         let source_changed = self.source != Some(source);
-        let grid_changed = self.config.band_ticks != config.band_ticks;
-        let changed = self.config != config;
         self.source = Some(source);
         self.config = config;
-        if source_changed || grid_changed {
+        if source_changed {
             self.tape = Tape::default();
             self.history = None;
             self.covered_from = None;
             self.history_anchor = None;
             self.notice = None;
         }
-        if changed || source_changed || self.detector.is_none() {
+        if source_changed || self.detector.is_none() {
             self.rebuild();
         }
     }
@@ -198,7 +196,8 @@ impl OrderflowIndicator {
         let started = std::time::Instant::now();
         self.rebuild();
         log::info!(
-            "orderflow_history source=BinanceBTC from={} to={} prints={} seconds={} compact_bytes={} replay_ms={} ingest_us={} max_chunk_us={} marks={}",
+            "orderflow_history source=BinanceBTC policy={} from={} to={} prints={} seconds={} compact_bytes={} replay_ms={} ingest_us={} max_chunk_us={} marks={}",
+            orderflow::POLICY_VERSION,
             history.from,
             history.to,
             prints,
@@ -298,6 +297,11 @@ impl KlineIndicatorImpl for OrderflowIndicator {
                 .iter()
                 .filter(|_| self.config.show_observed),
         ) {
+            if (event.kind == Kind::Absorption && !self.config.absorption)
+                || (event.kind == Kind::Exhaustion && !self.config.exhaustion)
+            {
+                continue;
+            }
             let radius = marker_radius(event) / scale;
             let time = event.confirmed.unwrap_or(event.observed);
             let x =
@@ -385,10 +389,10 @@ impl KlineIndicatorImpl for OrderflowIndicator {
                 event.buy_usd, event.sell_usd, self.config.window_seconds
             ),
             format!(
-                "Threshold ${:.0} · pace {:.0}% · rejection ${:.1}",
+                "Adaptive threshold ${:.0} · pace {:.0}% · band ${:.1}",
                 event.threshold_usd,
                 event.pace_ratio * 100.0,
-                event.rejection
+                event.band_width
             ),
             match event.kind {
                 Kind::Absorption => format!(
@@ -396,8 +400,9 @@ impl KlineIndicatorImpl for OrderflowIndicator {
                     absorption_ratio(event)
                 ),
                 Kind::Exhaustion => format!(
-                    "Size: {:.0}% pace drop · intensity, not win probability",
-                    (1.0 - event.pace_ratio) * 100.0
+                    "Size: {:.0}% pace drop · prior flow {:.1}× baseline",
+                    (1.0 - event.pace_ratio) * 100.0,
+                    event.activity_ratio
                 ),
             },
             format!(
@@ -508,6 +513,10 @@ mod tests {
             pace_ratio: 0.35,
             rejection: 20.0,
             confirmation_price: None,
+            band_width: 5.0,
+            activity_ratio: 2.0,
+            reaction_activity_usd: 100_000.0,
+            push_usd: 1_000_000.0,
         }
     }
     #[test]
@@ -617,7 +626,7 @@ mod tests {
         assert!(!indicator.finish(id, true));
     }
     #[test]
-    fn unsupported_venue_cannot_enter_a_binance_detector_and_grid_change_restarts_history() {
+    fn unsupported_venue_is_rejected_and_legacy_tuning_does_not_restart_history() {
         let mut indicator = OrderflowIndicator::default();
         let binance = source(Exchange::BinanceLinear);
         indicator.configure(orderflow::Config::default(), binance);
@@ -633,8 +642,11 @@ mod tests {
             },
             binance,
         );
-        assert!(!indicator.owns(id));
-        assert!(indicator.plan_history(UnixMs::new(21_000_000)).is_some());
+        assert!(
+            indicator.owns(id),
+            "ignored legacy settings do not cancel an automatic history load"
+        );
+        assert!(indicator.plan_history(UnixMs::new(21_000_000)).is_none());
         indicator.configure(orderflow::Config::default(), source(Exchange::BybitLinear));
         assert!(indicator.plan_history(UnixMs::new(21_000_000)).is_none());
     }
