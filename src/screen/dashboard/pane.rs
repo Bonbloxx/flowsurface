@@ -978,7 +978,8 @@ impl State {
                 | data::chart::KlineChartKind::Renko { .. }
                 | data::chart::KlineChartKind::Tpo { .. }
         ) || matches!(chart.basis(), Basis::Tick(_))
-            || indicators.contains(&KlineIndicator::VisibleRangeProfile);
+            || indicators.contains(&KlineIndicator::VisibleRangeProfile)
+            || indicators.contains(&KlineIndicator::OrderflowReversals);
         let main_sources = if !main_uses_trades {
             Vec::new()
         } else if matches!(
@@ -1886,9 +1887,14 @@ impl State {
                                 .contains(&KlineIndicator::LargeTrades)
                                 .then(|| chart.visual_config().large_trades_min_usd),
                             &self.large_trades_threshold_input,
-                            indicators
-                                .contains(&KlineIndicator::VisibleRangeProfile)
-                                .then(|| chart.visual_config().vpvr_ticks),
+                            (
+                                indicators
+                                    .contains(&KlineIndicator::VisibleRangeProfile)
+                                    .then(|| chart.visual_config().vpvr_ticks),
+                                indicators
+                                    .contains(&KlineIndicator::OrderflowReversals)
+                                    .then(|| chart.visual_config().orderflow),
+                            ),
                         )
                     };
 
@@ -3893,8 +3899,10 @@ impl Content {
 
     pub fn allows_indicator(&self, indicator: UiIndicator) -> bool {
         match (self, indicator) {
-            (Content::Kline { kind, .. }, UiIndicator::Kline(indicator)) => {
-                kind.allows_indicator(indicator)
+            (Content::Kline { kind, chart, .. }, UiIndicator::Kline(indicator)) => {
+                kind.allows_indicator(indicator) && (indicator != KlineIndicator::OrderflowReversals ||
+                    chart.as_ref().is_some_and(|chart| matches!(chart.basis(), Basis::Time(_)) &&
+                        crate::chart::indicator::kline::orderflow::OrderflowIndicator::supports(chart.feed().primary())))
             }
             (Content::Heatmap { .. } | Content::ShaderHeatmap { .. }, UiIndicator::Heatmap(_)) => {
                 true

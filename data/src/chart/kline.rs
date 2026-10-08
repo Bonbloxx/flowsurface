@@ -443,6 +443,12 @@ pub enum KlineChartKind {
 
 impl KlineChartKind {
     pub fn allows_indicator(&self, indicator: KlineIndicator) -> bool {
+        if indicator == KlineIndicator::OrderflowReversals {
+            return matches!(
+                self,
+                KlineChartKind::Candles | KlineChartKind::Footprint { .. }
+            );
+        }
         // CME session edges require the chart's timestamp-keyed OHLC source.
         // Renko/TPO are tick-indexed projections and cannot truthfully recover
         // the exact Friday close and Sunday reopen from their synthetic bars.
@@ -693,6 +699,8 @@ pub struct Config {
     pub large_trades_side: LargeTradesSide,
     /// VPVR grouping in exchange min-ticks. `1` is one price level per min tick.
     pub vpvr_ticks: u16,
+    #[serde(default, deserialize_with = "crate::util::ok_or_default")]
+    pub orderflow: super::orderflow::Config,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
@@ -799,6 +807,7 @@ impl Default for Config {
             large_trades_min_usd: Self::LARGE_TRADES_MIN_USD_DEFAULT,
             large_trades_side: LargeTradesSide::default(),
             vpvr_ticks: 10,
+            orderflow: super::orderflow::Config::default(),
         }
     }
 }
@@ -954,6 +963,32 @@ mod config_tests {
                 config: crate::chart::tpo::Config::default(),
             }
             .allows_indicator(KlineIndicator::CmeGap)
+        );
+    }
+
+    #[test]
+    fn orderflow_is_only_available_on_candles_and_footprints() {
+        let indicator = KlineIndicator::OrderflowReversals;
+        assert!(KlineChartKind::Candles.allows_indicator(indicator));
+        assert!(
+            KlineChartKind::Footprint {
+                clusters: ClusterKind::BidAsk,
+                scaling: ClusterScaling::default(),
+                studies: Vec::new()
+            }
+            .allows_indicator(indicator)
+        );
+        assert!(
+            !KlineChartKind::Renko {
+                config: RenkoConfig::default()
+            }
+            .allows_indicator(indicator)
+        );
+        assert!(
+            !KlineChartKind::Tpo {
+                config: crate::chart::tpo::Config::default()
+            }
+            .allows_indicator(indicator)
         );
     }
 }

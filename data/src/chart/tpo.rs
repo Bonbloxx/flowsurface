@@ -1192,6 +1192,7 @@ mod tests {
             large_trades_min_usd: 1_000_000.0,
             large_trades_side: LargeTradesSide::Both,
             vpvr_ticks: 10,
+            orderflow: crate::chart::orderflow::Config::default(),
         };
 
         let kind_json = serde_json::to_string(&kind).expect("serialize Renko settings");

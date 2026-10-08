@@ -1478,6 +1478,22 @@ impl Dashboard {
         }
     }
 
+    pub fn orderflow_disconnected(&mut self, streams: &[StreamKind], main_window: window::Id) {
+        self.iter_all_panes_mut(main_window)
+            .for_each(|(_, _, state)| {
+                if let pane::Content::Kline {
+                    chart: Some(chart), ..
+                } = &mut state.content
+                {
+                    for stream in streams {
+                        if let StreamKind::Trades { ticker_info } = stream {
+                            chart.orderflow_disconnected(*ticker_info);
+                        }
+                    }
+                }
+            });
+    }
+
     pub fn invalidate_all_panes(&mut self, main_window: window::Id) {
         self.iter_all_panes_mut(main_window)
             .for_each(|(_, _, state)| {

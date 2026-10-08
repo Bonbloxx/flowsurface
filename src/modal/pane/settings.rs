@@ -663,8 +663,9 @@ pub fn kline_cfg_view<'a>(
     previous_value_area: Option<u16>,
     large_trades: Option<f32>,
     large_trades_input: &'a str,
-    vpvr_ticks: Option<u16>,
+    trade_overlays: (Option<u16>, Option<data::chart::orderflow::Config>),
 ) -> Element<'a, Message> {
+    let (vpvr_ticks, orderflow) = trade_overlays;
     let uses_shared_price_grid = !aggregate_sources.is_empty();
     let data_sources: Element<'a, Message> = if aggregate_sources.is_empty() {
         column![].into()
@@ -1582,6 +1583,33 @@ pub fn kline_cfg_view<'a>(
             ]
             .spacing(8),
         );
+    }
+
+    if let Some(flow) = orderflow {
+        let change = move |orderflow| {
+            Message::VisualConfigChanged(
+                pane,
+                VisualConfig::Kline(data::chart::kline::Config { orderflow, ..cfg }),
+                false,
+            )
+        };
+        content = content.push(column![
+            text("Absorption & Exhaustion").size(crate::style::text_size::SECTION),
+            text("Binance BTC perpetuals · 4h execution history. Squares: absorption; diamonds: exhaustion. Filled marks are confirmed; faded marks broke their level within 5 minutes. Hover for evidence."),
+            checkbox(flow.absorption).label("Absorption").on_toggle(move |absorption| change(data::chart::orderflow::Config { absorption, ..flow })),
+            checkbox(flow.exhaustion).label("Exhaustion (experimental)").on_toggle(move |exhaustion| change(data::chart::orderflow::Config { exhaustion, ..flow })),
+            checkbox(flow.show_observed).label("Show unconfirmed observations").on_toggle(move |show_observed| change(data::chart::orderflow::Config { show_observed, ..flow })),
+            text(format!("Analysis band: {} minimum ticks", flow.band_ticks)),
+            slider(10..=500, flow.band_ticks, move |band_ticks| change(data::chart::orderflow::Config { band_ticks, ..flow })).step(10u16),
+            text(format!("Window: {} seconds", flow.window_seconds)),
+            slider(5..=60, flow.window_seconds, move |window_seconds| change(data::chart::orderflow::Config { window_seconds, ..flow })),
+            text(format!("Minimum absorption: ${:.0}", flow.min_absorption_usd)),
+            slider(50_000.0..=2_000_000.0, flow.min_absorption_usd, move |min_absorption_usd| change(data::chart::orderflow::Config { min_absorption_usd, ..flow })).step(50_000.0),
+            text(format!("Unusual volume threshold: {:.2}", flow.sensitivity)),
+            slider(1.0..=5.0, flow.sensitivity, move |sensitivity| change(data::chart::orderflow::Config { sensitivity, ..flow })).step(0.25),
+            text(format!("Confirmation rejection: {:.1} bands", flow.rejection_bands)),
+            slider(1.0..=6.0, flow.rejection_bands, move |rejection_bands| change(data::chart::orderflow::Config { rejection_bands, ..flow })).step(0.5),
+        ].spacing(8));
     }
 
     cfg_view_container(360, content)

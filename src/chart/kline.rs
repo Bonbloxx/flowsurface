@@ -403,7 +403,7 @@ pub struct KlineChart {
     /// Renko/TPO historical seed completed.
     trade_history_loaded: bool,
     pub(crate) kind: KlineChartKind,
-    request_handler: RequestHandler,
+    request_handler: Box<RequestHandler>,
     study_configurator: study::Configurator<FootprintStudy>,
     last_tick: Instant,
     /// Data ingestion is immediate; only expensive canvas publication is
@@ -416,7 +416,7 @@ pub struct KlineChart {
     tpo_structural_composite: Option<Box<StructuralComposite>>,
     /// UTC day used when the cached completed-session set was last evaluated.
     tpo_structural_anchor_day: u64,
-    visual_config: Config,
+    visual_config: Box<Config>,
 }
 
 impl KlineChart {
@@ -432,6 +432,7 @@ impl KlineChart {
         visual_config: Option<Config>,
     ) -> Self {
         let mut visual_config = visual_config.unwrap_or_default();
+        visual_config.orderflow = visual_config.orderflow.normalized();
         visual_config.footprint_summary_abnormal_multiplier =
             visual_config.normalized_footprint_summary_abnormal_multiplier();
         let kind = match kind.clone() {
@@ -537,6 +538,9 @@ impl KlineChart {
                         indi.set_large_trades_threshold(visual_config.large_trades_min_usd);
                         indi.set_large_trades_side(visual_config.large_trades_side);
                     }
+                    if let Some(orderflow) = indi.orderflow() {
+                        orderflow.configure(visual_config.orderflow, ticker_info);
+                    }
                     indi.rebuild_from_source(&data_source);
                     indicators[i] = Some(indi);
                 }
@@ -550,7 +554,7 @@ impl KlineChart {
                     pva_dirty: true,
                     pva_anchor_day: day_start(UnixMs::now()),
                     feed: Box::new(feed),
-                    visual_config,
+                    visual_config: Box::new(visual_config),
                     data_source,
                     raw_trades,
                     indicators: Box::new(indicators),
@@ -561,7 +565,7 @@ impl KlineChart {
                     trade_fetch_handles: Vec::new(),
                     active_trade_fetches: Box::default(),
                     trade_history_loaded: false,
-                    request_handler: RequestHandler::default(),
+                    request_handler: Box::default(),
                     kind: kind.clone(),
                     study_configurator: study::Configurator::new(),
                     last_tick: Instant::now(),
@@ -651,6 +655,9 @@ impl KlineChart {
                         indi.set_large_trades_threshold(visual_config.large_trades_min_usd);
                         indi.set_large_trades_side(visual_config.large_trades_side);
                     }
+                    if let Some(orderflow) = indi.orderflow() {
+                        orderflow.configure(visual_config.orderflow, ticker_info);
+                    }
                     indi.rebuild_from_source(&data_source);
                     indicators[i] = Some(indi);
                 }
@@ -663,7 +670,7 @@ impl KlineChart {
                     pva_dirty: true,
                     pva_anchor_day: day_start(UnixMs::now()),
                     feed: Box::new(feed),
-                    visual_config,
+                    visual_config: Box::new(visual_config),
                     data_source,
                     raw_trades,
                     tpo_klines: Box::new(tpo_klines),
@@ -675,7 +682,7 @@ impl KlineChart {
                     trade_fetch_handles: Vec::new(),
                     active_trade_fetches: Box::default(),
                     trade_history_loaded: false,
-                    request_handler: RequestHandler::default(),
+                    request_handler: Box::default(),
                     kind: kind.clone(),
                     study_configurator: study::Configurator::new(),
                     last_tick: Instant::now(),
@@ -724,6 +731,15 @@ impl KlineChart {
                 .any(|candidate| candidate.ticker.same_market(&source.ticker))
         });
         self.chart.ticker_info = feed.primary();
+        if let Some(indicator) = self.indicators[KlineIndicator::OrderflowReversals]
+            .as_mut()
+            .and_then(|indicator| indicator.orderflow())
+        {
+            if self.feed.primary() != feed.primary() {
+                self.request_handler.drop_orderflow_requests();
+            }
+            indicator.configure(self.visual_config.orderflow, feed.primary());
+        }
         *self.feed = feed;
         *self.tpo_klines = tpo_klines;
         *self.pva_klines = pva_klines;
@@ -733,6 +749,20 @@ impl KlineChart {
 
     pub fn feed(&self) -> &ResolvedFeed {
         &self.feed
+    }
+
+    pub fn orderflow_disconnected(&mut self, source: TickerInfo) {
+        if source != self.feed.primary() {
+            return;
+        }
+        if let Some(indicator) = self.indicators[KlineIndicator::OrderflowReversals]
+            .as_mut()
+            .and_then(|indicator| indicator.orderflow())
+        {
+            self.request_handler.drop_orderflow_requests();
+            indicator.continuity_lost();
+            self.chart.clear_render_caches();
+        }
     }
 
     pub fn configure_open_interest(&mut self, sources: Vec<TickerInfo>) {
@@ -1313,10 +1343,46 @@ impl KlineChart {
         None
     }
 
+    fn fetch_orderflow_history(&mut self) -> Option<Action> {
+        let indicator = self.indicators[KlineIndicator::OrderflowReversals]
+            .as_mut()?
+            .orderflow()?;
+        let (from, to) = indicator.plan_history(UnixMs::now())?;
+        let stream = StreamKind::Trades {
+            ticker_info: self.feed.primary(),
+        };
+        let fetch = FetchRange::OrderflowTrades(from, to);
+        let id = self
+            .request_handler
+            .add_request(fetch, Some(stream))
+            .ok()??;
+        indicator.begin_history(id, from, to);
+        Some(Action::RequestFetch(vec![FetchSpec {
+            req_id: id,
+            fetch,
+            stream: Some(stream),
+        }]))
+    }
+
+    fn finish_orderflow_history(&mut self, id: uuid::Uuid, success: bool) -> bool {
+        let finished = self.indicators[KlineIndicator::OrderflowReversals]
+            .as_mut()
+            .and_then(|indicator| indicator.orderflow())
+            .is_some_and(|indicator| indicator.finish(id, success));
+        if finished {
+            self.chart.clear_render_caches();
+        }
+        finished
+    }
+
     fn fetch_missing_data(&mut self) -> Option<Action> {
         // Seed the chart's own bar history before trade-history indicators.
         // CVD backfill used to take every tick and leave Renko with one 1m page.
         if let Some(action) = self.fetch_seed_klines() {
+            return Some(action);
+        }
+
+        if let Some(action) = self.fetch_orderflow_history() {
             return Some(action);
         }
 
@@ -1825,6 +1891,10 @@ impl KlineChart {
     /// Finish a successful trade-history fetch that did not already finalize
     /// via an `is_batches_done` data page (footprint gap fills often end this way).
     pub fn finalize_trade_fetch(&mut self, req_id: uuid::Uuid) {
+        if self.finish_orderflow_history(req_id, true) {
+            self.request_handler.mark_completed(req_id);
+            return;
+        }
         self.for_each_trade_history(|indicator| {
             indicator.commit_staged_source_trades(req_id);
         });
@@ -1855,6 +1925,10 @@ impl KlineChart {
         source: TickerInfo,
         missing_ranges: &[(UnixMs, UnixMs)],
     ) {
+        if self.finish_orderflow_history(req_id, false) {
+            self.request_handler.mark_failed(req_id);
+            return;
+        }
         log::debug!(
             "Finalizing partial trade history req={req_id} source={} consumers=footprint:{} daily_delta:{} cvd:{} large_trades:{}",
             source.ticker,
@@ -1896,6 +1970,10 @@ impl KlineChart {
 
     /// Mark a fetch request as failed to unblock re-fetches of the same range.
     pub fn mark_fetch_failed(&mut self, req_id: uuid::Uuid) {
+        if self.finish_orderflow_history(req_id, false) {
+            self.request_handler.mark_failed(req_id);
+            return;
+        }
         self.for_each_trade_history(|indicator| {
             indicator.discard_staged_source_trades(req_id);
         });
@@ -1911,6 +1989,10 @@ impl KlineChart {
     /// Mark a fetch request as having no data. The source confirmed the
     /// range is empty and it should never be retried.
     pub fn mark_fetch_no_data(&mut self, req_id: uuid::Uuid) {
+        if self.finish_orderflow_history(req_id, false) {
+            self.request_handler.mark_failed(req_id);
+            return;
+        }
         self.for_each_trade_history(|indicator| {
             indicator.discard_staged_source_trades(req_id);
         });
@@ -1945,6 +2027,14 @@ impl KlineChart {
     }
 
     pub fn set_handle(&mut self, req_id: uuid::Uuid, handle: Handle) {
+        if let Some(indicator) = self.indicators[KlineIndicator::OrderflowReversals]
+            .as_mut()
+            .and_then(|indicator| indicator.orderflow())
+            .filter(|indicator| indicator.owns(req_id))
+        {
+            indicator.set_handle(req_id, handle);
+            return;
+        }
         // Main visible-history requests can contain one task per selected
         // venue. Retain every handle or registering Bybit/Hyperliquid aborts
         // the Binance task that was registered immediately before it. Route
@@ -1962,6 +2052,7 @@ impl KlineChart {
     /// resolve, instead of the ranges being suppressed as pending overlaps.
     pub fn release_undispatched_requests(&mut self, ids: &[uuid::Uuid]) {
         for id in ids {
+            self.finish_orderflow_history(*id, false);
             self.for_each_trade_history(|indicator| {
                 indicator.discard_staged_source_trades(*id);
             });
@@ -2015,7 +2106,7 @@ impl KlineChart {
     }
 
     pub fn visual_config(&self) -> Config {
-        self.visual_config
+        *self.visual_config
     }
 
     pub fn set_visual_config(&mut self, visual_config: Config) {
@@ -2045,6 +2136,17 @@ impl KlineChart {
             .to_bits()
             != visual_config.liquidity_heatmap_order_size_filter.to_bits();
         let mut visual_config = visual_config;
+        visual_config.orderflow = visual_config.orderflow.normalized();
+        if self.visual_config.orderflow != visual_config.orderflow
+            && let Some(indicator) = self.indicators[KlineIndicator::OrderflowReversals]
+                .as_mut()
+                .and_then(|indicator| indicator.orderflow())
+        {
+            if self.visual_config.orderflow.band_ticks != visual_config.orderflow.band_ticks {
+                self.request_handler.drop_orderflow_requests();
+            }
+            indicator.configure(visual_config.orderflow, self.feed.primary());
+        }
         visual_config.footprint_summary_abnormal_multiplier =
             visual_config.normalized_footprint_summary_abnormal_multiplier();
         visual_config.large_trades_min_usd = visual_config.large_trades_min_usd.clamp(
@@ -2055,13 +2157,13 @@ impl KlineChart {
             != visual_config.large_trades_min_usd.to_bits();
         let large_trades_side_changed =
             self.visual_config.large_trades_side != visual_config.large_trades_side;
-        self.visual_config = visual_config;
+        *self.visual_config = visual_config;
         if lookback_changed {
             self.restart_trade_history_backfill();
         } else if pva_config_changed {
             // Letter-timeframe changes invalidate every stored bar; other knob
             // changes only need a rebuild from the existing bars.
-            self.request_handler = RequestHandler::default();
+            *self.request_handler = RequestHandler::default();
             if letter_tf_changed {
                 *self.pva_klines = KlineAggregator::new(&self.previous_value_area_feed());
             }
@@ -2326,6 +2428,10 @@ impl KlineChart {
     }
 
     pub fn insert_trades(&mut self, source: TickerInfo, buffer: &[Trade]) {
+        let orderflow_updated = self.indicators[KlineIndicator::OrderflowReversals]
+            .as_mut()
+            .and_then(|indicator| indicator.orderflow())
+            .is_some_and(|indicator| indicator.insert_live(source, buffer));
         let history_overlay_updated = self.uses_trade_history();
         if let Some(first_live) = buffer.iter().map(|trade| trade.time).min() {
             self.live_trade_starts
@@ -2339,7 +2445,7 @@ impl KlineChart {
 
         let main_uses_trades = self.wants_bucketed_trades();
         if !main_uses_trades || !self.accepts_main_trade_source(source) {
-            if history_overlay_updated {
+            if history_overlay_updated || orderflow_updated {
                 self.invalidate_live_render();
             }
             return;
@@ -2425,6 +2531,19 @@ impl KlineChart {
         is_batches_done: bool,
         req_id: Option<uuid::Uuid>,
     ) {
+        if let Some(id) = req_id
+            && let Some(indicator) = self.indicators[KlineIndicator::OrderflowReversals]
+                .as_mut()
+                .and_then(|indicator| indicator.orderflow())
+                .filter(|indicator| indicator.owns(id))
+        {
+            indicator.stage(id, source, &raw_trades);
+            if is_batches_done {
+                self.finish_orderflow_history(id, true);
+                self.request_handler.mark_completed(id);
+            }
+            return;
+        }
         if req_id.is_some_and(|id| self.footprint_history.trade_requests.contains_key(&id)) {
             if let Some(req_id) = req_id {
                 self.for_each_trade_history(|indicator| {
@@ -3066,6 +3185,14 @@ impl KlineChart {
         let prev_indi_count = self.subplot_indicator_count();
 
         if is_enabled {
+            if indicator == KlineIndicator::OrderflowReversals
+                && let Some(id) = self.indicators[indicator]
+                    .as_mut()
+                    .and_then(|indicator| indicator.orderflow())
+                    .and_then(|indicator| indicator.request_id())
+            {
+                self.request_handler.remove(id);
+            }
             self.indicators[indicator] = None;
             if indicator == KlineIndicator::LiquidityHeatmap {
                 // Drop the depth aggregator and GPU heatmap immediately when
@@ -3075,6 +3202,10 @@ impl KlineChart {
             }
         } else {
             let mut box_indi = indicator::kline::make_empty(indicator);
+            if let Some(orderflow) = box_indi.orderflow() {
+                self.request_handler.drop_orderflow_requests();
+                orderflow.configure(self.visual_config.orderflow, self.feed.primary());
+            }
             if indicator == KlineIndicator::OpenInterest {
                 box_indi.configure_open_interest(&self.open_interest_sources);
             }
@@ -3131,7 +3262,7 @@ impl KlineChart {
             }
             indicator.reset_trade_history_backfill();
         });
-        self.request_handler = RequestHandler::default();
+        *self.request_handler = RequestHandler::default();
         self.footprint_history.cutoff = None;
         self.footprint_history.trade_requests.clear();
         self.footprint_history.oi_requests.clear();
@@ -3453,6 +3584,16 @@ impl canvas::Program<Message> for KlineChart {
                     chart.tick_size,
                 );
             }
+            if let Some(indicator) = self.indicators[KlineIndicator::OrderflowReversals].as_ref() {
+                indicator.draw_overlay(
+                    frame,
+                    chart,
+                    &self.data_source,
+                    palette,
+                    region,
+                    chart.tick_size,
+                );
+            }
             if let Some(indicator) = self.indicators[KlineIndicator::VisibleRangeProfile].as_ref() {
                 let group_step = self.vpvr_group_step();
                 indicator.draw_overlay(
@@ -3529,6 +3670,18 @@ impl canvas::Program<Message> for KlineChart {
                     (cursor_position.y - bounds.height / 2.0) / chart.scaling - chart.translation.y,
                 );
                 if let Some(indicator) = self.indicators[KlineIndicator::LargeTrades].as_ref() {
+                    indicator.draw_hover(
+                        frame,
+                        chart,
+                        &self.data_source,
+                        palette,
+                        visible_region,
+                        cursor_chart,
+                    );
+                }
+                if let Some(indicator) =
+                    self.indicators[KlineIndicator::OrderflowReversals].as_ref()
+                {
                     indicator.draw_hover(
                         frame,
                         chart,
@@ -8327,5 +8480,65 @@ mod tests {
             "CVD and Large Trades history must not wait for the PVA page chain"
         );
         crate::connector::fetcher::set_trade_fetch_mode(TradeFetchMode::Off);
+    }
+
+    #[test]
+    fn orderflow_history_is_complete_window_owned_and_never_enters_candle_raw_store() {
+        let source = TickerInfo::new(
+            Ticker::new("BTCUSDT", Exchange::BinanceLinear),
+            0.1,
+            0.001,
+            None,
+        );
+        let mut chart = KlineChart::new(
+            ViewConfig::default(),
+            Basis::Time(Timeframe::M1),
+            source.min_ticksize.into(),
+            &[],
+            Vec::new(),
+            &[KlineIndicator::OrderflowReversals],
+            source,
+            &KlineChartKind::Candles,
+            None,
+        );
+        let Action::RequestFetch(specs) = chart.fetch_orderflow_history().unwrap() else {
+            panic!("history action")
+        };
+        let spec = &specs[0];
+        let FetchRange::OrderflowTrades(from, to) = spec.fetch else {
+            panic!("dedicated range")
+        };
+        assert!(to.as_u64() - from.as_u64() >= 4 * 60 * 60 * 1_000);
+        assert_eq!(
+            spec.stream,
+            Some(StreamKind::Trades {
+                ticker_info: source
+            })
+        );
+        chart.insert_raw_trades(
+            source,
+            vec![test_trade(100_000.0, 1.0, false); 10_000],
+            false,
+            Some(spec.req_id),
+        );
+        assert!(chart.raw_trades.is_empty());
+        chart.finalize_trade_fetch(spec.req_id);
+        chart.insert_trades(source, &[test_trade(100_000.0, 1.0, false)]);
+        chart.toggle_indicator(KlineIndicator::OrderflowReversals);
+        chart.insert_raw_trades(
+            source,
+            vec![test_trade(100_000.0, 1.0, false)],
+            false,
+            Some(spec.req_id),
+        );
+        assert!(
+            chart.raw_trades.is_empty(),
+            "late disabled pages must be ignored"
+        );
+        chart.toggle_indicator(KlineIndicator::OrderflowReversals);
+        assert!(
+            chart.fetch_orderflow_history().is_some(),
+            "destroyed overlay cannot reuse its completed request coverage"
+        );
     }
 }

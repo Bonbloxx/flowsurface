@@ -781,8 +781,10 @@ impl Flowsurface {
         match event {
             exchange::Event::Connected(_streams) => Task::none(),
             exchange::Event::ReplayRecovered(_streams, _from) => Task::none(),
-            exchange::Event::Disconnected(_streams, reason) => {
+            exchange::Event::Disconnected(streams, reason) => {
                 log::info!("a stream disconnected from WS: {reason:?}");
+                self.active_dashboard_mut()
+                    .orderflow_disconnected(&streams, main_window_id);
                 Task::none()
             }
             exchange::Event::DepthReceived(stream, update_t, depth) => self

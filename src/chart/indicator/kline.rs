@@ -20,6 +20,7 @@ pub mod footprint_history;
 pub mod large_trades;
 pub mod liquidity_heatmap;
 pub mod open_interest;
+pub mod orderflow;
 pub mod previous_value_area;
 pub mod volume;
 pub mod vpvr;
@@ -85,6 +86,9 @@ impl IndicatorAvailability {
 }
 
 pub trait KlineIndicatorImpl {
+    fn orderflow(&mut self) -> Option<&mut orderflow::OrderflowIndicator> {
+        None
+    }
     /// Clear all caches for a full redraw
     fn clear_all_caches(&mut self);
 
@@ -303,5 +307,6 @@ pub fn make_empty(which: KlineIndicator) -> Box<dyn KlineIndicatorImpl> {
         KlineIndicator::VisibleRangeProfile => {
             Box::new(super::kline::vpvr::VisibleRangeProfileIndicator::new())
         }
+        KlineIndicator::OrderflowReversals => Box::new(orderflow::OrderflowIndicator::default()),
     }
 }

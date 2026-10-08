@@ -271,6 +271,11 @@ impl RequestHandler {
         self.requests.remove(&id);
     }
 
+    pub fn drop_orderflow_requests(&mut self) {
+        self.requests
+            .retain(|_, request| !matches!(request.fetch_type, FetchRange::OrderflowTrades(..)));
+    }
+
     /// Mark a request as completed with no data — the source returned an
     /// empty result.  The range will never be retried.
     pub fn mark_no_data(&mut self, id: Uuid) {
@@ -289,6 +294,7 @@ impl RequestHandler {
                 request.fetch_type,
                 FetchRange::FootprintHistoryTrades(..)
                     | FetchRange::FootprintHistoryOpenInterest(..)
+                    | FetchRange::OrderflowTrades(..)
             )
         });
     }
@@ -330,6 +336,8 @@ pub enum FetchRange {
     /// Complete executed-trade history for a visible Footprint chart range.
     /// Unlike generic seeds, this must not stop at a fixed trade-count cap.
     FootprintTrades(UnixMs, UnixMs),
+    /// Complete Binance execution replay for the bounded orderflow overlay.
+    OrderflowTrades(UnixMs, UnixMs),
     /// Per-UTC-day trades requested by Footprint History / Daily Delta.
     FootprintHistoryTrades(UnixMs, UnixMs),
     /// Open-interest history requested exclusively by Footprint History.
@@ -374,6 +382,9 @@ impl FetchRequest {
             (FetchRange::FootprintTrades(s1, e1), FetchRange::FootprintTrades(s2, e2)) => {
                 e1 == e2 && s1 == s2
             }
+            (FetchRange::OrderflowTrades(s1, e1), FetchRange::OrderflowTrades(s2, e2)) => {
+                e1 == e2 && s1 == s2
+            }
             (
                 FetchRange::FootprintHistoryTrades(s1, e1),
                 FetchRange::FootprintHistoryTrades(s2, e2),
@@ -400,6 +411,7 @@ impl FetchRequest {
             | FetchRange::OpenInterest(from, to)
             | FetchRange::Trades(from, to)
             | FetchRange::FootprintTrades(from, to)
+            | FetchRange::OrderflowTrades(from, to)
             | FetchRange::FootprintHistoryTrades(from, to)
             | FetchRange::FootprintHistoryOpenInterest(from, to)
             | FetchRange::TradesRecent(from, to) => Some((*from, *to)),
@@ -573,6 +585,7 @@ pub fn request_fetch(
         }
         FetchRange::Trades(from_time, to_time)
         | FetchRange::FootprintTrades(from_time, to_time)
+        | FetchRange::OrderflowTrades(from_time, to_time)
         | FetchRange::FootprintHistoryTrades(from_time, to_time)
         | FetchRange::TradesRecent(from_time, to_time) => {
             let recent_first = matches!(fetch, FetchRange::TradesRecent(..));
@@ -588,8 +601,37 @@ pub fn request_fetch(
                         | Exchange::BybitLinear
                         | Exchange::BybitInverse
                 );
-                let mode = trade_fetch_mode();
-                let server = sources.server.clone();
+                let is_orderflow = matches!(fetch, FetchRange::OrderflowTrades(..));
+                if is_orderflow
+                    && (ticker_info.exchange() != Exchange::BinanceLinear
+                        || !ticker_info
+                            .ticker
+                            .to_full_symbol_and_type()
+                            .0
+                            .eq_ignore_ascii_case("BTCUSDT"))
+                {
+                    return Task::done(FetchUpdate::Error {
+                        pane_id,
+                        req_id: Some(req_id),
+                        error: "Orderflow history currently requires Binance BTC perpetuals."
+                            .into(),
+                    });
+                }
+                // Reuse Binance's complete, rate-limited history path even when
+                // general backfill is Off or a recorder has a coverage gap.
+                let mode = if is_orderflow && trade_fetch_mode() == TradeFetchMode::Off {
+                    TradeFetchMode::Exchange
+                } else {
+                    trade_fetch_mode()
+                };
+                let server = if is_orderflow {
+                    sources
+                        .server
+                        .clone()
+                        .filter(|_| mode == TradeFetchMode::Server)
+                } else {
+                    sources.server.clone()
+                };
                 let data_path = match ticker_info.exchange().venue() {
                     exchange::adapter::Venue::Binance => {
                         data::data_path(Some("market_data/binance/"))
@@ -635,7 +677,9 @@ pub fn request_fetch(
 
                 let is_complete_footprint = matches!(
                     fetch,
-                    FetchRange::FootprintTrades(..) | FetchRange::FootprintHistoryTrades(..)
+                    FetchRange::FootprintTrades(..)
+                        | FetchRange::FootprintHistoryTrades(..)
+                        | FetchRange::OrderflowTrades(..)
                 );
                 let (task, handle) = Task::sip(
                     fetch_trades_paged(
@@ -652,6 +696,7 @@ pub fn request_fetch(
                         // chart seeds stay bounded because they only need a useful window.
                         trade_fetch_limits(is_complete_footprint),
                         is_complete_footprint,
+                        is_orderflow,
                     ),
                     move |batch| {
                         let data = FetchedData::Trades {
@@ -780,6 +825,7 @@ fn fetch_is_dispatchable(
         }
         FetchRange::Trades(..)
         | FetchRange::FootprintTrades(..)
+        | FetchRange::OrderflowTrades(..)
         | FetchRange::FootprintHistoryTrades(..)
         | FetchRange::TradesRecent(..) => select_trade_stream(stream, ready_streams).is_some(),
     }
@@ -1114,6 +1160,7 @@ fn fetch_trades_paged(
     recent_first: bool,
     limits: Option<FetchLimits>,
     fill_exchange_gaps: bool,
+    orderflow_fallback: bool,
 ) -> impl Straw<TradeFetchOutcome, Vec<Trade>, AdapterError> {
     sipper(async move |mut progress| {
         if recent_first {
@@ -1136,12 +1183,15 @@ fn fetch_trades_paged(
             return Ok(TradeFetchOutcome::complete(had_data));
         }
 
-        // Modes are deliberately exclusive. In Server mode, recorder gaps
+        // Ordinary modes are deliberately exclusive. In Server mode, recorder gaps
         // stay explicit and uncheckpointed; they must never trigger large
         // Binance/Bybit archive downloads onto the desktop. Direct exchange
         // history is available only when no recorder client is configured
-        // (TradeFetchMode::Exchange).
-        let exchange_available = server.is_none() && supports_exchange_trade_fetch(ticker_info);
+        // (TradeFetchMode::Exchange). The bounded orderflow request explicitly
+        // opts into Binance gap filling to supply four hours even with an
+        // incomplete recorder, without changing other indicators' policy.
+        let exchange_available =
+            (server.is_none() || orderflow_fallback) && supports_exchange_trade_fetch(ticker_info);
 
         // Durable footprint-derived caches may advance only after the whole
         // requested interval is accounted for. The recorder proves the exact
@@ -1171,7 +1221,17 @@ fn fetch_trades_paged(
                             .into_iter()
                             .map(|segment| (UnixMs::new(segment.from), UnixMs::new(segment.to)))
                             .collect::<Vec<_>>();
-                        (stored, gaps, Vec::new())
+                        if exchange_available {
+                            (stored, Vec::new(), gaps)
+                        } else {
+                            (stored, gaps, Vec::new())
+                        }
+                    }
+                    Err(err) if orderflow_fallback => {
+                        log::warn!(
+                            "Orderflow recorder coverage unavailable; using Binance history: {err}"
+                        );
+                        (Vec::new(), Vec::new(), vec![(from_time, to_time)])
                     }
                     Err(err) => return Err(err),
                 }

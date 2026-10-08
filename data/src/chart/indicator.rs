@@ -23,6 +23,7 @@ pub enum KlineIndicator {
     LiquidityHeatmap,
     LargeTrades,
     VisibleRangeProfile,
+    OrderflowReversals,
 }
 
 impl Indicator for KlineIndicator {
@@ -49,7 +50,7 @@ impl KlineIndicator {
         KlineIndicator::VisibleRangeProfile,
     ];
     /// Indicators that can be used with perpetual swap market tickers
-    const FOR_PERPS: [KlineIndicator; 10] = [
+    const FOR_PERPS: [KlineIndicator; 11] = [
         KlineIndicator::Volume,
         KlineIndicator::BarAnalysis,
         KlineIndicator::CumulativeDelta,
@@ -60,6 +61,7 @@ impl KlineIndicator {
         KlineIndicator::LiquidityHeatmap,
         KlineIndicator::LargeTrades,
         KlineIndicator::VisibleRangeProfile,
+        KlineIndicator::OrderflowReversals,
     ];
 
     /// Overlay drawn on the main chart instead of a subplot row.
@@ -72,13 +74,14 @@ impl KlineIndicator {
                 | Self::LiquidityHeatmap
                 | Self::LargeTrades
                 | Self::VisibleRangeProfile
+                | Self::OrderflowReversals
         )
     }
 
     /// Overlay that needs executed trades bucketed onto the visible candles
     /// (live tape + visible-range history), without the UTC-day trade book.
     pub fn needs_visible_trades(self) -> bool {
-        matches!(self, Self::VisibleRangeProfile)
+        matches!(self, Self::VisibleRangeProfile | Self::OrderflowReversals)
     }
 
     /// Needs the shared multi-venue daily trade history pipeline.
@@ -104,6 +107,7 @@ impl Display for KlineIndicator {
             KlineIndicator::LiquidityHeatmap => write!(f, "Liquidity Heatmap"),
             KlineIndicator::LargeTrades => write!(f, "Large Trades"),
             KlineIndicator::VisibleRangeProfile => write!(f, "VPVR"),
+            KlineIndicator::OrderflowReversals => write!(f, "Absorption & Exhaustion"),
         }
     }
 }
