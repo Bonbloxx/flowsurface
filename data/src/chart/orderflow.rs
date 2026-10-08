@@ -9,11 +9,14 @@ use exchange::{
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
 
-pub const HISTORY_MS: u64 = 24 * 60 * 60 * 1_000;
+pub const HISTORY_MS: u64 = 4 * 24 * 60 * 60 * 1_000;
 pub const WARMUP_MS: u64 = 5 * 60 * 1_000;
 pub const RETENTION_MS: u64 = HISTORY_MS + 2 * WARMUP_MS;
+/// Replay streams older seconds through the detector; the live summary book
+/// keeps its existing one-day bound independently of the displayed signal span.
+pub const TAPE_RETENTION_MS: u64 = 24 * 60 * 60 * 1_000 + 2 * WARMUP_MS;
 pub const MAX_LEVELS_PER_SECOND: usize = 16;
-pub const MAX_EVENTS: usize = 512;
+pub const MAX_EVENTS: usize = 2_048;
 pub const BREAK_WINDOW_MS: u64 = 5 * 60 * 1_000;
 pub const POLICY_VERSION: &str = "adaptive-v1";
 
@@ -192,7 +195,7 @@ mod tests {
                 false,
             );
         }
-        assert!(base.seconds.len() <= (RETENTION_MS / 1_000 + 1) as usize);
+        assert!(base.seconds.len() <= (TAPE_RETENTION_MS / 1_000 + 1) as usize);
         assert!(base.estimated_bytes() < 10_000_000);
         for p in 0..100 {
             base.insert(
@@ -234,8 +237,8 @@ mod tests {
         assert_eq!(legacy.orderflow, Config::default());
     }
     #[test]
-    fn day_history_retains_old_summaries_and_marks_then_expires_them() {
-        assert_eq!(HISTORY_MS, 24 * 3_600_000);
+    fn four_day_signals_outlive_the_bounded_summary_book_then_expire() {
+        assert_eq!(HISTORY_MS, 4 * 24 * 3_600_000);
         let mut tape = Tape::default();
         let trade = Trade {
             time: UnixMs::new(0),
@@ -258,7 +261,7 @@ mod tests {
         );
         tape.insert(
             &[Trade {
-                time: UnixMs::new(RETENTION_MS + 1_000),
+                time: UnixMs::new(TAPE_RETENTION_MS + 1_000),
                 ..trade
             }],
             tick(),
@@ -276,7 +279,7 @@ mod tests {
         }
         detector.process(&second(364, 1_025.0, 100.0, true));
         let mark = detector.events()[0].observed;
-        detector.process(&second(8 * 3_600, 1_025.0, 100.0, true));
+        detector.process(&second(3 * 24 * 3_600, 1_025.0, 100.0, true));
         assert_eq!(detector.events()[0].observed, mark);
         detector.process(&second(
             (mark + RETENTION_MS) / 1_000 + 1,
@@ -286,7 +289,7 @@ mod tests {
         ));
         assert!(
             detector.events().is_empty(),
-            "old signals expire with the summary book"
+            "old signals expire at the four-day retention boundary"
         );
     }
 
@@ -648,7 +651,7 @@ impl Tape {
             self.prints += 1;
         }
         if let Some((&latest, _)) = self.seconds.last_key_value() {
-            let oldest = latest.saturating_sub(RETENTION_MS);
+            let oldest = latest.saturating_sub(TAPE_RETENTION_MS);
             while self
                 .seconds
                 .first_key_value()
@@ -843,7 +846,15 @@ impl Detector {
         self.last_time = Some(second.time);
         self.evaluated_seconds += 1;
         let now = second.time + 999;
-        for event in &mut self.events {
+        // Only the most recent five minutes can acquire an outcome. Older
+        // retained signals add no per-second work as the display span grows.
+        let break_from = second.time.saturating_sub(BREAK_WINDOW_MS);
+        for event in self
+            .events
+            .iter_mut()
+            .rev()
+            .take_while(|event| event.confirmed.is_some_and(|time| time >= break_from))
+        {
             if event.broken.is_none()
                 && event
                     .confirmed

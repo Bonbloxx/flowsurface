@@ -49,10 +49,12 @@ minimum exchange tick precision remains a physical resolution limit.
 
 Squares mean absorption; diamonds mean exhaustion. Blue/positive marks expect
 an upward reaction and red/negative marks expect a downward reaction, using the
-theme's orderflow colors. Filled marks have confirmed. A level breach within
-five minutes fades the mark rather than deleting it. Faded/white marks can still
-have produced an earlier reaction; this status is not trade PnL. Optional hollow
-observations have not confirmed yet.
+theme's orderflow colors. Filled marks have confirmed. Every confirmed mark
+keeps its original side color, fill and size, including signals whose level
+later breaks. Later outcomes never recolor, fade or delete a confirmed mark.
+Optional hollow observations have not confirmed yet. Five-minute level breaches
+remain recorded internally for analysis; they do not change chart presentation
+and are not trade PnL.
 
 Markers span 18-28 screen pixels and retain that size when zooming. Absorption
 squares grow with aggressor notional relative to their adaptive threshold: 1x
@@ -125,33 +127,54 @@ untouched final-code holdout.
 
 ## History and resources
 
-The indicator requests **24 hours plus five minutes of warm-up** through the
+The indicator requests **four days plus five minutes of warm-up**, matching the
+four-day Daily Delta span in the current layout, through the
 existing connector and recorder coverage protocol. Binance's existing bounded
 archive/REST path fills missing coverage or supplies the range when general
 trade backfill is Off. This exception remains scoped to this Binance indicator.
 Partial history stays incomplete and retries through the existing cooldown.
 
+History is replayed in chronological minute slices inside the existing
+10,000-trade messages. Only ten minutes of staging summaries are kept, while
+the rolling detector retains four days of signal records. Partial loads stay
+private until complete coverage succeeds. Replay and live use the same
+two-second publication buffer; previously processed seconds are immutable.
+
 Only one-second summaries and band totals are retained, not raw executions or
-a second footprint day book. Retention is 24 hours plus ten minutes, with
-**16 bands per second and 512 confirmed events**. Overflowing seconds widen
+a second footprint day book. The live summary book retains its existing bound
+of 24 hours plus ten minutes, with **16 bands per second**. Signals retain four
+days plus ten minutes, capped at **2,048 events**. Overflowing seconds widen
 their storage grid and merge adjacent bands in place, preserving all buying
 and selling notional. Analysis respects the compressed resolution. Numerical
 overflow, disconnects or silence over ten seconds reset continuity and warm-up.
 Genuine idle intervals do not become exhaustion. History stages atomically.
+Only signals from the last five minutes are inspected for level breaches, so
+older retained marks do not increase the per-second outcome-check cost.
 
 Recorder loads keep one shared history slot, sequential 50,000-row pages and
 a 200 ms pause per page. Ingestion yields in 10,000-trade UI messages. Capped
 pages re-fetch their final millisecond to preserve ties. No raw-trade disk
 cache or server-side export file is added.
 
-October 7 compact memory: **26.3 MiB versus 21.1 MiB previously**. The busier
+The original 24-hour adaptive replay measured October 7 compact memory at
+**26.3 MiB versus 21.1 MiB previously**. The busier
 validation day uses 28.3 MiB. Release detector rebuilds take about 175-195 ms,
 versus roughly 60 ms previously; live summary processing p99 is 2.9-3.8
 microseconds. These are detector costs, not whole-app frame times. The 16-band
 cap lowers the estimated worst-case retained book from 77.7 to **46.5 MiB**.
-Atomic replacement can retain two books temporarily. Allocation estimates are
+The four-day streaming load does not multiply that book by four: staging holds
+ten minutes plus at most one minute slice, and retained marks occupy less
+than 1 MiB at the event cap, including spare queue capacity. The existing
+one-day live book bound remains **46.5 MiB**, excluding allocator overhead.
+Allocation estimates are
 not exact process bounds and are per indicator pane. Current process/runtime
-measurements are in the adaptive receipt; the
+measurements for the four-day loader are in the
+[fixed-marker and four-day receipt](evidence/orderflow-four-day-fixed-markers-2026-10-08.json).
+The native load processed 4,192,385 executions into 113 signals, with 0.22 MiB
+of summaries after loading, 643 ms of replay work distributed across messages
+and a 5.9 ms largest ingestion/replay message. Whole-app peak working set was
+407 MiB, alongside the preserved four-pane layout. These are one-run
+measurements; the
 [previous 24-hour receipt](evidence/orderflow-24h-resources-2026-10-08.json)
 provides the historical baseline.
 
@@ -189,3 +212,16 @@ recorder history with common quote-notional units and UTC seconds. Keep venue
 readiness/gaps/deduplication separate, and define an explicit price reference.
 Do not sum differently priced venue extrema or reinterpret a venue failure as
 exhaustion. No new transport, database, GUI framework or crate is needed now.
+
+Aggregation is feasible through the existing Binance/Bybit/Hyperliquid BTC feed.
+The current layout already subscribes to their trades for other surfaces, so
+subscriptions can be shared. A merged capped summary book can keep the same
+per-second band and history bounds instead of retaining three full books.
+Processing and historical transfer costs still grow with total execution count;
+an exact overhead needs measurement on the implemented aggregate path.
+Sequential recorder backfill, per-venue coverage/watermarks and reconnect
+deduplication are needed. The Binance archive fallback cannot fill Bybit or
+Hyperliquid coverage gaps. Quote-currency differences and venue price premiums
+need an explicit common reference before combining bands. These correctness
+rules are the main additional implementation work. Aggregation is not enabled
+by the four-day-history or fixed-marker presentation change.

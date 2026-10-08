@@ -5,7 +5,7 @@ use crate::chart::{Message, ViewState};
 use data::chart::{
     Basis, PlotData,
     kline::KlineDataPoint,
-    orderflow::{self, Detector, Event, Kind, Status, Tape},
+    orderflow::{self, Detector, Event, Kind, Tape},
 };
 use exchange::{
     TickerInfo, Trade, UnixMs,
@@ -24,9 +24,11 @@ struct History {
     from: UnixMs,
     to: UnixMs,
     tape: Tape,
+    detector: Detector,
     handle: Option<iced::task::Handle>,
     ingest_us: u128,
     max_chunk_us: u128,
+    replay_us: u128,
 }
 
 pub struct OrderflowIndicator {
@@ -128,11 +130,16 @@ impl OrderflowIndicator {
             from,
             to,
             tape: Tape::default(),
+            detector: Detector::new(
+                self.config,
+                self.detector.as_ref().expect("configured detector").step(),
+            ),
             handle: None,
             ingest_us: 0,
             max_chunk_us: 0,
+            replay_us: 0,
         });
-        self.notice = Some("Loading 24h execution history…".to_string());
+        self.notice = Some("Loading 4-day execution history…".to_string());
     }
     pub fn owns(&self, id: uuid::Uuid) -> bool {
         self.history
@@ -156,27 +163,52 @@ impl OrderflowIndicator {
             return;
         };
         if let Some(history) = self.history.as_mut().filter(|history| history.id == id) {
-            // The connector owns the sequential paging cursor; this bounded
-            // staging book is published only on terminal success.
+            // The connector owns the sequential paging cursor. Replay older
+            // seconds now, but publish neither history nor marks before success.
             let started = std::time::Instant::now();
-            history.tape.insert(trades, step, qty_is_quote);
-            let us = started.elapsed().as_micros();
-            history.ingest_us += us;
-            history.max_chunk_us = history.max_chunk_us.max(us);
+            // Minute slices also bound sparse input: even a batch spanning
+            // several days cannot prune a second before it has been evaluated.
+            for minute in
+                trades.chunk_by(|a, b| a.time.as_u64() / 60_000 == b.time.as_u64() / 60_000)
+            {
+                let ingest_started = std::time::Instant::now();
+                history
+                    .tape
+                    .insert_after(minute, step, qty_is_quote, history.detector.last_time());
+                history.ingest_us += ingest_started.elapsed().as_micros();
+                let replay_started = std::time::Instant::now();
+                advance_detector(&history.tape, &mut history.detector);
+                history.replay_us += replay_started.elapsed().as_micros();
+                let oldest = history
+                    .tape
+                    .seconds
+                    .last_key_value()
+                    .map_or(0, |(&time, _)| {
+                        time.saturating_sub(2 * orderflow::WARMUP_MS)
+                    });
+                while history
+                    .tape
+                    .seconds
+                    .first_key_value()
+                    .is_some_and(|(&time, _)| time < oldest)
+                {
+                    history.tape.seconds.pop_first();
+                }
+            }
+            history.max_chunk_us = history.max_chunk_us.max(started.elapsed().as_micros());
         }
     }
     pub fn finish(&mut self, id: uuid::Uuid, success: bool) -> bool {
         if !self.owns(id) {
             return false;
         }
-        let history = self.history.take().expect("owned history");
+        let mut history = self.history.take().expect("owned history");
         if !success {
             self.notice =
                 Some("History incomplete; retrying. Live signals need warm-up.".to_string());
             return true;
         }
         let prints = history.tape.prints;
-        let seconds = history.tape.seconds.len();
         let mut tape = history.tape;
         // Historical seconds replace their live overlap authoritatively. Keep
         // the current second and newer live tail, without re-counting prints.
@@ -194,7 +226,10 @@ impl OrderflowIndicator {
         self.covered_from = Some(history.from.as_u64());
         self.notice = None;
         let started = std::time::Instant::now();
-        self.rebuild();
+        advance_detector(&self.tape, &mut history.detector);
+        let seconds = history.detector.evaluated_seconds;
+        let replay_us = history.replay_us + started.elapsed().as_micros();
+        self.detector = Some(history.detector);
         log::info!(
             "orderflow_history source=BinanceBTC policy={} from={} to={} prints={} seconds={} compact_bytes={} replay_ms={} ingest_us={} max_chunk_us={} marks={}",
             orderflow::POLICY_VERSION,
@@ -203,7 +238,7 @@ impl OrderflowIndicator {
             prints,
             seconds,
             self.tape.estimated_bytes(),
-            started.elapsed().as_millis(),
+            replay_us / 1_000,
             history.ingest_us,
             history.max_chunk_us,
             self.detector
@@ -225,18 +260,7 @@ impl OrderflowIndicator {
         // seconds at least two seconds behind the newest received timestamp.
         self.tape
             .insert_after(trades, detector.step(), qty_is_quote, detector.last_time());
-        let latest = self
-            .tape
-            .seconds
-            .last_key_value()
-            .map_or(0, |(&time, _)| time);
-        let from = detector.last_time().map_or(0, |time| time + 1);
-        if from >= latest.saturating_sub(1_000) {
-            return false;
-        }
-        for (_, second) in self.tape.seconds.range(from..latest.saturating_sub(1_000)) {
-            detector.process(second);
-        }
+        advance_detector(&self.tape, detector);
         before != detector.last_time()
     }
     pub fn continuity_lost(&mut self) {
@@ -246,6 +270,19 @@ impl OrderflowIndicator {
         self.history = None;
         self.covered_from = None;
         self.history_anchor = None;
+    }
+}
+
+/// Close complete execution seconds with the same reordering buffer in replay
+/// and live processing. A processed second and its evidence are never revisited.
+fn advance_detector(tape: &Tape, detector: &mut Detector) {
+    let latest = tape.seconds.last_key_value().map_or(0, |(&time, _)| time);
+    let from = detector.last_time().map_or(0, |time| time + 1);
+    let before = latest.saturating_sub(1_000);
+    if from < before {
+        for (_, second) in tape.seconds.range(from..before) {
+            detector.process(second);
+        }
     }
 }
 
@@ -315,13 +352,7 @@ impl KlineIndicatorImpl for OrderflowIndicator {
                 continue;
             }
             let point = Point::new(x, y);
-            let color = if event.broken.is_some() {
-                palette.background.strong.text.scale_alpha(0.45)
-            } else if event.bullish {
-                buy
-            } else {
-                sell
-            };
+            let color = if event.bullish { buy } else { sell };
             let path = match event.kind {
                 Kind::Absorption => Path::rectangle(
                     Point::new(x - radius, y - radius),
@@ -335,7 +366,7 @@ impl KlineIndicatorImpl for OrderflowIndicator {
                     builder.close();
                 }),
             };
-            if event.status() != Status::Observed {
+            if event.confirmed.is_some() {
                 frame.fill(&path, color.scale_alpha(0.85));
             }
             frame.stroke(
@@ -383,7 +414,15 @@ impl KlineIndicatorImpl for OrderflowIndicator {
             return;
         };
         let labels = [
-            format!("{} · {:?} · Binance BTC", event.label(), event.status()),
+            format!(
+                "{} · {} · Binance BTC",
+                event.label(),
+                if event.confirmed.is_some() {
+                    "Confirmed"
+                } else {
+                    "Observed"
+                }
+            ),
             format!(
                 "Band buys ${:.0} / sells ${:.0} · {}s",
                 event.buy_usd, event.sell_usd, self.config.window_seconds
@@ -572,25 +611,111 @@ mod tests {
         ));
     }
     #[test]
-    fn full_day_plus_warmup_are_requested_and_retry_keeps_identity_bounds() {
+    fn four_days_plus_warmup_are_requested_and_retry_keeps_identity_bounds() {
         let mut indicator = OrderflowIndicator::default();
         indicator.configure(
             orderflow::Config::default(),
             source(Exchange::BinanceLinear),
         );
-        let (from, to) = indicator.plan_history(UnixMs::new(120_000_000)).unwrap();
+        let (from, to) = indicator.plan_history(UnixMs::new(400_000_000)).unwrap();
         assert_eq!(
             to.as_u64() - from.as_u64() + 1,
             orderflow::HISTORY_MS + orderflow::WARMUP_MS
         );
         let id = uuid::Uuid::new_v4();
         indicator.begin_history(id, from, to);
-        assert!(indicator.plan_history(UnixMs::new(121_000_000)).is_none());
+        assert!(indicator.plan_history(UnixMs::new(401_000_000)).is_none());
         assert!(indicator.finish(id, false));
         assert_eq!(
-            indicator.plan_history(UnixMs::new(121_000_000)),
+            indicator.plan_history(UnixMs::new(401_000_000)),
             Some((from, to))
         );
+    }
+    #[test]
+    fn streamed_four_day_history_matches_unpruned_replay_with_small_or_sparse_batches() {
+        let source = source(Exchange::BinanceLinear);
+        let step = source.min_ticksize.into();
+        let mut trades = Vec::new();
+        let mut seconds = Vec::new();
+        for day in 0..4 {
+            let mut daily = Vec::new();
+            for second in 0..374 {
+                let (price, usd, is_sell) = if second < 300 {
+                    (1_000.0, 100.0, second % 2 == 0)
+                } else if second < 360 {
+                    (1_000.0 + (second - 300) as f64 * 0.6, 100.0, false)
+                } else if second < 364 {
+                    (1_040.0, 150_000.0, false)
+                } else if second < 366 {
+                    (1_025.0, 100.0, true)
+                } else {
+                    (1_047.0, 100.0, false)
+                };
+                daily.push(Trade {
+                    time: UnixMs::new(day * 86_400_000 + second * 1_000),
+                    price: Price::from_f64(price),
+                    qty: Qty::from_f64(usd / price),
+                    is_sell,
+                });
+            }
+            let mut day_tape = Tape::default();
+            day_tape.insert(&daily, step, false);
+            seconds.extend(day_tape.seconds.into_values());
+            trades.extend(daily);
+        }
+        let mut expected = Detector::new(orderflow::Config::default(), step);
+        let before = seconds.last().unwrap().time - 1_000;
+        for second in seconds.iter().filter(|second| second.time < before) {
+            expected.process(second);
+        }
+        assert_eq!(expected.events().len(), 4, "one retained signal per day");
+        let identities = |detector: &Detector| {
+            detector
+                .events()
+                .iter()
+                .map(|event| {
+                    (
+                        event.kind,
+                        event.bullish,
+                        event.observed,
+                        event.confirmed,
+                        event.broken,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        for batch_size in [37, trades.len()] {
+            let mut indicator = OrderflowIndicator::default();
+            indicator.configure(orderflow::Config::default(), source);
+            let id = uuid::Uuid::new_v4();
+            indicator.begin_history(id, UnixMs::new(0), UnixMs::new(before + 1_999));
+            for batch in trades.chunks(batch_size) {
+                indicator.stage(id, source, batch);
+                assert!(
+                    indicator.detector.as_ref().unwrap().events().is_empty(),
+                    "staged signals stay private until complete coverage succeeds"
+                );
+                assert!(indicator.history.as_ref().unwrap().tape.seconds.len() <= 601);
+            }
+            assert!(indicator.finish(id, true));
+            assert_eq!(
+                identities(indicator.detector.as_ref().unwrap()),
+                identities(&expected)
+            );
+            assert!(indicator.tape.seconds.len() <= 601);
+            assert!(
+                indicator
+                    .detector
+                    .as_ref()
+                    .unwrap()
+                    .events()
+                    .front()
+                    .unwrap()
+                    .observed
+                    < *indicator.tape.seconds.first_key_value().unwrap().0,
+                "older signals survive after their execution summaries are discarded"
+            );
+        }
     }
     #[test]
     fn historical_overlap_replaces_live_once_and_partial_fetch_is_not_published() {

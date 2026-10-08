@@ -1,0 +1,333 @@
+{
+  "created_at_utc": "2026-10-08T10:55:44.300110+00:00",
+  "baseline_commit": "6b51a9490225080aa1160898e22a822cac86cbbb",
+  "policy": "adaptive-v1",
+  "scope": [
+    "Outcome-independent confirmed marker colors, fill and hover label",
+    "Existing severity sizing retained",
+    "Four-day lookback matching current Daily Delta setting",
+    "Bounded streaming history replay"
+  ],
+  "detector_thresholds_changed": false,
+  "history": {
+    "source": "BinanceBTC",
+    "policy": "adaptive-v1",
+    "from": 1791110560000,
+    "to": 1791456459999,
+    "prints": 4192385,
+    "seconds": 326443,
+    "compact_bytes": 226400,
+    "replay_ms": 643,
+    "ingest_us": 268698,
+    "max_chunk_us": 5886,
+    "marks": 113
+  },
+  "history_range_utc": {
+    "from": "2026-10-04T10:42:40+00:00",
+    "to": "2026-10-08T10:47:39.999000+00:00"
+  },
+  "native": {
+    "pid": 73844,
+    "binary_sha256": "19f58891276e7ff8324236555ce5c1b136e0d6d24e4b1f9510c0490139d89264",
+    "samples": [
+      {
+        "utc": "2026-10-08T10:48:11.5015912Z",
+        "pid": 73844,
+        "responding": true,
+        "working_set_bytes": 352010240,
+        "peak_working_set_bytes": 427118592,
+        "cpu_seconds": 16.234375
+      },
+      {
+        "utc": "2026-10-08T10:48:15.5532927Z",
+        "pid": 73844,
+        "responding": true,
+        "working_set_bytes": 353169408,
+        "peak_working_set_bytes": 427118592,
+        "cpu_seconds": 18.171875
+      },
+      {
+        "utc": "2026-10-08T10:48:19.5803172Z",
+        "pid": 73844,
+        "responding": true,
+        "working_set_bytes": 344023040,
+        "peak_working_set_bytes": 427118592,
+        "cpu_seconds": 20.140625
+      },
+      {
+        "utc": "2026-10-08T10:48:23.5973425Z",
+        "pid": 73844,
+        "responding": true,
+        "working_set_bytes": 357392384,
+        "peak_working_set_bytes": 427118592,
+        "cpu_seconds": 22.015625
+      },
+      {
+        "utc": "2026-10-08T10:48:27.6178822Z",
+        "pid": 73844,
+        "responding": true,
+        "working_set_bytes": 354963456,
+        "peak_working_set_bytes": 427118592,
+        "cpu_seconds": 23.546875
+      },
+      {
+        "utc": "2026-10-08T10:48:31.6424768Z",
+        "pid": 73844,
+        "responding": true,
+        "working_set_bytes": 355471360,
+        "peak_working_set_bytes": 427118592,
+        "cpu_seconds": 24.84375
+      },
+      {
+        "utc": "2026-10-08T10:48:35.6650363Z",
+        "pid": 73844,
+        "responding": true,
+        "working_set_bytes": 355536896,
+        "peak_working_set_bytes": 427118592,
+        "cpu_seconds": 25.6875
+      },
+      {
+        "utc": "2026-10-08T10:48:39.6795598Z",
+        "pid": 73844,
+        "responding": true,
+        "working_set_bytes": 358371328,
+        "peak_working_set_bytes": 427118592,
+        "cpu_seconds": 26.9375
+      },
+      {
+        "utc": "2026-10-08T10:48:43.6950033Z",
+        "pid": 73844,
+        "responding": true,
+        "working_set_bytes": 358375424,
+        "peak_working_set_bytes": 427118592,
+        "cpu_seconds": 28.171875
+      },
+      {
+        "utc": "2026-10-08T10:48:47.7052333Z",
+        "pid": 73844,
+        "responding": true,
+        "working_set_bytes": 358367232,
+        "peak_working_set_bytes": 427118592,
+        "cpu_seconds": 29.34375
+      },
+      {
+        "utc": "2026-10-08T10:48:51.7274089Z",
+        "pid": 73844,
+        "responding": true,
+        "working_set_bytes": 350195712,
+        "peak_working_set_bytes": 427118592,
+        "cpu_seconds": 30.875
+      },
+      {
+        "utc": "2026-10-08T10:48:55.7483050Z",
+        "pid": 73844,
+        "responding": true,
+        "working_set_bytes": 350199808,
+        "peak_working_set_bytes": 427118592,
+        "cpu_seconds": 32.484375
+      }
+    ],
+    "responsive_in_all_samples": true,
+    "peak_working_set_bytes": 427118592,
+    "preserved_layout_and_visibility": true,
+    "layout_signature": {
+      "active_layout": "Layout 1",
+      "charts": [
+        {
+          "kind": {
+            "Footprint": {
+              "clusters": "BidAsk",
+              "scaling": "Datapoint",
+              "studies": []
+            }
+          },
+          "indicators": [],
+          "basis": {
+            "Time": "M1"
+          },
+          "aggregate_sources": [
+            "BybitLinear:BTCUSDT",
+            "HyperliquidLinear:BTC",
+            "BinanceLinear:BTCUSDT"
+          ],
+          "footprint_history_sources": null,
+          "daily_delta_days": 4,
+          "visibility": {
+            "absorption": true,
+            "exhaustion": false,
+            "show_observed": false
+          }
+        },
+        {
+          "kind": "Candles",
+          "indicators": [
+            "PreviousValueArea",
+            "DailyDelta",
+            "VisibleRangeProfile",
+            "OrderflowReversals"
+          ],
+          "basis": {
+            "Time": "M1"
+          },
+          "aggregate_sources": null,
+          "footprint_history_sources": [
+            "BinanceLinear:BTCUSDT",
+            "BybitLinear:BTCUSDT",
+            "HyperliquidLinear:BTC"
+          ],
+          "daily_delta_days": 4,
+          "visibility": {
+            "absorption": true,
+            "exhaustion": true,
+            "show_observed": false
+          }
+        },
+        {
+          "kind": {
+            "Tpo": {
+              "config": {
+                "profile_period": "Day",
+                "block_size": "Minutes30",
+                "ticks_per_row": 250,
+                "session_start_minutes_utc": 0,
+                "value_area_percent": 70,
+                "initial_balance_blocks": 2,
+                "profiles_to_load": 150,
+                "display_style": "Blocks",
+                "show_poc": true,
+                "show_value_area": true,
+                "show_initial_balance": true,
+                "show_single_prints": true,
+                "show_three_day_composite": false
+              }
+            }
+          },
+          "indicators": [],
+          "basis": {
+            "Tick": 1
+          },
+          "aggregate_sources": [
+            "BinanceLinear:BTCUSDT",
+            "HyperliquidLinear:BTC",
+            "BybitLinear:BTCUSDT"
+          ],
+          "footprint_history_sources": null,
+          "daily_delta_days": null,
+          "visibility": {
+            "absorption": null,
+            "exhaustion": null,
+            "show_observed": null
+          }
+        },
+        {
+          "kind": {
+            "Renko": {
+              "config": {
+                "brick_size": 200,
+                "reversal": 2,
+                "normalization_ms": 250
+              }
+            }
+          },
+          "indicators": [
+            "PreviousValueArea"
+          ],
+          "basis": {
+            "Tick": 1
+          },
+          "aggregate_sources": null,
+          "footprint_history_sources": [
+            "BinanceLinear:BTCUSDT",
+            "BybitLinear:BTCUSDT",
+            "HyperliquidLinear:BTC"
+          ],
+          "daily_delta_days": 4,
+          "visibility": {
+            "absorption": true,
+            "exhaustion": false,
+            "show_observed": false
+          }
+        }
+      ]
+    },
+    "formerly_grey_example": {
+      "kind": "Selling exhaustion",
+      "observed_utc": "2026-10-08T08:22:50Z",
+      "confirmed_utc": "2026-10-08T08:22:57Z",
+      "band_usd": 3.2,
+      "pace_drop_percent": 99,
+      "prior_flow_baseline_ratio": 2.7,
+      "rendered": "Filled blue diamond, unchanged severity size and Confirmed hover label",
+      "previous_evidence": "orderflow-adaptive-2026-10-08.json native footprint check recorded the same signal as Broken"
+    },
+    "zoom_check": "Markers keep screen severity sizes and side colors while zooming; existing OHLC fetch path supplies chart candles",
+    "candidate_note": "Native build includes preserved unrelated working-tree edits; commit stages only owned indicator changes"
+  },
+  "checks": {
+    "workspace_release_tests_passed": 397,
+    "preexisting_manual_benchmarks_ignored": 11,
+    "format": "passed",
+    "clippy_workspace_all_targets_all_features_release_deny_warnings": "passed",
+    "release_build": "passed",
+    "streaming_equivalence": "Four days of retained signals equal unpruned reference replay under 37-print chunks and a sparse whole-history batch; incomplete staging remains private; published seconds immutable"
+  },
+  "bounds": {
+    "signal_history_ms": 346200000,
+    "max_signals": 2048,
+    "live_summary_retention_ms": 87000000,
+    "max_bands_per_second": 16,
+    "staging_summary_retention_ms": 600000,
+    "staging_processing_slice_ms": 60000,
+    "history_ui_batch_trades": 10000,
+    "recorder_page_trades": 50000,
+    "shared_history_concurrency": 1,
+    "live_summary_worst_estimated_bytes": 48720560,
+    "raw_trades_retained": 0
+  },
+  "server_read_only_snapshot": {
+    "active": true,
+    "pid": 3618222,
+    "restarts": 0,
+    "memory_current_bytes": 798896128,
+    "memory_peak_bytes": 806268928,
+    "memory_peak_change_from_prior_receipt_bytes": 0,
+    "disk_available_bytes": 13570945024,
+    "ram_available_bytes": 10025385984,
+    "server_exports_created": 0
+  },
+  "aggregation_assessment": {
+    "feasible": true,
+    "implemented": false,
+    "streams": "Existing Binance, Bybit and Hyperliquid BTC feed and shared subscriptions",
+    "resource_expectation": "Merged capped summaries avoid tripling history memory; ingestion and transfer grow with combined print count; aggregate overhead has not been benchmarked",
+    "correctness_work": [
+      "Common price and quote-notional reference",
+      "Per-source readiness, continuity and complete historical coverage",
+      "Timestamp alignment and reconnect deduplication",
+      "Never interpret missing source flow as exhaustion"
+    ],
+    "coverage_limitation": "This native run reports incomplete Bybit recorder segments on October 5 and 6; Binance archive fallback cannot repair the other venues"
+  },
+  "staged_source_sha256": {
+    "data/src/chart/orderflow.rs": "fea8b8e1e6ef46f39f1d21bd0671650c40a8dcad2352b5a870de004c553a13e7",
+    "src/chart/indicator/kline/orderflow.rs": "7a534953f700cf2afe9e5b71ec19eb8547413c5b003c43789ede2f06ff7c6be8",
+    "src/modal/pane/settings.rs": "c36a4f6349c24c1f2365249cf226592175e70234cd4beeb80b3a27ad79bc8a0c"
+  },
+  "cleanup": {
+    "temporary_files": [
+      "native.log",
+      "native-runtime-samples.json",
+      "saved-state-before.json"
+    ],
+    "temporary_bytes": 85394,
+    "raw_csv_created": 0,
+    "production_archive_cache_retained": {
+      "name": "BTCUSDT-aggTrades-2026-10-05.zip",
+      "bytes": 14666070,
+      "reason": "Normal Binance fallback cache required by a recorder coverage gap; reused by other chart history consumers"
+    },
+    "one_rollback_binary_retained": true,
+    "completed": true,
+    "temporary_files_deleted": 3
+  }
+}

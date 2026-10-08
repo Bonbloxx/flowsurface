@@ -1596,7 +1596,7 @@ pub fn kline_cfg_view<'a>(
         };
         content = content.push(column![
             text("Absorption & Exhaustion").size(crate::style::text_size::SECTION),
-            text("Binance BTC perpetuals · 24h execution history. Squares: absorption; diamonds: exhaustion. Filled marks are confirmed; faded marks broke their level within 5 minutes. Hover for evidence."),
+            text("Binance BTC perpetuals · 4-day execution history. Squares: absorption; diamonds: exhaustion. Every confirmed mark keeps its original color and size, regardless of its later outcome. Hover for evidence."),
             text("Automatic analysis adapts activity and price bands to recent executions and volatility. Detection is identical across chart timeframes and display settings; these switches only control visibility."),
             checkbox(flow.absorption).label("Show absorption").on_toggle(move |absorption| change(data::chart::orderflow::Config { absorption, ..flow })),
             checkbox(flow.exhaustion).label("Show exhaustion (experimental)").on_toggle(move |exhaustion| change(data::chart::orderflow::Config { exhaustion, ..flow })),
