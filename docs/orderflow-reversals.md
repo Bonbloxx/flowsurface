@@ -54,6 +54,18 @@ within five minutes fades the mark rather than deleting it. A faded mark can
 still have produced an earlier reaction; this status is not a trade PnL result.
 Optional hollow observations have not confirmed yet.
 
+Markers span 18–28 screen pixels and retain that visible size when zooming.
+Absorption squares grow with aggressor notional relative to the adaptive
+threshold: 1× is smallest, 2× is halfway, and 4× or more reaches the cap.
+Exhaustion diamonds grow with the collapse in execution pace: a 65% drop is
+smallest and a 100% drop reaches the cap. Exhaustion does not use high volume
+at the extreme as a size measure, because the flow is tapering there.
+The tooltip explains each mark's sizing evidence. Size describes intensity,
+not probability or expected profit; the two shapes use different measures.
+Sizing uses evidence captured at observation and stays fixed after confirmation
+or failure. No additional market-data requests or retained trade history are
+needed for sizing.
+
 Marks sit on the **confirmation candle**, at the observed price extreme. Hover
 shows actual observation and confirmation times, side volumes, threshold,
 pace ratio and rejection distance. Confirmation uses the close of an execution

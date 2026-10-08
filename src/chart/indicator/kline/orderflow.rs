@@ -38,7 +38,7 @@ pub struct OrderflowIndicator {
     covered_from: Option<u64>,
     history_anchor: Option<(UnixMs, UnixMs)>,
     notice: Option<String>,
-    hover: RefCell<Vec<(Point, Event)>>,
+    hover: RefCell<Vec<(Point, f32, Event)>>,
 }
 
 impl Default for OrderflowIndicator {
@@ -289,7 +289,6 @@ impl KlineIndicatorImpl for OrderflowIndicator {
             return;
         };
         let scale = chart.scaling.max(0.01);
-        let radius = 5.0 / scale;
         let (buy, sell) = delta_history_colors(palette);
         let mut hover = self.hover.borrow_mut();
         hover.clear();
@@ -299,14 +298,15 @@ impl KlineIndicatorImpl for OrderflowIndicator {
                 .iter()
                 .filter(|_| self.config.show_observed),
         ) {
+            let radius = marker_radius(event) / scale;
             let time = event.confirmed.unwrap_or(event.observed);
             let x =
                 chart.interval_to_x(time / interval.to_milliseconds() * interval.to_milliseconds());
             let y = chart.price_to_y(event.price);
             if x < region.x - radius
                 || x > region.x + region.width + radius
-                || y < region.y
-                || y > region.y + region.height
+                || y < region.y - radius
+                || y > region.y + region.height + radius
             {
                 continue;
             }
@@ -332,13 +332,13 @@ impl KlineIndicatorImpl for OrderflowIndicator {
                 }),
             };
             if event.status() != Status::Observed {
-                frame.fill(&path, color.scale_alpha(0.65));
+                frame.fill(&path, color.scale_alpha(0.85));
             }
             frame.stroke(
                 &path,
-                Stroke::default().with_color(color).with_width(1.2 / scale),
+                Stroke::default().with_color(color).with_width(1.8 / scale),
             );
-            hover.push((point, event.clone()));
+            hover.push((point, radius, event.clone()));
         }
         let notice = self.notice.clone().or_else(|| {
             if self.covered_from.is_none() {
@@ -369,10 +369,12 @@ impl KlineIndicatorImpl for OrderflowIndicator {
     ) {
         let scale = chart.scaling.max(0.01);
         let hover = self.hover.borrow();
-        let Some((point, event)) = hover
+        let Some((point, radius, event)) = hover
             .iter()
-            .filter(|(point, _)| point.distance(cursor) <= 9.0 / scale)
-            .min_by(|(a, _), (b, _)| a.distance(cursor).total_cmp(&b.distance(cursor)))
+            .filter(|(point, radius, event)| {
+                marker_contains(*point, *radius, event.kind, cursor, 3.0 / scale)
+            })
+            .min_by(|(a, _, _), (b, _, _)| a.distance(cursor).total_cmp(&b.distance(cursor)))
         else {
             return;
         };
@@ -388,6 +390,16 @@ impl KlineIndicatorImpl for OrderflowIndicator {
                 event.pace_ratio * 100.0,
                 event.rejection
             ),
+            match event.kind {
+                Kind::Absorption => format!(
+                    "Size: {:.2}× threshold activity · intensity, not win probability",
+                    absorption_ratio(event)
+                ),
+                Kind::Exhaustion => format!(
+                    "Size: {:.0}% pace drop · intensity, not win probability",
+                    (1.0 - event.pace_ratio) * 100.0
+                ),
+            },
             format!(
                 "Observed {} · confirmed {} UTC",
                 timestamp(event.observed),
@@ -395,14 +407,15 @@ impl KlineIndicatorImpl for OrderflowIndicator {
             ),
         ];
         let width = (470.0 / scale).min((region.width - 16.0 / scale).max(1.0));
-        let height = 72.0 / scale;
+        let height = 86.0 / scale;
+        let offset = radius + 8.0 / scale;
         let x = point
             .x
             .clamp(region.x, (region.x + region.width - width).max(region.x));
-        let y = if point.y - height - 14.0 / scale >= region.y {
-            point.y - height - 14.0 / scale
+        let y = if point.y - height - offset >= region.y {
+            point.y - height - offset
         } else {
-            point.y + 14.0 / scale
+            (point.y + offset).min((region.y + region.height - height).max(region.y))
         };
         let panel = Path::rectangle(Point::new(x, y), iced::Size::new(width, height));
         frame.fill(&panel, palette.background.base.color.scale_alpha(0.97));
@@ -422,6 +435,38 @@ impl KlineIndicatorImpl for OrderflowIndicator {
                 Alignment::Start,
             );
         }
+    }
+}
+
+fn absorption_ratio(event: &Event) -> f64 {
+    let aggressive = if event.bullish {
+        event.sell_usd
+    } else {
+        event.buy_usd
+    };
+    aggressive / event.threshold_usd.max(1.0)
+}
+
+/// Screen-pixel radius based only on evidence captured at observation. Later
+/// confirmation/failure and new market activity cannot resize an existing mark.
+fn marker_radius(event: &Event) -> f32 {
+    let intensity = match event.kind {
+        // 1× threshold is the minimum size; 4× and above reach the cap. Log
+        // scaling keeps exceptional prints from obscuring the candle chart.
+        Kind::Absorption => absorption_ratio(event).clamp(1.0, 4.0).log2() / 2.0,
+        // Exhaustion measures the collapse in pace, not high volume at the
+        // extreme. Its qualification boundary is a 65% pace drop.
+        Kind::Exhaustion => (1.0 - event.pace_ratio / 0.35).clamp(0.0, 1.0),
+    };
+    9.0 + 5.0 * intensity as f32
+}
+
+fn marker_contains(point: Point, radius: f32, kind: Kind, cursor: Point, pad: f32) -> bool {
+    let dx = (point.x - cursor.x).abs();
+    let dy = (point.y - cursor.y).abs();
+    match kind {
+        Kind::Absorption => dx.max(dy) <= radius + pad,
+        Kind::Exhaustion => dx + dy <= radius + pad * std::f32::consts::SQRT_2,
     }
 }
 
@@ -448,6 +493,74 @@ mod tests {
             qty: Qty::from_f64(1.0),
             is_sell: false,
         }
+    }
+    fn event(kind: Kind) -> Event {
+        Event {
+            kind,
+            bullish: true,
+            price: Price::from_f64(100_000.0),
+            observed: 1_000,
+            confirmed: None,
+            broken: None,
+            buy_usd: 100_000.0,
+            sell_usd: 1_000_000.0,
+            threshold_usd: 1_000_000.0,
+            pace_ratio: 0.35,
+            rejection: 20.0,
+            confirmation_price: None,
+        }
+    }
+    #[test]
+    fn absorption_size_is_relative_to_activity_and_frozen_after_observation() {
+        let mut mark = event(Kind::Absorption);
+        let minimum = marker_radius(&mark);
+        mark.sell_usd *= 2.0;
+        let larger = marker_radius(&mark);
+        assert!(larger > minimum);
+        mark.sell_usd *= 10.0;
+        mark.threshold_usd *= 10.0;
+        assert_eq!(marker_radius(&mark), larger, "same normalized evidence");
+        mark.confirmed = Some(10_000);
+        mark.broken = Some(20_000);
+        assert_eq!(marker_radius(&mark), larger, "outcomes do not resize marks");
+        mark.sell_usd *= 100.0;
+        assert!(marker_radius(&mark) <= 14.0, "outliers stay bounded");
+        mark.bullish = false;
+        mark.buy_usd = mark.sell_usd;
+        assert_eq!(marker_radius(&mark), 14.0, "same sizing for either side");
+    }
+    #[test]
+    fn exhaustion_size_tracks_pace_collapse_not_band_volume() {
+        let mut mark = event(Kind::Exhaustion);
+        let minimum = marker_radius(&mark);
+        mark.pace_ratio = 0.20;
+        let larger = marker_radius(&mark);
+        assert!(larger > minimum);
+        mark.sell_usd *= 100.0;
+        assert_eq!(marker_radius(&mark), larger);
+        mark.pace_ratio = 0.0;
+        assert_eq!(marker_radius(&mark), 14.0);
+        assert!(marker_contains(
+            Point::ORIGIN,
+            14.0,
+            Kind::Exhaustion,
+            Point::new(13.5, 0.0),
+            0.0
+        ));
+        assert!(!marker_contains(
+            Point::ORIGIN,
+            14.0,
+            Kind::Exhaustion,
+            Point::new(13.5, 13.5),
+            0.0
+        ));
+        assert!(marker_contains(
+            Point::ORIGIN,
+            14.0,
+            Kind::Absorption,
+            Point::new(13.5, 13.5),
+            0.0
+        ));
     }
     #[test]
     fn four_hours_plus_warmup_are_requested_and_retry_keeps_identity_bounds() {
