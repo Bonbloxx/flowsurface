@@ -134,7 +134,7 @@ impl OrderflowIndicator {
             ingest_us: 0,
             max_chunk_us: 0,
         });
-        self.notice = Some("Loading 4h execution history…".to_string());
+        self.notice = Some("Loading 24h execution history…".to_string());
     }
     pub fn owns(&self, id: uuid::Uuid) -> bool {
         self.history
@@ -563,23 +563,23 @@ mod tests {
         ));
     }
     #[test]
-    fn four_hours_plus_warmup_are_requested_and_retry_keeps_identity_bounds() {
+    fn full_day_plus_warmup_are_requested_and_retry_keeps_identity_bounds() {
         let mut indicator = OrderflowIndicator::default();
         indicator.configure(
             orderflow::Config::default(),
             source(Exchange::BinanceLinear),
         );
-        let (from, to) = indicator.plan_history(UnixMs::new(20_000_000)).unwrap();
+        let (from, to) = indicator.plan_history(UnixMs::new(120_000_000)).unwrap();
         assert_eq!(
             to.as_u64() - from.as_u64() + 1,
             orderflow::HISTORY_MS + orderflow::WARMUP_MS
         );
         let id = uuid::Uuid::new_v4();
         indicator.begin_history(id, from, to);
-        assert!(indicator.plan_history(UnixMs::new(21_000_000)).is_none());
+        assert!(indicator.plan_history(UnixMs::new(121_000_000)).is_none());
         assert!(indicator.finish(id, false));
         assert_eq!(
-            indicator.plan_history(UnixMs::new(21_000_000)),
+            indicator.plan_history(UnixMs::new(121_000_000)),
             Some((from, to))
         );
     }

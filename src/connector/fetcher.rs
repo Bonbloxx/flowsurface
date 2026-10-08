@@ -22,6 +22,7 @@ static TRADE_FETCH_MODE: RwLock<TradeFetchMode> = RwLock::new(TradeFetchMode::Of
 
 /// Maximum trades to request per Arrow IPC call to server.
 const ARROW_LIMIT: usize = 400_000;
+const ORDERFLOW_ARROW_LIMIT: usize = 50_000;
 
 /// Keep historical trade ingestion responsive by yielding smaller work units
 /// to the iced update loop. A busy UTC day can contain millions of trades;
@@ -35,6 +36,30 @@ const TRADE_UI_CHUNK: usize = 10_000;
 const RECORDER_FINALITY_RETRY_DELAY: Duration = Duration::from_secs(4);
 const RECORDER_FINALITY_WINDOW_MS: u64 = 60_000;
 const RECORDER_FINALITY_MAX_GAP_MS: u64 = 5_000;
+
+fn orderflow_history_gate() -> Arc<tokio::sync::Semaphore> {
+    static GATE: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+    GATE.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1)))
+        .clone()
+}
+
+fn orderflow_page_extent(
+    trades: &[Trade],
+    raw_rows: usize,
+    last_ts: Option<UnixMs>,
+    limit: usize,
+) -> Result<(usize, Option<UnixMs>), AdapterError> {
+    if raw_rows < limit {
+        return Ok((trades.len(), None));
+    }
+    let last = last_ts.ok_or_else(|| {
+        AdapterError::ParseError("Orderflow history page is missing its timestamp cursor".into())
+    })?;
+    Ok((
+        trades.partition_point(|trade| trade.time < last),
+        Some(last),
+    ))
+}
 
 fn exchange_trade_gate(ticker_info: TickerInfo) -> Arc<tokio::sync::Semaphore> {
     static BINANCE: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
@@ -1163,6 +1188,22 @@ fn fetch_trades_paged(
     orderflow_fallback: bool,
 ) -> impl Straw<TradeFetchOutcome, Vec<Trade>, AdapterError> {
     sipper(async move |mut progress| {
+        // A full-day overlay must not multiply startup memory/network bursts
+        // when it is enabled on several panes at once.
+        let _orderflow_permit = if orderflow_fallback {
+            Some(
+                orderflow_history_gate()
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| {
+                        AdapterError::ParseError(
+                            "Orderflow history scheduler closed unexpectedly".into(),
+                        )
+                    })?,
+            )
+        } else {
+            None
+        };
         if recent_first {
             let batches = if let Some(client) = server {
                 fetch_recent_server_trade_batches(client, ticker_info, from_time, to_time).await?
@@ -1188,7 +1229,7 @@ fn fetch_trades_paged(
         // Binance/Bybit archive downloads onto the desktop. Direct exchange
         // history is available only when no recorder client is configured
         // (TradeFetchMode::Exchange). The bounded orderflow request explicitly
-        // opts into Binance gap filling to supply four hours even with an
+        // opts into Binance gap filling to supply 24 hours even with an
         // incomplete recorder, without changing other indicators' policy.
         let exchange_available =
             (server.is_none() || orderflow_fallback) && supports_exchange_trade_fetch(ticker_info);
@@ -1247,13 +1288,45 @@ fn fetch_trades_paged(
                     ));
                 };
                 let mut cursor = range_from;
+                let mut page_limit = if orderflow_fallback {
+                    ORDERFLOW_ARROW_LIMIT
+                } else {
+                    ARROW_LIMIT
+                };
                 while cursor <= range_to {
                     let prev_cursor = cursor;
-                    let parsed = client
-                        .fetch_trades_arrow(ticker_info, cursor, range_to, ARROW_LIMIT)
+                    if orderflow_fallback {
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                    }
+                    let mut parsed = client
+                        .fetch_trades_arrow(ticker_info, cursor, range_to, page_limit)
                         .await?;
                     if parsed.raw_row_count == 0 {
                         break;
+                    }
+                    let mut range_complete = false;
+                    if orderflow_fallback {
+                        let (keep, next) = orderflow_page_extent(
+                            &parsed.trades,
+                            parsed.raw_row_count,
+                            parsed.last_ts,
+                            page_limit,
+                        )?;
+                        if keep == 0 && next.is_some() {
+                            if page_limit >= ARROW_LIMIT {
+                                return Err(AdapterError::ParseError(
+                                    "Orderflow history cannot safely page an oversized trade millisecond".into()
+                                ));
+                            }
+                            page_limit = (page_limit * 2).min(ARROW_LIMIT);
+                            continue;
+                        }
+                        parsed.trades.truncate(keep);
+                        range_complete = next.is_none();
+                        cursor = next.unwrap_or(range_to);
+                        page_limit = ORDERFLOW_ARROW_LIMIT;
+                    } else {
+                        cursor = parsed.last_ts.map_or(cursor, |time| time.saturating_add(1));
                     }
                     if !parsed.trades.is_empty() {
                         had_data = true;
@@ -1261,7 +1334,9 @@ fn fetch_trades_paged(
                             progress.send(chunk).await;
                         }
                     }
-                    cursor = parsed.last_ts.map_or(cursor, |time| time.saturating_add(1));
+                    if range_complete {
+                        break;
+                    }
                     if cursor <= prev_cursor {
                         return Err(AdapterError::ParseError(
                             "server trade paging cursor did not advance".into(),
@@ -1653,6 +1728,75 @@ mod tests {
             ticker_info: TickerInfo::new(Ticker::new("BTCUSDT", exchange), 0.1, 0.001, None),
             timeframe: Timeframe::M30,
         }
+    }
+
+    #[test]
+    fn orderflow_pages_preserve_every_timestamp_tie_without_duplicates() {
+        let trades: Vec<_> = [1, 2, 3, 3, 3, 3, 4, 4]
+            .into_iter()
+            .enumerate()
+            .map(|(id, time)| Trade {
+                time: UnixMs::new(time),
+                price: Price::from_f64(100_000.0 + id as f64),
+                qty: Qty::from_f64(1.0),
+                is_sell: false,
+            })
+            .collect();
+        let mut cursor = UnixMs::new(1);
+        let mut received = Vec::new();
+        loop {
+            let page: Vec<_> = trades
+                .iter()
+                .copied()
+                .filter(|t| t.time >= cursor)
+                .take(5)
+                .collect();
+            let (keep, next) =
+                orderflow_page_extent(&page, page.len(), page.last().map(|t| t.time), 5).unwrap();
+            received.extend_from_slice(&page[..keep]);
+            let Some(next) = next else { break };
+            assert!(next > cursor);
+            cursor = next;
+        }
+        assert_eq!(received.len(), trades.len());
+        assert!(
+            received
+                .iter()
+                .zip(&trades)
+                .all(|(actual, expected)| actual.price == expected.price)
+        );
+    }
+
+    #[test]
+    fn orderflow_paging_uses_raw_limits_and_rejects_missing_cursors() {
+        let trade = Trade {
+            time: UnixMs::new(2),
+            price: Price::from_f64(100_000.0),
+            qty: Qty::from_f64(1.0),
+            is_sell: false,
+        };
+        assert_eq!(
+            orderflow_page_extent(&[trade], 5, Some(UnixMs::new(3)), 5).unwrap(),
+            (1, Some(UnixMs::new(3)))
+        );
+        assert_eq!(
+            orderflow_page_extent(&[], 5, Some(UnixMs::new(3)), 5).unwrap(),
+            (0, Some(UnixMs::new(3)))
+        );
+        assert!(orderflow_page_extent(&[], 5, None, 5).is_err());
+        assert_eq!(
+            orderflow_page_extent(&[trade], 1, Some(trade.time), 5).unwrap(),
+            (1, None)
+        );
+    }
+
+    #[test]
+    fn orderflow_initial_fetches_share_one_memory_budget_slot() {
+        let gate = orderflow_history_gate();
+        let permit = gate.clone().try_acquire_owned().unwrap();
+        assert!(gate.clone().try_acquire_owned().is_err());
+        drop(permit);
+        assert!(gate.try_acquire_owned().is_ok());
     }
 
     #[test]

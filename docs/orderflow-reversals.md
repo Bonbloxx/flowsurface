@@ -80,7 +80,7 @@ notional, normalized once from the adapter's base/quote quantity convention.
 
 ## History and resource limits
 
-Enabling the indicator requests **four hours plus five minutes of warm-up**.
+Enabling the indicator requests **24 hours plus five minutes of warm-up**.
 It uses the existing connector and recorder coverage protocol. Binance's
 existing rate-limited archive/REST path fills missing recorder coverage, or
 supplies the entire range when general trade backfill is Off. This exception
@@ -90,13 +90,21 @@ retry with the existing cooldown. Initial direct Binance fetching can take
 longer than recorder fetching on a busy market.
 
 The indicator retains one-second summaries and price-band totals, not raw
-executions or a second UTC-day footprint book. Retention is four hours plus ten
+executions or a second UTC-day footprint book. Retention is 24 hours plus ten
 minutes; each second has at most 32 bands, and confirmed events are capped at
 512. A band-overflow second, explicit disconnect, or silence exceeding ten
 seconds resets continuity and warm-up. Short genuine idle intervals do not
 count as exhaustion. Historical pages are staged and committed atomically;
 their overlap replaces the live book once. Fetch handles belong to this
 indicator and are cancelled on disable/grid/source changes.
+
+Recorder loads use one shared orderflow history slot, sequential 50,000-row
+pages and a 200 ms pause per page; ingestion still yields in 10,000-trade UI
+messages. Capped pages re-fetch their final millisecond to preserve timestamp
+ties. The summary book is kept in memory and adds no raw-trade disk cache.
+The [24-hour resource receipt](evidence/orderflow-24h-resources-2026-10-08.json)
+compares the previous window with a full-day replay. Resource use depends on
+activity and analysis settings; the 32-band-per-second and 512-event caps remain.
 
 Runtime measurements and their limitations are in the
 [verification report](evidence/orderflow-btc-verification-2026-10-08.json).

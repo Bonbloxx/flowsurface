@@ -1595,7 +1595,7 @@ pub fn kline_cfg_view<'a>(
         };
         content = content.push(column![
             text("Absorption & Exhaustion").size(crate::style::text_size::SECTION),
-            text("Binance BTC perpetuals · 4h execution history. Squares: absorption; diamonds: exhaustion. Filled marks are confirmed; faded marks broke their level within 5 minutes. Hover for evidence."),
+            text("Binance BTC perpetuals · 24h execution history. Squares: absorption; diamonds: exhaustion. Filled marks are confirmed; faded marks broke their level within 5 minutes. Hover for evidence."),
             text("Signal preset"),
             pick_list(data::chart::orderflow::Preset::ALL, flow.preset(), move |preset| change(preset.config())).placeholder("Custom"),
             checkbox(flow.absorption).label("Absorption").on_toggle(move |absorption| change(data::chart::orderflow::Config { absorption, ..flow })),

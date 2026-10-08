@@ -8508,7 +8508,7 @@ mod tests {
         let FetchRange::OrderflowTrades(from, to) = spec.fetch else {
             panic!("dedicated range")
         };
-        assert!(to.as_u64() - from.as_u64() >= 4 * 60 * 60 * 1_000);
+        assert!(to.as_u64() - from.as_u64() >= 24 * 60 * 60 * 1_000);
         assert_eq!(
             spec.stream,
             Some(StreamKind::Trades {

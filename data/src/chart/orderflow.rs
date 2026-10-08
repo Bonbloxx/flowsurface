@@ -9,7 +9,7 @@ use exchange::{
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
 
-pub const HISTORY_MS: u64 = 4 * 60 * 60 * 1_000;
+pub const HISTORY_MS: u64 = 24 * 60 * 60 * 1_000;
 pub const WARMUP_MS: u64 = 5 * 60 * 1_000;
 pub const RETENTION_MS: u64 = HISTORY_MS + 2 * WARMUP_MS;
 pub const MAX_LEVELS_PER_SECOND: usize = 32;
@@ -243,6 +243,62 @@ mod tests {
         assert_eq!(config.window_seconds, 60);
         let legacy: crate::chart::kline::Config = serde_json::from_str("{}").unwrap();
         assert_eq!(legacy.orderflow, Config::default());
+    }
+    #[test]
+    fn day_history_retains_old_summaries_and_marks_then_expires_them() {
+        assert_eq!(HISTORY_MS, 24 * 3_600_000);
+        let mut tape = Tape::default();
+        let trade = Trade {
+            time: UnixMs::new(0),
+            price: Price::from_f64(100_000.0),
+            qty: Qty::from_f64(1.0),
+            is_sell: true,
+        };
+        tape.insert(&[trade], tick(), false);
+        tape.insert(
+            &[Trade {
+                time: UnixMs::new(8 * 3_600_000),
+                ..trade
+            }],
+            tick(),
+            false,
+        );
+        assert!(
+            tape.seconds.contains_key(&0),
+            "history beyond four hours remains available"
+        );
+        tape.insert(
+            &[Trade {
+                time: UnixMs::new(RETENTION_MS + 1_000),
+                ..trade
+            }],
+            tick(),
+            false,
+        );
+        assert!(
+            !tape.seconds.contains_key(&0),
+            "old summaries do not accumulate indefinitely"
+        );
+        assert_eq!(tape.seconds.len(), 2);
+
+        let mut detector = approaching();
+        for t in 360..364 {
+            detector.process(&second(t, 1_040.0, 150_000.0, false));
+        }
+        detector.process(&second(364, 1_025.0, 100.0, true));
+        let mark = detector.events()[0].observed;
+        detector.process(&second(8 * 3_600, 1_025.0, 100.0, true));
+        assert_eq!(detector.events()[0].observed, mark);
+        detector.process(&second(
+            (mark + RETENTION_MS) / 1_000 + 1,
+            1_025.0,
+            100.0,
+            true,
+        ));
+        assert!(
+            detector.events().is_empty(),
+            "old signals expire with the summary book"
+        );
     }
 }
 
