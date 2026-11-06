@@ -27,6 +27,8 @@ pub enum BarClass {
     Single,
     /// draw two bars, a success/danger colored (alpha) and an overlay using full color.
     Overlay { overlay: f32 }, // signed; sign decides color
+    /// Positive stacks: success below, danger above. Total still controls the scale.
+    Stacked { lower: f32 },
 }
 
 pub struct BarPlot<V, CL, T> {
@@ -37,6 +39,7 @@ pub struct BarPlot<V, CL, T> {
     pub classify: CL, // Single vs Overlay with signed overlay
     pub tooltip: Option<TooltipFn<T>>,
     pub baseline: Baseline,
+    pub time_interval_ms: Option<u64>,
     _phantom: std::marker::PhantomData<T>,
 }
 
@@ -50,6 +53,7 @@ impl<V, CL, T> BarPlot<V, CL, T> {
             classify,
             tooltip: None,
             baseline: Baseline::Zero,
+            time_interval_ms: None,
             _phantom: std::marker::PhantomData,
         }
     }
@@ -74,6 +78,11 @@ impl<V, CL, T> BarPlot<V, CL, T> {
         F: Fn(&T, Option<&T>) -> PlotTooltip + 'static,
     {
         self.tooltip = Some(Box::new(tooltip));
+        self
+    }
+
+    pub fn time_interval_ms(mut self, interval: u64) -> Self {
+        self.time_interval_ms = Some(interval);
         self
     }
 }
@@ -129,7 +138,13 @@ where
         scale: &YScale,
     ) {
         let palette = theme.extended_palette();
-        let bar_width = ctx.cell_width * self.bar_width_factor;
+        let interval_factor = match (self.time_interval_ms, ctx.basis) {
+            (Some(interval), data::chart::Basis::Time(tf)) => {
+                interval as f32 / tf.to_milliseconds() as f32
+            }
+            _ => 1.0,
+        };
+        let bar_width = ctx.cell_width * self.bar_width_factor * interval_factor;
 
         let baseline_value = match self.baseline {
             Baseline::Zero => 0.0,
@@ -157,6 +172,19 @@ where
             }
 
             match (self.classify)(y) {
+                BarClass::Stacked { lower } => {
+                    let y_middle = scale.to_y(lower.clamp(0.0, total));
+                    frame.fill_rectangle(
+                        Point::new(left, y_middle),
+                        Size::new(bar_width, (y_base - y_middle).max(0.0)),
+                        palette.success.base.color,
+                    );
+                    frame.fill_rectangle(
+                        Point::new(left, top_y),
+                        Size::new(bar_width, (y_middle - top_y).max(0.0)),
+                        palette.danger.base.color,
+                    );
+                }
                 BarClass::Single => {
                     frame.fill_rectangle(
                         Point::new(left, top_y),

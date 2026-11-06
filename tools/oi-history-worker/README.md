@@ -5,6 +5,13 @@ Cloudflare Worker + D1 reference collector for the contract in
 linear-perpetual OI once per minute. A VPS posts Binance raw OI and mark price
 through the source-locked ingest route. D1 serves paged USD-normalized history.
 
+Large history reads use daily JSON projections maintained by SQLite triggers in
+the same transaction as the original samples. The original minute rows remain
+authoritative and intact; numeric values use round-trip decimal strings in the
+projection. Small live-tail requests retain the original indexed query. Apply
+`0003_history_days.sql` and verify its backfill before enabling `HISTORY_DAYS=v1`.
+Removing that variable restores the original read path without losing data.
+
 ## Deploy
 
 1. `npx wrangler d1 create flowsurface-oi-history`

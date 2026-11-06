@@ -1,0 +1,98 @@
+{
+  "KlineChart": {
+    "layout": {
+      "splits": [
+        0.8
+      ],
+      "autoscale": "FitToVisible",
+      "rectangles": []
+    },
+    "kind": "Candles",
+    "stream_type": [
+      {
+        "Kline": {
+          "ticker": "BinanceLinear:BTCUSDT",
+          "timeframe": "M1"
+        }
+      },
+      {
+        "Trades": {
+          "ticker": "BinanceLinear:BTCUSDT"
+        }
+      },
+      {
+        "Trades": {
+          "ticker": "BybitLinear:BTCUSDT"
+        }
+      },
+      {
+        "Trades": {
+          "ticker": "HyperliquidLinear:BTC"
+        }
+      }
+    ],
+    "settings": {
+      "tick_multiply": null,
+      "visual_config": {
+        "Kline": {
+          "data_labels_always_visible": false,
+          "show_footprint_candles": true,
+          "show_footprint_row_delta": false,
+          "show_footprint_summary": false,
+          "footprint_summary_abnormal_multiplier": 3.0,
+          "show_renko_wicks": true,
+          "daily_delta_ticks": 1000,
+          "daily_delta_days": 4,
+          "previous_value_area_ticks": 100,
+          "previous_value_area_block_size": "Minutes30",
+          "previous_value_area_session_start_minutes_utc": 0,
+          "previous_value_area_value_area_percent": 70,
+          "liquidity_heatmap_order_size_filter": 0.0,
+          "large_trades_min_usd": 1000000.0,
+          "large_trades_side": "Both",
+          "vpvr_ticks": 1000,
+          "orderflow": {
+            "absorption": true,
+            "exhaustion": true,
+            "show_observed": false,
+            "band_ticks": 50,
+            "window_seconds": 15,
+            "min_absorption_usd": 1000000.0,
+            "sensitivity": 2.0,
+            "rejection_bands": 4.0
+          }
+        }
+      },
+      "selected_basis": {
+        "Time": "M1"
+      },
+      "aggregate_feed": null,
+      "aggregate_sources": null,
+      "footprint_history_sources": [
+        "BinanceLinear:BTCUSDT",
+        "BybitLinear:BTCUSDT",
+        "HyperliquidLinear:BTC"
+      ],
+      "orderflow_sources": [
+        "BinanceLinear:BTCUSDT",
+        "HyperliquidLinear:BTC",
+        "BybitLinear:BTCUSDT"
+      ],
+      "footprint_history_aggregate": true,
+      "open_interest_sources": [
+        "BinanceLinear:BTCUSDT",
+        "BybitLinear:BTCUSDT",
+        "HyperliquidLinear:BTC"
+      ],
+      "open_interest_aggregate": true,
+      "liquidity_heatmap_sources": null
+    },
+    "indicators": [
+      "PreviousValueArea",
+      "DailyDelta",
+      "VisibleRangeProfile",
+      "OrderflowReversals"
+    ],
+    "link_group": null
+  }
+}

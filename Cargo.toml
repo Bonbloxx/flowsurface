@@ -89,3 +89,7 @@ opt-level = 1
 
 [profile.dev.package."*"]
 opt-level = 3
+
+[[example]]
+name = "trev_native_qa"
+path = "src/trev_native_qa.rs"

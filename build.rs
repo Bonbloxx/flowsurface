@@ -6,6 +6,18 @@ fn main() {
     println!("cargo:rerun-if-changed=.git/HEAD");
     println!("cargo:rerun-if-changed=.git/refs");
     println!("cargo:rerun-if-changed=.git/packed-refs");
+    println!("cargo:rerun-if-changed=assets/icon/flowsurface.res");
+
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")
+        && env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc")
+    {
+        let resource = std::path::PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap())
+            .join("assets/icon/flowsurface.res");
+        println!(
+            "cargo:rustc-link-arg-bin=flowsurface={}",
+            resource.display()
+        );
+    }
 
     let Some(git_sha) = git_output(&["rev-parse", "--short=7", "HEAD"]) else {
         return;

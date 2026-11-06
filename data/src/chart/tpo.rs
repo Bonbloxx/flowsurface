@@ -1178,6 +1178,7 @@ mod tests {
         let visual = VisualConfig {
             data_labels_always_visible: true,
             show_footprint_candles: true,
+            show_footprint_row_delta: false,
             show_footprint_summary: false,
             footprint_summary_abnormal_multiplier:
                 VisualConfig::FOOTPRINT_SUMMARY_ABNORMAL_MULTIPLIER_DEFAULT,
@@ -1192,6 +1193,8 @@ mod tests {
             large_trades_min_usd: 1_000_000.0,
             large_trades_side: LargeTradesSide::Both,
             vpvr_ticks: 10,
+            trade_pace: crate::chart::trade_pace::Config::default(),
+            orderflow: crate::chart::orderflow::Config::default(),
         };
 
         let kind_json = serde_json::to_string(&kind).expect("serialize Renko settings");

@@ -44,9 +44,10 @@ pub(crate) const DAYS: usize = 3;
 /// tape had already stored. Those files must be dropped and re-fetched.
 /// v7: quote-normalized and inverse trades are no longer multiplied by price
 /// a second time when producing USD notionals.
-/// v8: Large Trades lowers its capture floor from $1M to $100k. Older complete
-/// day books do not contain the newly eligible prints and must be re-fetched.
-pub(crate) const CACHE_SCHEMA_VERSION: u16 = 8;
+/// v8: Large Trades lowers its capture floor from $1M to $100k.
+/// v9: retain small constituents before clustering; v8 filtered them before
+/// aggregation and cannot reconstruct the missing bubbles.
+pub(crate) const CACHE_SCHEMA_VERSION: u16 = 9;
 const MAX_LOOKBACK_DAYS: usize = 732;
 // v2 invalidates any completion proof produced before Hyperliquid replay IDs
 // were deduplicated and its legacy recorder coverage was retired. Valid days
@@ -103,13 +104,6 @@ pub(crate) fn write_cache_with_completion_proof(path: &Path, bytes: &[u8]) -> st
     Ok(())
 }
 
-/// Notional floor (quote currency) at which an executed trade is retained for
-/// the Large Trades overlay. Matches the lowest configurable UI threshold so
-/// lowering the threshold never requires a re-backfill within retention.
-fn large_trades_capture_floor() -> f64 {
-    f64::from(data::chart::kline::Config::LARGE_TRADES_MIN_USD_MIN)
-}
-
 pub(crate) fn trade_notional(trade: Trade, qty_is_quote: bool) -> f64 {
     let qty = trade.qty.to_f64();
     if qty_is_quote {
@@ -120,10 +114,8 @@ pub(crate) fn trade_notional(trade: Trade, qty_is_quote: bool) -> f64 {
 }
 
 /// Hard per-day ceiling so busy symbols cannot grow the shared day book
-/// without bound. Retention is by notional, not recency: when the cap is hit
-/// the smallest stored prints are dropped so a $10k flood cannot evict the
-/// largest trades the overlay is for. The $100_000 capture floor can still
-/// fill this cap on the busiest sessions.
+/// without bound. Retain complete same-side execution clusters by total
+/// notional, so their small constituents are never individually evicted.
 const MAX_LARGE_TRADES_PER_DAY: usize = 100_000;
 /// Compact only after this many extras have accumulated, so a busy tape is
 /// not sorted on every insert.
@@ -138,6 +130,33 @@ pub(crate) struct StoredLargeTrade {
     pub(crate) price_units: i64,
     pub(crate) notional: f64,
     pub(crate) is_sell: bool,
+}
+
+pub(crate) const LARGE_TRADE_CLUSTER_WINDOW_MS: u64 = 100;
+
+/// Ranges in a slice sorted by (side, time). Shared by storage retention and
+/// drawing so the cap measures the same bubbles the user sees.
+pub(crate) fn large_trade_cluster_ranges(
+    prints: &[StoredLargeTrade],
+) -> impl Iterator<Item = std::ops::Range<usize>> + '_ {
+    let mut start = 0;
+    std::iter::from_fn(move || {
+        let first = prints.get(start)?;
+        let mut end = start + 1;
+        while end < prints.len()
+            && prints[end].is_sell == first.is_sell
+            && prints[end]
+                .time
+                .as_u64()
+                .saturating_sub(first.time.as_u64())
+                <= LARGE_TRADE_CLUSTER_WINDOW_MS
+        {
+            end += 1;
+        }
+        let range = start..end;
+        start = end;
+        Some(range)
+    })
 }
 
 /// Inclusive UTC-day windows from `00:00:00.000` through `23:59:59.999`,
@@ -393,7 +412,7 @@ impl DayStats {
         // Full day-book writers and the Large Trades consumer retain prints.
         // Compact CVD staging must not build a large-print vector it never
         // renders and is intentionally forbidden from persisting.
-        if (retain.large_trades || retain.levels) && notional >= large_trades_capture_floor() {
+        if retain.large_trades || retain.levels {
             self.push_large_trade(StoredLargeTrade {
                 time: trade.time,
                 price_units: trade.price.units,
@@ -445,16 +464,56 @@ impl DayStats {
         }
     }
 
-    /// Keep the largest notionals. FIFO eviction at the capture floor
-    /// dropped rally-sized prints on busy majors once a few hours of
-    /// threshold-sized tape filled the cap.
+    /// Keep whole clusters, including prints smaller than the display floor.
+    /// Protect the newest cluster on each side because a following live page
+    /// can still add to it. Capacity is still bounded in individual entries.
     fn compact_large_trades(&mut self) {
         if self.large_trades.len() <= MAX_LARGE_TRADES_PER_DAY {
             return;
         }
         self.large_trades
-            .sort_unstable_by(|a, b| b.notional.total_cmp(&a.notional));
-        self.large_trades.truncate(MAX_LARGE_TRADES_PER_DAY);
+            .sort_by_key(|trade| (trade.is_sell, trade.time.as_u64()));
+        let largest_index = self
+            .large_trades
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.notional.total_cmp(&b.notional))
+            .map(|(index, _)| index)
+            .unwrap();
+        let mut groups: Vec<_> = large_trade_cluster_ranges(&self.large_trades)
+            .map(|range| {
+                let prints = &self.large_trades[range.clone()];
+                let newest = self
+                    .large_trades
+                    .get(range.end)
+                    .is_none_or(|next| next.is_sell != prints[0].is_sell);
+                let notional = prints.iter().map(|trade| trade.notional).sum::<f64>();
+                let protected = newest || range.contains(&largest_index);
+                (range, protected, notional)
+            })
+            .collect();
+        groups.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| b.2.total_cmp(&a.2)));
+        let mut kept = Vec::with_capacity(MAX_LARGE_TRADES_PER_DAY);
+        let mut protected_remaining = groups.iter().filter(|group| group.1).count();
+        for (range, protected, _) in groups {
+            if protected {
+                protected_remaining -= 1;
+            }
+            let available = MAX_LARGE_TRADES_PER_DAY - kept.len() - protected_remaining;
+            if range.len() <= available {
+                kept.extend_from_slice(&self.large_trades[range]);
+            } else if protected || range.len() > MAX_LARGE_TRADES_PER_DAY {
+                // Even an extreme single burst must fit the bound. Summarize
+                // that whole burst rather than truncating its total or VWAP.
+                if available > 0 {
+                    kept.push(super::large_trades::merge_print_cluster(
+                        &self.large_trades[range],
+                    ));
+                }
+            }
+        }
+        kept.sort_by_key(|trade| trade.time.as_u64());
+        self.large_trades = kept;
     }
 
     fn merge(&mut self, other: &Self) {
@@ -1249,8 +1308,7 @@ impl FootprintHistoryIndicator {
         // same day is missing. Unlike daily totals or profiles, they do not
         // imply continuous coverage; partial fetches contain only
         // recorder-proven segments.
-        let floor =
-            f64::from(threshold_usd.max(data::chart::kline::Config::LARGE_TRADES_MIN_USD_MIN));
+        let floor = f64::from(threshold_usd.max(0.0));
         for source in self.active_sources() {
             if let Some(stats) = self
                 .histories
@@ -2575,7 +2633,8 @@ mod tests {
             stats
                 .large_trades
                 .iter()
-                .all(|trade| trade.notional >= 11_000.0)
+                .any(|trade| trade.time.as_u64() == 99_999),
+            "the open buy cluster must survive compaction to accept its next page"
         );
     }
 
@@ -2590,6 +2649,30 @@ mod tests {
         assert_eq!(left.large_trades.len(), 1);
         assert!((left.large_trades[0].notional - 2_000_000.0).abs() < f64::EPSILON);
         assert_eq!(left.volume(), 0.0);
+    }
+
+    #[test]
+    fn storage_cap_retains_small_constituents_of_a_large_cluster() {
+        let mut stats = DayStats::default();
+        for i in 0..MAX_LARGE_TRADES_PER_DAY {
+            stats.push_large_trade(stored_print(i as u64 * 250, 100.0, false));
+        }
+        let start = MAX_LARGE_TRADES_PER_DAY as u64 * 250;
+        for i in 0..21 {
+            stats.push_large_trade(stored_print(start + i, 60_000.0, true));
+        }
+        stats.compact_large_trades();
+        assert!(stats.large_trades.len() <= MAX_LARGE_TRADES_PER_DAY);
+        let constituents: Vec<_> = stats
+            .large_trades
+            .iter()
+            .filter(|trade| trade.is_sell)
+            .collect();
+        assert_eq!(constituents.len(), 21);
+        assert!(
+            (constituents.iter().map(|trade| trade.notional).sum::<f64>() - 1_260_000.0).abs()
+                < 0.01
+        );
     }
 
     #[test]

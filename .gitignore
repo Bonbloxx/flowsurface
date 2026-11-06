@@ -2,3 +2,6 @@
 /target
 /.vscode
 *.log
+/.codex-remote-attachments/
+__pycache__/
+*.pyc

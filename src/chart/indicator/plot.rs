@@ -368,6 +368,11 @@ pub trait Plot<S: Series> {
         0
     }
 
+    /// Independent time sampling while retaining the chart's shared x-axis.
+    fn time_step_ms(&self) -> Option<u64> {
+        None
+    }
+
     fn draw<'a>(
         &'a self,
         frame: &'a mut canvas::Frame,
@@ -573,7 +578,7 @@ where
                 let crosshair_ratio = f64::from(cursor_x / bounds.width);
                 let (rounded_x, snap_ratio) = match ctx.basis {
                     Basis::Time(tf) => {
-                        let step = tf.to_milliseconds() as f64;
+                        let step = self.plot.time_step_ms().unwrap_or(tf.to_milliseconds()) as f64;
                         let rx = ((earliest_f + crosshair_ratio * (latest_f - earliest_f)) / step)
                             .round() as u64
                             * step as u64;
@@ -704,7 +709,7 @@ where
     }
 }
 
-type TooltipFn<T> = Box<dyn Fn(&T, Option<&T>) -> PlotTooltip>;
+pub type TooltipFn<T> = Box<dyn Fn(&T, Option<&T>) -> PlotTooltip>;
 
 const TOOLTIP_MARGIN: f32 = 4.0; // px from edge of canvas
 const TOOLTIP_PADDING: f32 = 8.0; // px inside tooltip box

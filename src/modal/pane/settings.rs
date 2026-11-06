@@ -610,6 +610,11 @@ pub fn comparison_cfg_view<'a>(
 }
 
 type FootprintHistorySettings = Option<(Vec<(exchange::TickerInfo, String, bool)>, bool)>;
+
+pub struct TradeVenueSettings {
+    pub pace: FootprintHistorySettings,
+    pub history: FootprintHistorySettings,
+}
 type OpenInterestSettings = Option<(Vec<(exchange::TickerInfo, String, bool)>, bool)>;
 type LiquidityHeatmapSettings = Option<Vec<(exchange::TickerInfo, String, bool)>>;
 
@@ -647,6 +652,16 @@ pub fn footprint_history_cfg_view(
     )
 }
 
+type OrderflowSettings = (
+    data::chart::orderflow::Config,
+    Vec<(exchange::TickerInfo, String, bool)>,
+);
+
+pub struct KlineSettingsInputs<'a> {
+    pub trev: (&'a str, &'a str),
+    pub large_trades: &'a str,
+}
+
 pub fn kline_cfg_view<'a>(
     study_config: &'a study::Configurator<FootprintStudy>,
     cfg: data::chart::kline::Config,
@@ -657,14 +672,23 @@ pub fn kline_cfg_view<'a>(
     tick_multiply: TickMultiplier,
     aggregate_sources: Vec<(exchange::TickerInfo, String, bool)>,
     open_interest: OpenInterestSettings,
-    footprint_history: FootprintHistorySettings,
+    trade_venues: TradeVenueSettings,
     liquidity_heatmap: LiquidityHeatmapSettings,
     daily_delta: Option<(u16, u16)>,
     previous_value_area: Option<u16>,
     large_trades: Option<f32>,
-    large_trades_input: &'a str,
-    vpvr_ticks: Option<u16>,
+    inputs: KlineSettingsInputs<'a>,
+    trade_overlays: (Option<u16>, Option<OrderflowSettings>),
 ) -> Element<'a, Message> {
+    let KlineSettingsInputs {
+        trev: trev_inputs,
+        large_trades: large_trades_input,
+    } = inputs;
+    let TradeVenueSettings {
+        pace: trade_pace,
+        history: footprint_history,
+    } = trade_venues;
+    let (vpvr_ticks, orderflow) = trade_overlays;
     let uses_shared_price_grid = !aggregate_sources.is_empty();
     let data_sources: Element<'a, Message> = if aggregate_sources.is_empty() {
         column![].into()
@@ -781,7 +805,7 @@ pub fn kline_cfg_view<'a>(
                 display_readout_section,
                 column![
                     text("Renko construction").size(crate::style::text_size::SECTION),
-                    text("History uses 1m closes; live bricks use executed trades. Time never closes a brick."),
+                    text("History and live bricks use executed trades. Confirmed bricks are saved with the layout."),
                     row![text("Brick size (ticks)"), space::horizontal(), brick_size]
                         .align_y(Alignment::Center),
                     row![text("Reversal boxes"), space::horizontal(), reversal]
@@ -795,6 +819,80 @@ pub fn kline_cfg_view<'a>(
                     space::horizontal(),
                     sync_all_button(pane, VisualConfig::Kline(cfg))
                 ],
+                ; spacing = 12, align_x = Alignment::Start
+            ]
+        }
+        KlineChartKind::Trev { config } => {
+            use data::chart::trev::{Config as TrevConfig, Display};
+            let continuation = text_input("Continuation ticks", trev_inputs.0)
+                .on_input(move |value| {
+                    Message::PaneEvent(pane, Event::TrevThresholdEdited(true, value))
+                })
+                .on_submit(Message::PaneEvent(pane, Event::ApplyTrevThresholds))
+                .width(110);
+            let reversal = text_input("Reversal ticks", trev_inputs.1)
+                .on_input(move |value| {
+                    Message::PaneEvent(pane, Event::TrevThresholdEdited(false, value))
+                })
+                .on_submit(Message::PaneEvent(pane, Event::ApplyTrevThresholds))
+                .width(110);
+            let valid = [trev_inputs.0, trev_inputs.1].into_iter().all(|value| {
+                value
+                    .trim()
+                    .parse::<u32>()
+                    .is_ok_and(|n| (1..=100_000).contains(&n))
+            });
+            let apply = button("Apply thresholds").on_press_maybe(
+                valid.then_some(Message::PaneEvent(pane, Event::ApplyTrevThresholds)),
+            );
+            let display = pick_list(Display::ALL, Some(config.display), move |display| {
+                Message::PaneEvent(
+                    pane,
+                    Event::TrevConfigChanged(TrevConfig { display, ..*config }),
+                )
+            });
+            let rows = pick_list(
+                TrevConfig::ROW_PRESETS,
+                Some(config.ticks_per_row),
+                move |ticks_per_row| {
+                    Message::PaneEvent(
+                        pane,
+                        Event::TrevConfigChanged(TrevConfig {
+                            ticks_per_row,
+                            ..*config
+                        }),
+                    )
+                },
+            );
+            let normalization = pick_list(
+                TrevConfig::NORMALIZATION_PRESETS,
+                Some(config.normalization_ms),
+                move |normalization_ms| {
+                    Message::PaneEvent(
+                        pane,
+                        Event::TrevConfigChanged(TrevConfig {
+                            normalization_ms,
+                            ..*config
+                        }),
+                    )
+                },
+            );
+            split_column![display_readout_section,
+                column![
+                    text("TRev construction").size(crate::style::text_size::SECTION),
+                    text("Continuation and reversal use exchange minimum-price ticks."),
+                    row![text("Continuation"), space::horizontal(), continuation].align_y(Alignment::Center),
+                    row![text("Reversal"), space::horizontal(), reversal].align_y(Alignment::Center),
+                    apply,
+                    text("1–100,000 ticks. Applying thresholds rebuilds only this pane.").size(crate::style::text_size::SMALL),
+                    row![text("Minimum lifetime (ms)"), space::horizontal(), normalization].align_y(Alignment::Center),
+                    row![text("Display"), space::horizontal(), display].align_y(Alignment::Center),
+                    row![text("Ticks per footprint row"), space::horizontal(), rows].align_y(Alignment::Center),
+                    text("Row aggregation changes the display without rebuilding candles."),
+                    text("Four-hour history; confirmed bars and footprint rows are saved with this pane."),
+                    checkbox(cfg.show_footprint_summary).label("Show candle volume and delta summary").on_toggle(move |show_footprint_summary| Message::VisualConfigChanged(pane, VisualConfig::Kline(data::chart::kline::Config { show_footprint_summary,..cfg }),false)),
+                    checkbox(cfg.show_footprint_row_delta).label("Show bid/ask row delta").on_toggle(move |show_footprint_row_delta| Message::VisualConfigChanged(pane, VisualConfig::Kline(data::chart::kline::Config { show_footprint_row_delta,..cfg }),false)),
+                ].spacing(10),
                 ; spacing = 12, align_x = Alignment::Start
             ]
         }
@@ -1053,7 +1151,25 @@ pub fn kline_cfg_view<'a>(
                             false,
                         )
                     }),
-                Some("Show per-bar volume and delta below footprint candles"),
+                Some(
+                    "Show executed buy/sell totals, volume, delta, and relative activity below each footprint",
+                ),
+                TooltipPosition::Top,
+            );
+            let footprint_row_delta_checkbox = tooltip(
+                checkbox(cfg.show_footprint_row_delta)
+                    .label("Show row delta (Bid × Ask)")
+                    .on_toggle(move |value| {
+                        Message::VisualConfigChanged(
+                            pane,
+                            VisualConfig::Kline(data::chart::kline::Config {
+                                show_footprint_row_delta: value,
+                                ..cfg
+                            }),
+                            false,
+                        )
+                    }),
+                Some("Hide the extra delta column to give bid and ask values more room"),
                 TooltipPosition::Top,
             );
             let abnormal_multiplier = {
@@ -1141,10 +1257,12 @@ pub fn kline_cfg_view<'a>(
                 display_readout_section,
                 data_sources,
                 text("Executed market sells × buys are grouped at every traded price."),
+                text("Volume uses base asset units (BTC for BTC markets). Settings → Size in quote currency switches it to USD.")
+                    .size(crate::style::text_size::SMALL),
                 column![
                     text("Tick size").size(crate::style::text_size::SECTION),
                     text(format!(
-                        "Each histogram level is {}. Lower grouping (10x–50x) keeps more rows readable.",
+                        "Each row covers {}. Smaller grouping adds price detail; larger grouping makes rows taller.",
                         tick_size.to_ui_string()
                     )),
                     row![text("Grouping"), space::horizontal(), tick_picklist]
@@ -1154,13 +1272,14 @@ pub fn kline_cfg_view<'a>(
                 column![
                     text("Footprint display").size(crate::style::text_size::SECTION),
                     footprint_candles_checkbox,
+                    footprint_row_delta_checkbox,
                 ]
                 .spacing(8),
                 column![
                     text("Footprint summary").size(crate::style::text_size::SECTION),
                     footprint_summary_checkbox,
                     abnormal_multiplier,
-                    text("Highlights volume and absolute delta against the prior 20 candles (after at least 5 candles).")
+                    text("× compares volume and absolute delta with the prior 20 populated candles (at least 5 needed). The live candle is still accumulating. Strong highlights use the abnormal threshold.")
                         .size(crate::style::text_size::SMALL),
                 ]
                 .spacing(8),
@@ -1340,6 +1459,40 @@ pub fn kline_cfg_view<'a>(
             ]
             .spacing(8),
         );
+    }
+
+    if let Some((sources, aggregate)) = trade_pace {
+        let available = sources.iter().map(|(info, _, _)| *info).collect::<Vec<_>>();
+        let choices =
+            sources
+                .into_iter()
+                .fold(column![].spacing(6), |choices, (info, label, selected)| {
+                    choices.push(checkbox(selected).label(label).on_toggle(move |enabled| {
+                        Message::PaneEvent(pane, Event::TradePaceSourceToggled(info, enabled))
+                    }))
+                });
+        let config = cfg.trade_pace.normalized();
+        let windows = [1_u16, 5, 15, 30, 60];
+        let baselines = [30_u16, 60, 120, 300, 600];
+        content = content.push(column![
+            text("Trade Pace").size(crate::style::text_size::SECTION),
+            text("Live execution prints per second. Venue reporting conventions differ; counts do not identify traders."),
+            row![text("Rolling window (seconds)"), space::horizontal(), pick_list(windows, Some(config.window_secs), move |window_secs| {
+                Message::VisualConfigChanged(pane, VisualConfig::Kline(data::chart::kline::Config {
+                    trade_pace: data::chart::trade_pace::Config { window_secs, ..config }, ..cfg
+                }), false)
+            })].align_y(Alignment::Center),
+            row![text("Preceding baseline (seconds)"), space::horizontal(), pick_list(baselines, Some(config.baseline_secs), move |baseline_secs| {
+                Message::VisualConfigChanged(pane, VisualConfig::Kline(data::chart::kline::Config {
+                    trade_pace: data::chart::trade_pace::Config { baseline_secs, ..config }, ..cfg
+                }), false)
+            })].align_y(Alignment::Center),
+            checkbox(aggregate).label("Combine selected trade venues").on_toggle(move |enabled| {
+                Message::PaneEvent(pane, Event::TradePaceAggregationToggled(enabled, available.clone()))
+            }),
+            choices,
+            text("History starts when enabled. Quiet seconds count as zero; stream gaps restart the window. Four hours retained in memory."),
+        ].spacing(8));
     }
 
     if let Some((sources, aggregate)) = footprint_history {
@@ -1582,6 +1735,34 @@ pub fn kline_cfg_view<'a>(
             ]
             .spacing(8),
         );
+    }
+
+    if let Some((flow, sources)) = orderflow {
+        let flow = flow.normalized();
+        let change = move |orderflow| {
+            Message::VisualConfigChanged(
+                pane,
+                VisualConfig::Kline(data::chart::kline::Config { orderflow, ..cfg }),
+                false,
+            )
+        };
+        content = content.push(column![
+            text("Absorption & Exhaustion").size(crate::style::text_size::SECTION),
+            text("BTC perpetuals · 4-day execution history. Squares: absorption; diamonds: exhaustion. Every confirmed mark keeps its original color and size, regardless of its later outcome. Hover for evidence."),
+            text("Automatic analysis adapts activity and price bands to recent executions and volatility. Detection is identical across chart timeframes and display settings; these switches only control visibility."),
+            checkbox(flow.absorption).label("Show absorption").on_toggle(move |absorption| change(data::chart::orderflow::Config { absorption, ..flow })),
+            checkbox(flow.exhaustion).label("Show exhaustion (experimental)").on_toggle(move |exhaustion| change(data::chart::orderflow::Config { exhaustion, ..flow })),
+            checkbox(flow.show_observed).label("Show unconfirmed observations").on_toggle(move |show_observed| change(data::chart::orderflow::Config { show_observed, ..flow })),
+        ].spacing(8));
+        let mut source_controls =
+            column![text("Execution venues").size(crate::style::text_size::BODY)].spacing(6);
+        for (source, label, selected) in sources {
+            source_controls =
+                source_controls.push(checkbox(selected).label(label).on_toggle(move |enabled| {
+                    Message::PaneEvent(pane, Event::OrderflowSourceToggled(source, enabled))
+                }));
+        }
+        content = content.push(source_controls).push(text("Select venues independently. Bybit and Hyperliquid history require Server backfill. Gaps are excluded; live detection waits for every selected venue. The first selected venue supplies prices; other venues' bands are aligned to it. Notional uses native USDT/USDC values."));
     }
 
     cfg_view_container(360, content)

@@ -2,6 +2,7 @@ use super::KlineIndicatorImpl;
 use super::daily_delta::delta_history_colors;
 use super::footprint_history::{
     DAY_MS, DayBookRetain, FootprintHistoryIndicator, StoredLargeTrade, day_start, draw_text,
+    large_trade_cluster_ranges,
 };
 use crate::chart::{Message, ViewState};
 use std::cell::RefCell;
@@ -24,32 +25,14 @@ pub(crate) const LARGE_TRADES_LOOKBACK_DAYS: u16 = 15;
 const EDGE_PAD_MS: u64 = 60_000;
 /// Hard cap on circles drawn in one frame. Keep the largest prints in view.
 const MAX_DRAWN_MARKERS: usize = 400;
-/// Same-side prints whose timestamps fall in this window are drawn as one
-/// bubble (notional summed, VWAP price). Matches Binance aggTrades' 100ms
-/// compression, and also folds simultaneous multi-venue prints together.
-const CLUSTER_WINDOW_MS: u64 = 100;
-
 fn cluster_same_side_prints(mut prints: Vec<StoredLargeTrade>) -> Vec<StoredLargeTrade> {
     if prints.len() <= 1 {
         return prints;
     }
     prints.sort_by_key(|trade| (trade.is_sell, trade.time.as_u64()));
-    let mut clustered = Vec::with_capacity(prints.len());
-    let mut start = 0;
-    while start < prints.len() {
-        let side = prints[start].is_sell;
-        let window_start = prints[start].time.as_u64();
-        let mut end = start + 1;
-        while end < prints.len()
-            && prints[end].is_sell == side
-            && prints[end].time.as_u64().saturating_sub(window_start) <= CLUSTER_WINDOW_MS
-        {
-            end += 1;
-        }
-        clustered.push(merge_print_cluster(&prints[start..end]));
-        start = end;
-    }
-    clustered
+    large_trade_cluster_ranges(&prints)
+        .map(|range| merge_print_cluster(&prints[range]))
+        .collect()
 }
 
 fn display_clusters_above_threshold(
@@ -74,7 +57,7 @@ fn display_clusters_for_side(
     clustered
 }
 
-fn merge_print_cluster(prints: &[StoredLargeTrade]) -> StoredLargeTrade {
+pub(super) fn merge_print_cluster(prints: &[StoredLargeTrade]) -> StoredLargeTrade {
     if prints.len() == 1 {
         return prints[0];
     }
@@ -162,13 +145,12 @@ struct VisibleWindow {
 /// Storage is delegated to the shared multi-venue day book
 /// ([`FootprintHistoryIndicator`]), exactly like Daily Delta: per-venue UTC-day
 /// books with disk persistence, live/backfill seam buffering, retention pruning
-/// and precise invalidation all come from that runtime. Trades at or above the
-/// fixed capture floor are recorded by `DayStats::insert_trade`; the
-/// user-facing threshold filters at draw time, so slider changes are instant
-/// and lossless within the retention window.
+/// and precise invalidation all come from that runtime. Small constituents
+/// remain available until after same-side, multi-venue clustering. The user
+/// threshold filters cluster totals at draw time within bounded retention.
 ///
-/// Drawing copies only the entries above the threshold for the visible days,
-/// so a redraw costs O(visible markers), not O(day book).
+/// Drawing collects constituents in the visible time window, clusters them,
+/// then applies price/size filters and the per-frame marker cap.
 struct HoverMarker {
     x: f32,
     y: f32,
@@ -283,18 +265,13 @@ impl LargeTradesIndicator {
         let last_day = day_start(UnixMs::new(window.to));
         let mut day = first_day;
         loop {
-            self.inner
-                .for_each_large_trade(day, capture_floor_usd(), |trade| {
-                    let time = trade.time.as_u64();
-                    if time < window.from || time > window.to {
-                        return;
-                    }
-                    let price = Price::from_units(trade.price_units);
-                    if price > highest || price < lowest {
-                        return;
-                    }
-                    prints.push(trade);
-                });
+            self.inner.for_each_large_trade(day, 0.0, |trade| {
+                let time = trade.time.as_u64();
+                if time < window.from || time > window.to {
+                    return;
+                }
+                prints.push(trade);
+            });
             if day >= last_day {
                 break;
             }
@@ -304,6 +281,10 @@ impl LargeTradesIndicator {
         let clustered = display_clusters_for_side(prints, f64::from(threshold), self.side);
         let mut markers: Vec<(f32, StoredLargeTrade)> = Vec::with_capacity(clustered.len());
         for trade in clustered {
+            let price = Price::from_units(trade.price_units);
+            if price > highest || price < lowest {
+                continue;
+            }
             let Some(x) = self.marker_x(chart, data_source, window, trade.time.as_u64()) else {
                 continue;
             };
@@ -656,6 +637,69 @@ mod tests {
                 10_000_000.0,
             ]
         );
+    }
+
+    #[test]
+    fn small_constituents_form_cross_venue_bubbles_before_threshold_filtering() {
+        let base = now_base();
+        let mut indicator = LargeTradesIndicator::new();
+        indicator.configure_footprint_history(&[binance(), bybit()], true);
+        // Neither venue clears even the minimum threshold on its own.
+        indicator.on_source_trades(binance(), &[trade(base, 80_000.0, 0.75, false)], false);
+        indicator.on_source_trades(bybit(), &[trade(base + 10, 80_000.0, 0.75, false)], false);
+        let prints = indicator
+            .inner
+            .display_large_trades(day_start(UnixMs::new(base)), 0.0);
+        let bubbles = display_clusters_above_threshold(prints, 100_000.0);
+        assert_eq!(bubbles.len(), 1);
+        assert!((bubbles[0].notional - 120_000.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn recorder_replay_restores_all_five_million_dollar_clusters_live_and_historical() {
+        // Real recorder sample, cross-checked against exchange REST. All five
+        // qualifying clusters vanished under the former $100k print filter.
+        let day = day_start(UnixMs::now());
+        let trades: Vec<_> = include_str!("large_trades/fixtures/btc-binance-20261009.csv")
+            .lines()
+            .map(|line| {
+                let columns: Vec<_> = line.split(',').collect();
+                trade(
+                    day + columns[5].parse::<u64>().unwrap() - 1_791_504_000_000,
+                    columns[1].parse().unwrap(),
+                    columns[2].parse().unwrap(),
+                    columns[6] == "true",
+                )
+            })
+            .collect();
+        assert_eq!(trades.len(), 6_663);
+        let mut live = LargeTradesIndicator::new();
+        live.configure_footprint_history(&[binance()], true);
+        for page in trades.chunks(23) {
+            live.on_source_trades(binance(), page, false);
+        }
+        let mut history = LargeTradesIndicator::new();
+        history.configure_footprint_history(&[binance()], true);
+        let req_id = uuid::Uuid::new_v4();
+        for page in trades.chunks(137) {
+            history.stage_source_trades(req_id, binance(), page);
+        }
+        history.commit_staged_source_trades(req_id);
+        let live_bubbles = display_clusters_above_threshold(
+            live.inner.display_large_trades(day, 0.0),
+            1_000_000.0,
+        );
+        let historical_bubbles = display_clusters_above_threshold(
+            history.inner.display_large_trades(day, 0.0),
+            1_000_000.0,
+        );
+        assert_eq!(live_bubbles.len(), 5);
+        assert_eq!(historical_bubbles, live_bubbles);
+        let largest = live_bubbles
+            .iter()
+            .map(|bubble| bubble.notional)
+            .fold(0.0, f64::max);
+        assert!((largest - 1_667_511.990_3).abs() < 0.01);
     }
 
     #[test]

@@ -685,6 +685,31 @@ impl ServerClient {
         to: UnixMs,
         limit: usize,
     ) -> Result<ParsedArrowBatch, AdapterError> {
+        self.fetch_trades_arrow_with_order(ticker_info, from, to, limit, false)
+            .await
+    }
+
+    /// Price-path consumers require stable insertion order within a millisecond.
+    /// The response header prevents an older recorder silently ignoring the opt-in.
+    pub async fn fetch_trev_trades_arrow(
+        &self,
+        ticker_info: TickerInfo,
+        from: UnixMs,
+        to: UnixMs,
+        limit: usize,
+    ) -> Result<ParsedArrowBatch, AdapterError> {
+        self.fetch_trades_arrow_with_order(ticker_info, from, to, limit, true)
+            .await
+    }
+
+    async fn fetch_trades_arrow_with_order(
+        &self,
+        ticker_info: TickerInfo,
+        from: UnixMs,
+        to: UnixMs,
+        limit: usize,
+        stable_order: bool,
+    ) -> Result<ParsedArrowBatch, AdapterError> {
         let (venue, market, symbol) = server_source_parts(ticker_info);
 
         let url = format!("{}/trades.arrow", self.base_url());
@@ -705,6 +730,9 @@ impl ServerClient {
             .query(&[("to", to.as_u64().to_string())])
             .query(&[("limit", limit.to_string())]);
 
+        if stable_order {
+            request = request.query(&[("stable_order", "true")]);
+        }
         if let Some(token) = self.auth_token() {
             request = request.header("Authorization", &format!("Bearer {token}"));
         }
@@ -727,6 +755,9 @@ impl ServerClient {
             ));
         }
 
+        if stable_order {
+            require_trev_order(response.headers())?;
+        }
         if let Some(content_type) = response
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
@@ -748,6 +779,19 @@ impl ServerClient {
         validate_server_trade_page(&parsed, from, to, limit)?;
         Ok(parsed)
     }
+}
+
+fn require_trev_order(headers: &reqwest::header::HeaderMap) -> Result<(), AdapterError> {
+    if headers
+        .get("x-flowsurface-trade-order")
+        .and_then(|value| value.to_str().ok())
+        != Some("timestamp-insertion-v1")
+    {
+        return Err(AdapterError::ParseError(
+            "TRev history requires the recorder's stable execution ordering update".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn server_ticker_key(ticker_info: TickerInfo) -> Option<String> {
@@ -973,6 +1017,22 @@ mod tests {
             price: Price::from_f64(100.0),
             qty: exchange::unit::qty::Qty::from_f64(1.0),
         }
+    }
+
+    #[test]
+    fn trev_requires_an_explicit_ordering_capability_from_the_recorder() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        assert!(require_trev_order(&headers).is_err());
+        headers.insert(
+            "x-flowsurface-trade-order",
+            reqwest::header::HeaderValue::from_static("timestamp"),
+        );
+        assert!(require_trev_order(&headers).is_err());
+        headers.insert(
+            "x-flowsurface-trade-order",
+            reqwest::header::HeaderValue::from_static("timestamp-insertion-v1"),
+        );
+        assert!(require_trev_order(&headers).is_ok());
     }
 
     #[test]

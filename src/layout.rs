@@ -187,6 +187,18 @@ impl From<&pane::State> for data::Pane {
             } => data::Pane::KlineChart {
                 layout: chart.as_ref().map_or(layout.clone(), |c| c.chart_layout()),
                 kind: kind.clone(),
+                trev_state: chart
+                    .as_ref()
+                    .and_then(|c| c.trev_snapshot())
+                    .or_else(|| pane.trev_restore.clone()),
+                renko_state: chart
+                    .as_ref()
+                    .and_then(|c| c.renko_snapshot())
+                    .or_else(|| pane.renko_restore.clone()),
+                orderflow_state: chart
+                    .as_ref()
+                    .and_then(|c| c.orderflow_snapshot())
+                    .or_else(|| pane.orderflow_restore.clone()),
                 stream_type: streams,
                 settings: pane.settings.clone(),
                 indicators: indicators.clone(),
@@ -289,6 +301,9 @@ pub fn configuration(pane: data::Pane) -> Configuration<pane::State> {
         data::Pane::KlineChart {
             layout,
             kind,
+            renko_state,
+            trev_state,
+            orderflow_state,
             stream_type,
             settings,
             indicators,
@@ -301,12 +316,11 @@ pub fn configuration(pane: data::Pane) -> Configuration<pane::State> {
                 kind,
             };
 
-            Configuration::Pane(pane::State::from_config(
-                content,
-                stream_type,
-                settings,
-                link_group,
-            ))
+            let mut state = pane::State::from_config(content, stream_type, settings, link_group);
+            state.renko_restore = renko_state;
+            state.trev_restore = trev_state;
+            state.orderflow_restore = orderflow_state;
+            Configuration::Pane(state)
         }
         data::Pane::FootprintHistory {
             stream_type,

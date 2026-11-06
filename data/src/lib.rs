@@ -37,7 +37,10 @@ pub enum InternalError {
 
 pub fn write_json_to_file(json: &str, file_name: &str) -> std::io::Result<()> {
     let path = data_path(Some(file_name));
+    write_json_at(json, &path)
+}
 
+fn write_json_at(json: &str, path: &std::path::Path) -> std::io::Result<()> {
     let parent = path.parent().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid state file path")
     })?;
@@ -46,8 +49,14 @@ pub fn write_json_to_file(json: &str, file_name: &str) -> std::io::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
 
-    let mut file = File::create(path)?;
+    // Never truncate the last good checkpoint while writing its replacement.
+    // Keep both files on the same volume so rename replaces it atomically.
+    let staging = path.with_extension("json.tmp");
+    let mut file = File::create(&staging)?;
     file.write_all(json.as_bytes())?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(staging, path)?;
     Ok(())
 }
 
@@ -260,6 +269,35 @@ pub fn cleanup_legacy_footprint_caches(current_schema_version: u16) -> usize {
 mod tests {
     use super::resolve_data_path;
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn checkpoint_replacement_keeps_the_previous_file_when_writing_fails() {
+        let root = std::env::temp_dir().join(format!(
+            "flowsurface-checkpoint-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = root.join("saved-state.json");
+        super::write_json_at(r#"{"checkpoint":1}"#, &path).unwrap();
+        super::write_json_at(r#"{"checkpoint":2}"#, &path).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            r#"{"checkpoint":2}"#
+        );
+        let staging = path.with_extension("json.tmp");
+        std::fs::create_dir(&staging).unwrap();
+        assert!(super::write_json_at(r#"{"checkpoint":3}"#, &path).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            r#"{"checkpoint":2}"#
+        );
+        std::fs::remove_dir(staging).unwrap();
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
 
     #[test]
     fn data_directory_override_keeps_state_logs_and_caches_separate() {

@@ -116,6 +116,14 @@ pub fn settings() -> Settings {
 #[cfg(target_os = "windows")]
 pub fn settings() -> Settings {
     Settings {
+        icon: Some(
+            window::icon::from_rgba(
+                include_bytes!("../assets/icon/flowsurface.rgba").to_vec(),
+                256,
+                256,
+            )
+            .expect("the embedded application icon must contain 256 x 256 RGBA pixels"),
+        ),
         min_size: Some(Size::new(800.0, 600.0)),
         ..Default::default()
     }

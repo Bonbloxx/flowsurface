@@ -20,7 +20,9 @@ pub mod footprint_history;
 pub mod large_trades;
 pub mod liquidity_heatmap;
 pub mod open_interest;
+pub mod orderflow;
 pub mod previous_value_area;
+pub mod trade_pace;
 pub mod volume;
 pub mod vpvr;
 
@@ -85,6 +87,15 @@ impl IndicatorAvailability {
 }
 
 pub trait KlineIndicatorImpl {
+    fn orderflow_sources(&self) -> &[exchange::TickerInfo] {
+        &[]
+    }
+    fn orderflow(&mut self) -> Option<&mut orderflow::OrderflowIndicator> {
+        None
+    }
+    fn orderflow_snapshot(&self) -> Option<Box<data::chart::orderflow::Snapshot>> {
+        None
+    }
     /// Clear all caches for a full redraw
     fn clear_all_caches(&mut self);
 
@@ -140,6 +151,23 @@ pub trait KlineIndicatorImpl {
 
     fn open_interest_sources(&self) -> &[exchange::TickerInfo] {
         &[]
+    }
+
+    fn configure_trade_pace(
+        &mut self,
+        _sources: &[exchange::TickerInfo],
+        _config: data::chart::trade_pace::Config,
+    ) {
+    }
+    fn trade_pace_connection(
+        &mut self,
+        _source: exchange::TickerInfo,
+        _connected: bool,
+        _now: UnixMs,
+    ) {
+    }
+    fn maintain_trade_pace(&mut self, _now: UnixMs, _source: &PlotData<KlineDataPoint>) -> bool {
+        false
     }
 
     /// Configure the independent Footprint History venue set.
@@ -275,6 +303,7 @@ pub struct FetchCtx<'a> {
 pub fn make_empty(which: KlineIndicator) -> Box<dyn KlineIndicatorImpl> {
     match which {
         KlineIndicator::Volume => Box::new(super::kline::volume::VolumeIndicator::new()),
+        KlineIndicator::TradePace => Box::new(trade_pace::TradePaceIndicator::new()),
         KlineIndicator::BarAnalysis => {
             Box::new(super::kline::bar_analysis::BarAnalysisIndicator::new())
         }
@@ -303,5 +332,6 @@ pub fn make_empty(which: KlineIndicator) -> Box<dyn KlineIndicatorImpl> {
         KlineIndicator::VisibleRangeProfile => {
             Box::new(super::kline::vpvr::VisibleRangeProfileIndicator::new())
         }
+        KlineIndicator::OrderflowReversals => Box::new(orderflow::OrderflowIndicator::default()),
     }
 }

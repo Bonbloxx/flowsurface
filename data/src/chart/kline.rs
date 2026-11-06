@@ -429,6 +429,10 @@ pub enum KlineChartKind {
         #[serde(default)]
         config: RenkoConfig,
     },
+    Trev {
+        #[serde(default)]
+        config: super::trev::Config,
+    },
     Tpo {
         #[serde(default)]
         config: super::tpo::Config,
@@ -442,7 +446,30 @@ pub enum KlineChartKind {
 }
 
 impl KlineChartKind {
+    pub fn is_footprint_display(&self) -> bool {
+        matches!(self, Self::Footprint { .. })
+            || matches!(self, Self::Trev { config } if config.display.clusters().is_some())
+    }
+
     pub fn allows_indicator(&self, indicator: KlineIndicator) -> bool {
+        if matches!(self, Self::Trev { .. }) {
+            return matches!(
+                indicator,
+                KlineIndicator::Volume
+                    | KlineIndicator::TradePace
+                    | KlineIndicator::FootprintHistory
+                    | KlineIndicator::DailyDelta
+                    | KlineIndicator::VisibleRangeProfile
+                    | KlineIndicator::LargeTrades
+                    | KlineIndicator::PreviousValueArea
+            );
+        }
+        if indicator == KlineIndicator::OrderflowReversals {
+            return matches!(
+                self,
+                KlineChartKind::Candles | KlineChartKind::Footprint { .. }
+            );
+        }
         // CME session edges require the chart's timestamp-keyed OHLC source.
         // Renko/TPO are tick-indexed projections and cannot truthfully recover
         // the exact Friday close and Sunday reopen from their synthetic bars.
@@ -486,6 +513,13 @@ impl KlineChartKind {
 
     pub fn min_scaling(&self) -> f32 {
         match self {
+            Self::Trev { config } => {
+                if config.display.clusters().is_some() {
+                    0.1
+                } else {
+                    0.6
+                }
+            }
             // Footprint must stay readable when many bars are on screen;
             // labels/candles clamp to minimum screen sizes instead.
             KlineChartKind::Footprint { .. } => 0.1,
@@ -496,6 +530,13 @@ impl KlineChartKind {
 
     pub fn max_scaling(&self) -> f32 {
         match self {
+            Self::Trev { config } => {
+                if config.display.clusters().is_some() {
+                    16.0
+                } else {
+                    2.5
+                }
+            }
             // TPO needs deeper overall zoom so letter cells can reach readable px.
             KlineChartKind::Tpo { .. } => 2.5,
             KlineChartKind::Footprint { .. } => 16.0,
@@ -505,6 +546,13 @@ impl KlineChartKind {
 
     pub fn max_cell_width(&self) -> f32 {
         match self {
+            Self::Trev { config } => {
+                if config.display.clusters().is_some() {
+                    1_440.0
+                } else {
+                    24.0
+                }
+            }
             KlineChartKind::Footprint { .. } => 1_440.0,
             // Allow a single day profile to fill most of the pane when zoomed in.
             KlineChartKind::Tpo { .. } => 520.0,
@@ -515,6 +563,13 @@ impl KlineChartKind {
 
     pub fn min_cell_width(&self) -> f32 {
         match self {
+            Self::Trev { config } => {
+                if config.display.clusters().is_some() {
+                    24.0
+                } else {
+                    3.0
+                }
+            }
             // Compact columns so a useful number of footprints fits on
             // screen; text hides itself below readable sizes instead.
             KlineChartKind::Footprint { .. } => 24.0,
@@ -526,6 +581,13 @@ impl KlineChartKind {
 
     pub fn max_cell_height(&self) -> f32 {
         match self {
+            Self::Trev { config } => {
+                if config.display.clusters().is_some() {
+                    360.0
+                } else {
+                    8.0
+                }
+            }
             KlineChartKind::Footprint { .. } => 360.0,
             // Per-tick height; visual TPO row = cell_height * ticks_per_row.
             // Higher cap so Y zoom can produce readable letter rows.
@@ -536,6 +598,13 @@ impl KlineChartKind {
 
     pub fn min_cell_height(&self) -> f32 {
         match self {
+            Self::Trev { config } => {
+                if config.display.clusters().is_some() {
+                    1.0
+                } else {
+                    0.001
+                }
+            }
             KlineChartKind::Footprint { .. } => 1.0,
             // Per-tick height; visual TPO row = cell_height * ticks_per_row.
             // Bound the *visual* row (~1.5 px at scale 1) instead of the raw
@@ -550,6 +619,10 @@ impl KlineChartKind {
 
     pub fn default_cell_width(&self) -> f32 {
         match self {
+            Self::Trev { config } => config
+                .display
+                .clusters()
+                .map_or(12.0, ClusterKind::min_footprint_width),
             KlineChartKind::Footprint { clusters, .. } => clusters.min_footprint_width(),
             // Give each daily profile a wide time slot so neighboring Market
             // Profiles remain visually distinct, as on reference TPO charts.
@@ -634,11 +707,11 @@ impl ClusterKind {
     /// Minimum footprint cell width (in unscaled pixels) for the cluster rendering mode.
     pub fn min_footprint_width(self) -> f32 {
         match self {
-            ClusterKind::VolumeProfile | ClusterKind::DeltaProfile => 80.0,
-            // Bid x Ask adds a per-row delta value after the two histogram
-            // halves. Give each lane enough room for slightly larger labels.
-            ClusterKind::BidAsk => 180.0,
-            ClusterKind::Table => 100.0,
+            ClusterKind::VolumeProfile | ClusterKind::DeltaProfile => 160.0,
+            // Leave room for readable bid/ask values at the initial zoom,
+            // including the optional per-row delta column.
+            ClusterKind::BidAsk => 224.0,
+            ClusterKind::Table => 180.0,
         }
     }
 }
@@ -662,6 +735,9 @@ pub struct Config {
     pub data_labels_always_visible: bool,
     // Whether to draw OHLC candle bodies and wicks on footprint charts.
     pub show_footprint_candles: bool,
+    /// Show a separate delta column beside Bid x Ask. Hidden by default so
+    /// the bid/ask values can use the available width.
+    pub show_footprint_row_delta: bool,
     // Whether to show the footprint per-bar summary below each candle.
     pub show_footprint_summary: bool,
     /// Highlight summary volume and absolute delta at this multiple of their
@@ -693,6 +769,10 @@ pub struct Config {
     pub large_trades_side: LargeTradesSide,
     /// VPVR grouping in exchange min-ticks. `1` is one price level per min tick.
     pub vpvr_ticks: u16,
+    /// Timestamp-based fast window and preceding activity baseline.
+    pub trade_pace: super::trade_pace::Config,
+    #[serde(default, deserialize_with = "crate::util::ok_or_default")]
+    pub orderflow: super::orderflow::Config,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
@@ -785,6 +865,7 @@ impl Default for Config {
         Self {
             data_labels_always_visible: false,
             show_footprint_candles: true,
+            show_footprint_row_delta: false,
             show_footprint_summary: false,
             footprint_summary_abnormal_multiplier:
                 Self::FOOTPRINT_SUMMARY_ABNORMAL_MULTIPLIER_DEFAULT,
@@ -799,6 +880,8 @@ impl Default for Config {
             large_trades_min_usd: Self::LARGE_TRADES_MIN_USD_DEFAULT,
             large_trades_side: LargeTradesSide::default(),
             vpvr_ticks: 10,
+            trade_pace: super::trade_pace::Config::default(),
+            orderflow: super::orderflow::Config::default(),
         }
     }
 }
@@ -925,8 +1008,13 @@ mod config_tests {
         .expect("legacy kline config should deserialize");
 
         assert!(config.show_footprint_candles);
+        assert!(!config.show_footprint_row_delta);
         assert_eq!(config.liquidity_heatmap_order_size_filter, 0.0);
         assert_eq!(config.large_trades_side, LargeTradesSide::Both);
+        assert_eq!(
+            config.trade_pace,
+            crate::chart::trade_pace::Config::default()
+        );
         assert_eq!(
             config.footprint_summary_abnormal_multiplier,
             Config::FOOTPRINT_SUMMARY_ABNORMAL_MULTIPLIER_DEFAULT
@@ -954,6 +1042,55 @@ mod config_tests {
                 config: crate::chart::tpo::Config::default(),
             }
             .allows_indicator(KlineIndicator::CmeGap)
+        );
+    }
+
+    #[test]
+    fn trade_pace_reuses_candle_footprint_and_renko_subplots_but_is_hidden_on_tpo() {
+        for kind in [
+            KlineChartKind::Candles,
+            KlineChartKind::Footprint {
+                clusters: ClusterKind::BidAsk,
+                scaling: ClusterScaling::default(),
+                studies: vec![],
+            },
+            KlineChartKind::Renko {
+                config: RenkoConfig::default(),
+            },
+        ] {
+            assert!(kind.allows_indicator(KlineIndicator::TradePace));
+        }
+        assert!(
+            !KlineChartKind::Tpo {
+                config: crate::chart::tpo::Config::default()
+            }
+            .allows_indicator(KlineIndicator::TradePace)
+        );
+    }
+
+    #[test]
+    fn orderflow_is_only_available_on_candles_and_footprints() {
+        let indicator = KlineIndicator::OrderflowReversals;
+        assert!(KlineChartKind::Candles.allows_indicator(indicator));
+        assert!(
+            KlineChartKind::Footprint {
+                clusters: ClusterKind::BidAsk,
+                scaling: ClusterScaling::default(),
+                studies: Vec::new()
+            }
+            .allows_indicator(indicator)
+        );
+        assert!(
+            !KlineChartKind::Renko {
+                config: RenkoConfig::default()
+            }
+            .allows_indicator(indicator)
+        );
+        assert!(
+            !KlineChartKind::Tpo {
+                config: crate::chart::tpo::Config::default()
+            }
+            .allows_indicator(indicator)
         );
     }
 }

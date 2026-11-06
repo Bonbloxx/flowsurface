@@ -13,6 +13,7 @@ pub trait Indicator: PartialEq + Display + 'static {
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize, Eq, Enum)]
 pub enum KlineIndicator {
     Volume,
+    TradePace,
     BarAnalysis,
     CumulativeDelta,
     OpenInterest,
@@ -23,6 +24,31 @@ pub enum KlineIndicator {
     LiquidityHeatmap,
     LargeTrades,
     VisibleRangeProfile,
+    OrderflowReversals,
+}
+
+/// Read each saved indicator independently so an entry from a newer build
+/// cannot erase the user's other enabled indicators.
+pub fn deserialize_kline_indicators<'de, D>(
+    deserializer: D,
+) -> Result<Vec<KlineIndicator>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum CompatibleIndicator {
+        Known(KlineIndicator),
+        Unknown(serde::de::IgnoredAny),
+    }
+    let entries: Vec<CompatibleIndicator> = crate::util::ok_or_default(deserializer)?;
+    Ok(entries
+        .into_iter()
+        .filter_map(|entry| match entry {
+            CompatibleIndicator::Known(indicator) => Some(indicator),
+            CompatibleIndicator::Unknown(_) => None,
+        })
+        .collect())
 }
 
 impl Indicator for KlineIndicator {
@@ -38,8 +64,9 @@ impl KlineIndicator {
     // Indicator togglers on UI menus depend on these arrays.
     // Every variant needs to be in either SPOT, PERPS or both.
     /// Indicators that can be used with spot market tickers
-    const FOR_SPOT: [KlineIndicator; 8] = [
+    const FOR_SPOT: [KlineIndicator; 9] = [
         KlineIndicator::Volume,
+        KlineIndicator::TradePace,
         KlineIndicator::BarAnalysis,
         KlineIndicator::CumulativeDelta,
         KlineIndicator::DailyDelta,
@@ -49,8 +76,9 @@ impl KlineIndicator {
         KlineIndicator::VisibleRangeProfile,
     ];
     /// Indicators that can be used with perpetual swap market tickers
-    const FOR_PERPS: [KlineIndicator; 10] = [
+    const FOR_PERPS: [KlineIndicator; 12] = [
         KlineIndicator::Volume,
+        KlineIndicator::TradePace,
         KlineIndicator::BarAnalysis,
         KlineIndicator::CumulativeDelta,
         KlineIndicator::OpenInterest,
@@ -60,6 +88,7 @@ impl KlineIndicator {
         KlineIndicator::LiquidityHeatmap,
         KlineIndicator::LargeTrades,
         KlineIndicator::VisibleRangeProfile,
+        KlineIndicator::OrderflowReversals,
     ];
 
     /// Overlay drawn on the main chart instead of a subplot row.
@@ -72,13 +101,14 @@ impl KlineIndicator {
                 | Self::LiquidityHeatmap
                 | Self::LargeTrades
                 | Self::VisibleRangeProfile
+                | Self::OrderflowReversals
         )
     }
 
     /// Overlay that needs executed trades bucketed onto the visible candles
     /// (live tape + visible-range history), without the UTC-day trade book.
     pub fn needs_visible_trades(self) -> bool {
-        matches!(self, Self::VisibleRangeProfile)
+        matches!(self, Self::VisibleRangeProfile | Self::OrderflowReversals)
     }
 
     /// Needs the shared multi-venue daily trade history pipeline.
@@ -94,6 +124,7 @@ impl Display for KlineIndicator {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             KlineIndicator::Volume => write!(f, "Volume"),
+            KlineIndicator::TradePace => write!(f, "Trade Pace"),
             KlineIndicator::BarAnalysis => write!(f, "Bar Analysis"),
             KlineIndicator::CumulativeDelta => write!(f, "CVD"),
             KlineIndicator::OpenInterest => write!(f, "Open Interest"),
@@ -104,6 +135,7 @@ impl Display for KlineIndicator {
             KlineIndicator::LiquidityHeatmap => write!(f, "Liquidity Heatmap"),
             KlineIndicator::LargeTrades => write!(f, "Large Trades"),
             KlineIndicator::VisibleRangeProfile => write!(f, "VPVR"),
+            KlineIndicator::OrderflowReversals => write!(f, "Absorption & Exhaustion"),
         }
     }
 }

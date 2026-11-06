@@ -81,6 +81,7 @@ pub enum Message {
     SplitDragged(usize, f32),
     DoubleClick(AxisScaleClicked),
     IndicatorViewChanged(KlineIndicator, indicator::plot::IndicatorViewEvent),
+    TradePaceWindowChanged(u16),
     RectangleToolToggled,
     RectangleDrawn(RectangleAnnotation),
     RectanglesCleared,
@@ -106,6 +107,8 @@ pub trait Chart: PlotConstants + canvas::Program<Message> {
     }
 
     fn view_indicators(&'_ self, enabled: &[Self::IndicatorKind]) -> Vec<Element<'_, Message>>;
+
+    fn set_trade_pace_window(&mut self, _seconds: u16) {}
 
     fn visible_timerange(&self) -> Option<(u64, u64)>;
 
@@ -620,6 +623,7 @@ pub fn update<T: Chart>(chart: &mut T, message: &Message) {
                 return;
             }
         }
+        Message::TradePaceWindowChanged(seconds) => chart.set_trade_pace_window(*seconds),
         Message::RectangleToolToggled => {
             let state = chart.mut_state();
             state.rectangle_tool_active = !state.rectangle_tool_active;

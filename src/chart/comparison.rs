@@ -8,9 +8,17 @@ use exchange::adapter::StreamKind;
 use exchange::{Kline, SerTicker, TickerInfo, Timeframe, UnixMs};
 
 use rustc_hash::FxHashMap;
-use std::time::Instant;
+use std::{collections::VecDeque, time::Instant};
 
 const SERIES_MAX_POINTS: usize = 5000;
+const MAX_CACHED_POINTS: usize = 200_000;
+const MAX_CACHED_TIMEFRAMES: usize = 5;
+
+struct CachedTimeframe {
+    timeframe: Timeframe,
+    series: Vec<Series>,
+}
+
 const DEFAULT_PAN_POINTS: f32 = 8.0;
 
 pub enum Action {
@@ -23,6 +31,35 @@ pub enum Action {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timeframe_roundtrip_keeps_series_and_refreshes_the_missing_tail() {
+        let source = TickerInfo::new(
+            exchange::Ticker::new("BTCUSDT", exchange::adapter::Exchange::BinanceLinear),
+            0.1,
+            0.001,
+            None,
+        );
+        let now = UnixMs::now().floor_to(Timeframe::M1);
+        let mut chart = ComparisonChart::new(Basis::Time(Timeframe::M1), &[source], None);
+        chart.series[0].points = (1..=100)
+            .rev()
+            .map(|i| (now.saturating_sub(i * 60_000).as_u64(), 100.0))
+            .collect();
+        chart.set_basis(Basis::Time(Timeframe::M5));
+        chart.zoom = Zoom::points(40);
+        let action = chart.set_basis(Basis::Time(Timeframe::M1));
+        assert_eq!(chart.series[0].points.len(), 100);
+        let Some(super::super::Action::RequestFetch(specs)) = action else {
+            panic!("tail refresh");
+        };
+        assert!(
+            specs
+                .iter()
+                .any(|spec| matches!(spec.fetch, FetchRange::Kline(from, _) if from == now))
+        );
+        assert!(!specs.iter().any(|spec| matches!(spec.fetch, FetchRange::Kline(from, _) if from < now.saturating_sub(100 * 60_000))));
+    }
 
     #[test]
     fn jump_to_latest_resets_only_the_horizontal_pan() {
@@ -52,6 +89,8 @@ pub struct ComparisonChart {
     pub series_editor: series_editor::TickerSeriesEditor,
     cache_rev: u64,
     rectangle_tool_active: bool,
+    timeframe_cache: VecDeque<CachedTimeframe>,
+    refresh_from: Option<(UnixMs, UnixMs)>,
 }
 
 #[derive(Debug, Clone)]
@@ -108,6 +147,8 @@ impl ComparisonChart {
             series_editor: series_editor::TickerSeriesEditor::default(),
             cache_rev: 0,
             rectangle_tool_active: false,
+            timeframe_cache: VecDeque::new(),
+            refresh_from: None,
         }
     }
 
@@ -328,6 +369,7 @@ impl ComparisonChart {
     }
 
     pub fn add_ticker(&mut self, ticker_info: &TickerInfo) -> Vec<StreamKind> {
+        self.timeframe_cache.clear();
         if !self.selected_tickers.contains(ticker_info) {
             self.selected_tickers.push(*ticker_info);
         }
@@ -338,6 +380,7 @@ impl ComparisonChart {
     }
 
     pub fn remove_ticker(&mut self, ticker_info: &TickerInfo) -> Vec<StreamKind> {
+        self.timeframe_cache.clear();
         if let Some(idx) = self.series_index.remove(ticker_info) {
             self.series.remove(idx);
             self.series_index.clear();
@@ -423,6 +466,10 @@ impl ComparisonChart {
     pub fn set_basis(&mut self, basis: data::chart::Basis) -> Option<super::Action> {
         match basis {
             Basis::Time(tf) => {
+                if self.timeframe == tf {
+                    return None;
+                }
+                let previous_tf = self.timeframe;
                 self.timeframe = tf;
 
                 let prev_colors: FxHashMap<TickerInfo, iced::Color> = self
@@ -436,20 +483,72 @@ impl ComparisonChart {
                     .map(|s| (s.ticker_info, s.name.clone()))
                     .collect();
 
-                self.series.clear();
+                let restored = self
+                    .timeframe_cache
+                    .iter()
+                    .position(|entry| entry.timeframe == tf)
+                    .and_then(|index| self.timeframe_cache.remove(index));
+                let mut previous = std::mem::take(&mut self.series);
+                let cutoff = UnixMs::now().floor_to(previous_tf).as_u64();
+                for series in &mut previous {
+                    series.points.retain(|(time, _)| *time < cutoff);
+                }
+                let points = previous
+                    .iter()
+                    .map(|series| series.points.capacity())
+                    .sum::<usize>();
+                if points > 0 && points <= MAX_CACHED_POINTS {
+                    while self.timeframe_cache.len() >= MAX_CACHED_TIMEFRAMES
+                        || self
+                            .timeframe_cache
+                            .iter()
+                            .flat_map(|entry| &entry.series)
+                            .map(|series| series.points.capacity())
+                            .sum::<usize>()
+                            + points
+                            > MAX_CACHED_POINTS
+                    {
+                        self.timeframe_cache.pop_front();
+                    }
+                    self.timeframe_cache.push_back(CachedTimeframe {
+                        timeframe: previous_tf,
+                        series: previous,
+                    });
+                }
+                self.refresh_from = restored
+                    .as_ref()
+                    .and_then(|cached| {
+                        cached
+                            .series
+                            .iter()
+                            .filter_map(|series| {
+                                series.points.last().map(|(time, _)| UnixMs::new(*time))
+                            })
+                            .min()
+                    })
+                    .map(|last| {
+                        (
+                            last.saturating_add(tf.to_milliseconds()),
+                            UnixMs::now().floor_to(tf),
+                        )
+                    });
+                self.series = restored.map(|cached| cached.series).unwrap_or_default();
                 self.series_index.clear();
-
                 for (i, &t) in self.selected_tickers.iter().enumerate() {
                     let color = prev_colors
                         .get(&t)
                         .copied()
                         .unwrap_or_else(|| self.color_for_or_default(&t));
                     let name = prev_names.get(&t).cloned().unwrap_or(None);
-
-                    self.series.push(Series::new(t, color, name));
+                    if let Some(series) = self.series.get_mut(i) {
+                        series.color = color;
+                        series.name = name;
+                    } else {
+                        self.series.push(Series::new(t, color, name));
+                    }
                     self.series_index.insert(t, i);
                 }
-
+                self.cache_rev = self.cache_rev.wrapping_add(1);
                 self.rebuild_handlers();
 
                 let reqs = self.collect_fetch_reqs(self.desired_fetch_batches(self.pan));
@@ -590,6 +689,10 @@ impl ComparisonChart {
         let last_closed = self.align_floor(UnixMs::now());
 
         let mut batches: Vec<(FetchRange, Vec<TickerInfo>)> = Vec::new();
+
+        if let Some((from, to)) = self.refresh_from {
+            batches.push((FetchRange::Kline(from, to), self.selected_tickers.clone()));
+        }
 
         // Seed empties
         let mut empty_tickers: Vec<TickerInfo> = Vec::new();

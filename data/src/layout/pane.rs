@@ -62,11 +62,32 @@ pub enum Pane {
     KlineChart {
         layout: ViewConfig,
         kind: KlineChartKind,
+        #[serde(
+            default,
+            deserialize_with = "ok_or_default",
+            skip_serializing_if = "Option::is_none"
+        )]
+        renko_state: Option<Box<crate::aggr::ticks::RenkoSnapshot>>,
+        #[serde(
+            default,
+            deserialize_with = "ok_or_default",
+            skip_serializing_if = "Option::is_none"
+        )]
+        trev_state: Option<Box<crate::aggr::ticks::TrevSnapshot>>,
+        #[serde(
+            default,
+            deserialize_with = "ok_or_default",
+            skip_serializing_if = "Option::is_none"
+        )]
+        orderflow_state: Option<Box<crate::chart::orderflow::Snapshot>>,
         #[serde(deserialize_with = "ok_or_default", default)]
         stream_type: Vec<PersistStreamKind>,
         #[serde(deserialize_with = "ok_or_default")]
         settings: Settings,
-        #[serde(deserialize_with = "ok_or_default", default)]
+        #[serde(
+            deserialize_with = "crate::chart::indicator::deserialize_kline_indicators",
+            default
+        )]
         indicators: Vec<KlineIndicator>,
         #[serde(deserialize_with = "ok_or_default", default)]
         link_group: Option<LinkGroup>,
@@ -118,12 +139,19 @@ pub struct Settings {
     pub aggregate_sources: Option<Vec<Ticker>>,
     /// Venue sources used by the independent Footprint History indicator.
     pub footprint_history_sources: Option<Vec<Ticker>>,
+    /// Independent execution sources for Absorption & Exhaustion. Old layouts
+    /// keep their original single primary venue until explicitly changed.
+    pub orderflow_sources: Option<Vec<Ticker>>,
     /// Combine selected Footprint History venues into one composite footprint.
     pub footprint_history_aggregate: bool,
     /// Venue sources used by the Open Interest indicator.
     pub open_interest_sources: Option<Vec<Ticker>>,
     /// `None` preserves the aggregate-by-default behavior for older layouts.
     pub open_interest_aggregate: Option<bool>,
+    /// Independent live execution pace venues; None selects equivalent venues.
+    pub trade_pace_sources: Option<Vec<Ticker>>,
+    /// None defaults to aggregation, including layouts saved before this indicator.
+    pub trade_pace_aggregate: Option<bool>,
     /// Venue books combined by the toggleable kline liquidity heatmap.
     pub liquidity_heatmap_sources: Option<Vec<Ticker>>,
 }
@@ -227,6 +255,7 @@ pub enum ContentKind {
     FootprintChart,
     FootprintHistory,
     RenkoChart,
+    TrevChart,
     TpoChart,
     CandlestickChart,
     ComparisonChart,
@@ -235,13 +264,14 @@ pub enum ContentKind {
 }
 
 impl ContentKind {
-    pub const ALL: [ContentKind; 11] = [
+    pub const ALL: [ContentKind; 12] = [
         ContentKind::Starter,
         ContentKind::HeatmapChart,
         ContentKind::ShaderHeatmap,
         ContentKind::FootprintChart,
         ContentKind::FootprintHistory,
         ContentKind::RenkoChart,
+        ContentKind::TrevChart,
         ContentKind::TpoChart,
         ContentKind::CandlestickChart,
         ContentKind::ComparisonChart,
@@ -252,6 +282,14 @@ impl ContentKind {
     /// Whether this surface consumes the reusable aggregate market-data feed.
     /// Add future aggregate-aware tools here; their stream planning stays in
     /// the shared aggregation layer.
+    pub fn can_sync_visuals_with(self, other: Self) -> bool {
+        if matches!(self, Self::TrevChart) || matches!(other, Self::TrevChart) {
+            self == other
+        } else {
+            true
+        }
+    }
+
     pub fn supports_aggregate_feed(self) -> bool {
         matches!(self, ContentKind::FootprintChart | ContentKind::TpoChart)
     }
@@ -266,6 +304,7 @@ impl std::fmt::Display for ContentKind {
             ContentKind::FootprintChart => "Footprint · Executed Trades",
             ContentKind::FootprintHistory => "Footprint History",
             ContentKind::RenkoChart => "Renko Chart",
+            ContentKind::TrevChart => "TRev Chart",
             ContentKind::TpoChart => "TPO · Market Profile",
             ContentKind::CandlestickChart => "Candlestick Chart",
             ContentKind::ComparisonChart => "Comparison Chart",
@@ -333,7 +372,7 @@ impl PaneSetup {
                         Basis::default_kline_time(Some(base_ticker), Timeframe::M5)
                     }))
                 }
-                ContentKind::RenkoChart | ContentKind::TpoChart => {
+                ContentKind::RenkoChart | ContentKind::TrevChart | ContentKind::TpoChart => {
                     Some(Basis::Tick(crate::aggr::TickCount(1)))
                 }
                 ContentKind::CandlestickChart | ContentKind::ComparisonChart => {
@@ -372,7 +411,7 @@ impl PaneSetup {
             ContentKind::FootprintHistory => {
                 Some(current_tick_multiplier.unwrap_or(TickMultiplier(1000)))
             }
-            ContentKind::RenkoChart | ContentKind::TpoChart => None,
+            ContentKind::RenkoChart | ContentKind::TrevChart | ContentKind::TpoChart => None,
             ContentKind::CandlestickChart
             | ContentKind::ComparisonChart
             | ContentKind::TimeAndSales

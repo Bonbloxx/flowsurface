@@ -2,7 +2,10 @@ pub mod comparison;
 pub mod heatmap;
 pub mod indicator;
 pub mod kline;
+pub mod orderflow;
 pub mod tpo;
+pub mod trade_pace;
+pub mod trev;
 
 use exchange::UnixMs;
 use exchange::{Timeframe, unit::Price};

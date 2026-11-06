@@ -1,3 +1,5 @@
+import { readHistoryDays } from './history-days.mjs';
+
 const MINUTE_MS = 60_000;
 const DEFAULT_PAGE_SIZE = 10_000;
 const MAX_PAGE_SIZE = 20_000;
@@ -237,15 +239,23 @@ async function history(request, env) {
     const limit = Math.min(integerParameter(url, "limit", DEFAULT_PAGE_SIZE), MAX_PAGE_SIZE);
     if (from > to || limit === 0) throw new Error("invalid range");
     const query = env.DB.prepare(`
-      SELECT bucket_ms, observed_at_ms, usd_open_interest, oi_definition
+      SELECT bucket_ms, observed_at_ms, usd_open_interest, oi_definition,
+             raw_open_interest, raw_unit, mark_price
       FROM oi_samples
       WHERE venue = ? AND market = ? AND symbol = ?
         AND bucket_ms >= ? AND bucket_ms <= ?
       ORDER BY bucket_ms ASC
       LIMIT ?
     `).bind(venue, market, symbol, from, to, limit + 1);
-    const result = await query.all();
-    const rows = result.results ?? [];
+    let rows;
+    if (env.HISTORY_DAYS === 'v1' && to - from > 6 * 60 * MINUTE_MS && limit >= 1_000) {
+      try {
+        rows = await readHistoryDays(env.DB, venue, market, symbol, from, to, limit);
+      } catch (error) {
+        console.error(JSON.stringify({ event: 'oi_history_days_fallback', error: String(error.message ?? error) }));
+      }
+    }
+    if (rows === undefined) rows = (await query.all()).results ?? [];
     const page = rows.slice(0, limit);
     const nextFrom = rows.length > limit
       ? Number(page[page.length - 1].bucket_ms) + MINUTE_MS
@@ -264,6 +274,21 @@ async function history(request, env) {
           : Number(row.usd_open_interest),
       ]),
       next_from: nextFrom,
+      // Opt-in additive contract: existing FlowSurface v1 clients continue
+      // receiving exactly the same USD points. Never infer base OI from a
+      // historical USD value using today's price.
+      ...(url.searchParams.get("include_raw") === "1" ? {
+        raw_version: 1,
+        observations: page.map((row) => ({
+          bucket_ms: Number(row.bucket_ms),
+          observed_at_ms: Number(row.observed_at_ms),
+          raw_open_interest: Number(row.raw_open_interest),
+          raw_unit: row.raw_unit,
+          mark_price: Number(row.mark_price),
+          usd_open_interest: Number(row.usd_open_interest),
+          definition: row.oi_definition,
+        })),
+      } : {}),
     }, 200, { "cache-control": "private, max-age=30" });
   } catch (error) {
     return responseJson({ error: String(error.message ?? error) }, 400);

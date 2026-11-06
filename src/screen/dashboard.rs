@@ -105,6 +105,41 @@ fn extend_open_interest_catalog_sources(
     }
 }
 
+fn extend_trade_pace_catalog_sources(
+    state: &pane::State,
+    tickers: &mut Vec<TickerInfo>,
+    catalog: &rustc_hash::FxHashMap<exchange::Ticker, Option<TickerInfo>>,
+) {
+    if !matches!(&state.content, pane::Content::Kline { indicators, .. } if indicators.contains(&KlineIndicator::TradePace))
+    {
+        return;
+    }
+    let Some(primary) = tickers.first().copied() else {
+        return;
+    };
+    let available = data::aggregation::equivalent_footprint_sources(
+        primary,
+        catalog.values().filter_map(|info| *info),
+    );
+    for source in available {
+        if state
+            .settings
+            .trade_pace_sources
+            .as_ref()
+            .is_none_or(|wanted| {
+                wanted
+                    .iter()
+                    .any(|ticker| ticker.same_market(&source.ticker))
+            })
+            && !tickers
+                .iter()
+                .any(|current| current.ticker.same_market(&source.ticker))
+        {
+            tickers.push(source);
+        }
+    }
+}
+
 #[derive(Clone, Hash)]
 enum MarketStreamPlan {
     Depth(StreamConfig<TickerInfo>),
@@ -430,11 +465,15 @@ impl Dashboard {
                 pane::Message::VisualConfigChanged(pane, cfg, to_sync) => {
                     if to_sync {
                         if let Some(state) = self.get_pane(main_window.id, window, pane) {
+                            let source_kind = state.content.kind();
                             let studies_cfg = state.content.studies();
                             let clusters_cfg = state.content.clusters();
 
                             self.iter_all_panes_mut(main_window.id)
                                 .for_each(|(_, _, state)| {
+                                    if !source_kind.can_sync_visuals_with(state.content.kind()) {
+                                        return;
+                                    }
                                     let should_apply = match state.settings.visual_config {
                                         Some(ref current_cfg) => {
                                             std::mem::discriminant(current_cfg)
@@ -1342,6 +1381,46 @@ impl Dashboard {
         }
     }
 
+    pub fn invalidate_cached_trade_continuity(
+        &mut self,
+        streams: &[StreamKind],
+        main_window: window::Id,
+    ) {
+        self.iter_all_panes_mut(main_window)
+            .for_each(|(_, _, state)| {
+                if streams.iter().any(|stream| {
+                    matches!(stream, StreamKind::Trades { .. }) && state.matches_stream(stream)
+                }) && let pane::Content::Kline {
+                    chart: Some(chart), ..
+                } = &mut state.content
+                {
+                    chart.break_cached_trade_continuity();
+                }
+            });
+    }
+
+    pub fn trade_pace_connection(
+        &mut self,
+        streams: &[StreamKind],
+        connected: bool,
+        main_window: window::Id,
+    ) {
+        let now = UnixMs::now();
+        self.iter_all_panes_mut(main_window)
+            .for_each(|(_, _, state)| {
+                for stream in streams {
+                    if matches!(stream, StreamKind::Trades { .. })
+                        && state.matches_stream(stream)
+                        && let pane::Content::Kline {
+                            chart: Some(chart), ..
+                        } = &mut state.content
+                    {
+                        chart.trade_pace_connection(stream.ticker_info(), connected, now);
+                    }
+                }
+            });
+    }
+
     pub fn update_latest_klines(
         &mut self,
         stream: &StreamKind,
@@ -1478,6 +1557,22 @@ impl Dashboard {
         }
     }
 
+    pub fn orderflow_disconnected(&mut self, streams: &[StreamKind], main_window: window::Id) {
+        self.iter_all_panes_mut(main_window)
+            .for_each(|(_, _, state)| {
+                if let pane::Content::Kline {
+                    chart: Some(chart), ..
+                } = &mut state.content
+                {
+                    for stream in streams {
+                        if let StreamKind::Trades { ticker_info } = stream {
+                            chart.orderflow_disconnected(*ticker_info);
+                        }
+                    }
+                }
+            });
+    }
+
     pub fn invalidate_all_panes(&mut self, main_window: window::Id) {
         self.iter_all_panes_mut(main_window)
             .for_each(|(_, _, state)| {
@@ -1573,11 +1668,13 @@ impl Dashboard {
             Some(pane::Action::ResolveContent) => match state.stream_pair_kind() {
                 Some(StreamPairKind::MultiSource(mut tickers)) => {
                     extend_open_interest_catalog_sources(state, &mut tickers, ticker_catalog);
+                    extend_trade_pace_catalog_sources(state, &mut tickers, ticker_catalog);
                     state.set_content_and_streams(tickers, state.content.kind());
                 }
                 Some(StreamPairKind::SingleSource(ticker)) => {
                     let mut tickers = vec![ticker];
                     extend_open_interest_catalog_sources(state, &mut tickers, ticker_catalog);
+                    extend_trade_pace_catalog_sources(state, &mut tickers, ticker_catalog);
                     state.set_content_and_streams(tickers, state.content.kind());
                 }
                 None => {}
@@ -2048,5 +2145,103 @@ mod tests {
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].len(), 1);
         assert_eq!(snapshot(&batches[0][0]), expected);
+    }
+
+    #[test]
+    fn trev_visual_broadcasts_cannot_cross_the_chart_boundary_in_either_direction() {
+        use data::layout::pane::{ContentKind, VisualConfig};
+        let id = uuid::Uuid::new_v4();
+        let make = |kind| {
+            let mut state = pane::State::default();
+            state.set_content_and_streams(vec![source()], kind);
+            state
+        };
+        let mut dashboard = Dashboard::from_config(
+            Configuration::Pane(make(ContentKind::TrevChart)),
+            vec![],
+            id,
+        );
+        let first = *dashboard.panes.iter().next().unwrap().0;
+        for kind in [
+            ContentKind::TrevChart,
+            ContentKind::CandlestickChart,
+            ContentKind::FootprintChart,
+            ContentKind::RenkoChart,
+            ContentKind::TpoChart,
+        ] {
+            dashboard
+                .panes
+                .split(pane_grid::Axis::Vertical, first, make(kind))
+                .unwrap();
+        }
+        let window = Window::new(window::Id::unique());
+        let sources = DataSources {
+            exchange: AdapterHandles::spawn_venues(&reqwest::Client::new(), [], None),
+            server: None,
+            oi_history: None,
+        };
+        let before = dashboard
+            .panes
+            .iter()
+            .map(|(id, state)| (*id, serde_json::to_value(data::Pane::from(state)).unwrap()))
+            .collect::<HashMap<_, _>>();
+        let cfg = data::chart::kline::Config {
+            data_labels_always_visible: true,
+            show_footprint_summary: true,
+            ..Default::default()
+        };
+        let _ = dashboard.update(
+            Message::Pane(
+                window.id,
+                pane::Message::VisualConfigChanged(first, VisualConfig::Kline(cfg), true),
+            ),
+            &window,
+            &id,
+            &sources,
+        );
+        for (pane, state) in dashboard.panes.iter() {
+            if state.content.kind() == ContentKind::TrevChart {
+                assert_eq!(
+                    state.settings.visual_config.as_ref().unwrap().kline(),
+                    Some(cfg)
+                );
+            } else {
+                assert_eq!(
+                    serde_json::to_value(data::Pane::from(state)).unwrap(),
+                    before[pane]
+                );
+            }
+        }
+        let trev = dashboard
+            .panes
+            .iter()
+            .filter(|(_, state)| state.content.kind() == ContentKind::TrevChart)
+            .map(|(id, state)| (*id, serde_json::to_value(data::Pane::from(state)).unwrap()))
+            .collect::<HashMap<_, _>>();
+        let candle = *dashboard
+            .panes
+            .iter()
+            .find(|(_, s)| s.content.kind() == ContentKind::CandlestickChart)
+            .unwrap()
+            .0;
+        let _ = dashboard.update(
+            Message::Pane(
+                window.id,
+                pane::Message::VisualConfigChanged(
+                    candle,
+                    VisualConfig::Kline(Default::default()),
+                    true,
+                ),
+            ),
+            &window,
+            &id,
+            &sources,
+        );
+        for (pane, expected) in trev {
+            assert_eq!(
+                serde_json::to_value(data::Pane::from(dashboard.panes.get(pane).unwrap())).unwrap(),
+                expected
+            );
+        }
     }
 }

@@ -9,6 +9,11 @@ use exchange::{Kline, Trade, UnixMs, Volume};
 
 use std::collections::{BTreeMap, BTreeSet};
 
+mod renko;
+mod trev;
+pub use renko::RenkoSnapshot;
+pub use trev::Snapshot as TrevSnapshot;
+
 #[derive(Debug, Clone)]
 pub struct TickAccumulation {
     pub tick_count: usize,
@@ -110,21 +115,25 @@ impl TickAccumulation {
     }
 }
 
+#[derive(Clone)]
 pub struct TickAggr {
     pub datapoints: Vec<TickAccumulation>,
     pub interval: aggr::TickCount,
     pub tick_size: PriceStep,
-    renko: Option<RenkoState>,
+    trev: Option<Box<trev::State>>,
+    renko: Option<Box<RenkoState>>,
+    renko_last_trades: Vec<Trade>,
+    renko_trimmed: bool,
     tpo: Option<TpoState>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum RenkoDirection {
     Up,
     Down,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 struct RenkoState {
     config: RenkoConfig,
     direction: Option<RenkoDirection>,
@@ -143,6 +152,9 @@ impl TickAggr {
             interval,
             tick_size,
             renko: None,
+            trev: None,
+            renko_last_trades: Vec::new(),
+            renko_trimmed: false,
             tpo: None,
         };
 
@@ -154,69 +166,23 @@ impl TickAggr {
     }
 
     pub fn new_renko(config: RenkoConfig, tick_size: PriceStep, raw_trades: &[Trade]) -> Self {
-        Self::new_renko_seeded(config, tick_size, &[], raw_trades)
-    }
-
-    /// Build close-based historical Renko bricks, then continue the developing
-    /// brick with newer live trades. Using compact minute bars for the seed is
-    /// deliberate: a liquid market can print millions of trades in the time it
-    /// takes to form a useful Renko history.
-    pub fn new_renko_seeded(
-        config: RenkoConfig,
-        tick_size: PriceStep,
-        klines: &[Kline],
-        raw_trades: &[Trade],
-    ) -> Self {
         let mut tick_aggr = Self {
             datapoints: Vec::new(),
             // One x-axis unit represents one Renko brick.
             interval: aggr::TickCount(1),
             tick_size,
-            renko: Some(RenkoState {
+            renko: Some(Box::new(RenkoState {
                 config: config.normalized(),
                 direction: None,
                 last_input_time: None,
-            }),
+            })),
+            trev: None,
+            renko_last_trades: Vec::new(),
+            renko_trimmed: false,
             tpo: None,
         };
 
-        let mut ordered_klines = klines.to_vec();
-        ordered_klines.sort_by_key(|kline| kline.time);
-
-        // Ignore the still-forming minute. Its close is already represented by
-        // the live trade stream and applying both would double-count movement.
-        let minute_ms = 60_000;
-        let current_minute = UnixMs::now().as_u64() / minute_ms * minute_ms;
-        ordered_klines.retain(|kline| kline.time.as_u64() < current_minute);
-
-        for kline in &ordered_klines {
-            tick_aggr.insert_renko_price(kline.time, kline.close, None);
-        }
-
-        let seed_cutoff = ordered_klines
-            .last()
-            .map(|kline| kline.time.saturating_add(minute_ms).saturating_sub(1));
-        // Live buffers are normally chronological, but delayed websocket
-        // flushes and reconnect handoffs can append an older batch. Replaying
-        // that retained tail verbatim makes Renko walk backward and forward
-        // through price at nearly one timestamp. Keep the zero-allocation fast
-        // path while restoring chronological construction when needed.
-        let reordered_raw_trades = (!raw_trades
-            .windows(2)
-            .all(|pair| pair[0].time <= pair[1].time))
-        .then(|| {
-            let mut ordered = raw_trades.to_vec();
-            ordered.sort_by_key(|trade| trade.time);
-            ordered
-        });
-        let raw_trades = reordered_raw_trades.as_deref().unwrap_or(raw_trades);
-
-        for trade in raw_trades
-            .iter()
-            .filter(|trade| seed_cutoff.is_none_or(|cutoff| trade.time > cutoff))
-        {
-            tick_aggr.insert_renko_price(trade.time, trade.price, Some(trade));
-        }
+        tick_aggr.insert_renko_trades(raw_trades);
 
         // No NPoC pass here: Renko never renders POC status, and the scan is
         // quadratic in brick count — prohibitive on a month of seeded bricks.
@@ -246,6 +212,9 @@ impl TickAggr {
             interval: aggr::TickCount(1),
             tick_size,
             renko: None,
+            trev: None,
+            renko_last_trades: Vec::new(),
+            renko_trimmed: false,
             tpo: Some(TpoState {
                 config: config.normalized(),
             }),
@@ -418,6 +387,10 @@ impl TickAggr {
     }
 
     pub fn insert_trades(&mut self, buffer: &[Trade]) {
+        if self.is_trev() {
+            self.insert_trev_trades(buffer);
+            return;
+        }
         if self.tpo.is_some() {
             self.insert_tpo_trades(buffer);
             return;
@@ -474,6 +447,10 @@ impl TickAggr {
         for trade in buffer {
             self.insert_renko_trade(trade);
         }
+        self.renko_trimmed = false;
+        if let Some(last) = self.renko_last_input_time() {
+            self.trim_renko_history(last);
+        }
         // POC/NPoC status is only rendered on Footprint charts; skipping the
         // quadratic rescan here keeps live Renko inserts O(buffer) even with
         // a month of bricks loaded.
@@ -484,7 +461,7 @@ impl TickAggr {
     }
 
     fn insert_renko_price(&mut self, time: UnixMs, price: Price, trade: Option<&Trade>) {
-        let Some(mut state) = self.renko else {
+        let Some(mut state) = self.renko.as_deref().copied() else {
             return;
         };
 
@@ -498,6 +475,12 @@ impl TickAggr {
         {
             return;
         }
+        if state.last_input_time != Some(time) {
+            self.renko_last_trades.clear();
+        }
+        if let Some(trade) = trade {
+            self.renko_last_trades.push(*trade);
+        }
         state.last_input_time = Some(time);
 
         if self.datapoints.is_empty() {
@@ -505,7 +488,7 @@ impl TickAggr {
                 || TickAccumulation::empty_at(time, price, price),
                 |trade| TickAccumulation::new(trade, self.tick_size),
             ));
-            self.renko = Some(state);
+            *self.renko.as_deref_mut().expect("Renko state initialized") = state;
             return;
         }
 
@@ -526,7 +509,7 @@ impl TickAggr {
             .units
             .saturating_mul(i64::from(state.config.brick_size));
         if brick_units <= 0 {
-            self.renko = Some(state);
+            *self.renko.as_deref_mut().expect("Renko state initialized") = state;
             return;
         }
 
@@ -592,7 +575,7 @@ impl TickAggr {
                 .push(TickAccumulation::empty_at(time, close, price));
         }
 
-        self.renko = Some(state);
+        *self.renko.as_deref_mut().expect("Renko state initialized") = state;
     }
 
     fn insert_tpo_trades(&mut self, buffer: &[Trade]) {
@@ -937,18 +920,6 @@ mod tests {
         );
     }
 
-    fn kline(time: u64, close: f64) -> Kline {
-        let price = Price::from_f64(close);
-        Kline {
-            time: UnixMs::new(time),
-            open: price,
-            high: price,
-            low: price,
-            close: price,
-            volume: Volume::empty_total(),
-        }
-    }
-
     fn ranged_kline(time: u64, open: f64, high: f64, low: f64, close: f64) -> Kline {
         Kline {
             time: UnixMs::new(time),
@@ -1088,26 +1059,6 @@ mod tests {
         assert_eq!(large.datapoints.len(), 2);
         assert_eq!(small.datapoints[0].kline.close, Price::from_f64(110.0));
         assert_eq!(large.datapoints[0].kline.close, Price::from_f64(120.0));
-    }
-
-    #[test]
-    fn renko_seeds_fixed_bricks_from_compact_close_history() {
-        let config = RenkoConfig {
-            brick_size: 10,
-            reversal: 2,
-            normalization_ms: 0,
-        };
-        let klines = [kline(0, 100.0), kline(60_000, 111.0), kline(120_000, 121.0)];
-
-        let aggr = TickAggr::new_renko_seeded(config, one_dollar_step(), &klines, &[]);
-
-        assert_eq!(aggr.datapoints.len(), 3);
-        assert_eq!(aggr.datapoints[0].kline.open, Price::from_f64(100.0));
-        assert_eq!(aggr.datapoints[0].kline.close, Price::from_f64(110.0));
-        assert_eq!(aggr.datapoints[1].kline.open, Price::from_f64(110.0));
-        assert_eq!(aggr.datapoints[1].kline.close, Price::from_f64(120.0));
-        assert_eq!(aggr.datapoints[2].kline.open, Price::from_f64(120.0));
-        assert_eq!(aggr.datapoints[2].kline.close, Price::from_f64(121.0));
     }
 
     #[test]

@@ -26,7 +26,7 @@ enum PeriodKind {
 impl PeriodKind {
     fn short_name(self) -> &'static str {
         match self {
-            Self::Day => "PWD",
+            Self::Day => "PD",
             Self::Week => "PW",
             Self::Month => "PM",
             Self::Year => "PY",
@@ -536,8 +536,8 @@ mod tests {
     }
 
     #[test]
-    fn previous_day_uses_pwd_label_without_poc() {
-        assert_eq!(PeriodKind::Day.short_name(), "PWD");
+    fn previous_day_uses_pd_label_without_poc() {
+        assert_eq!(PeriodKind::Day.short_name(), "PD");
         assert!(!PeriodKind::Day.includes_poc());
         assert!(PeriodKind::Week.includes_poc());
     }

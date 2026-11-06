@@ -1,0 +1,142 @@
+{
+  "scope": "Binance USD-M BTCUSDT perpetual, time-based candles and footprints",
+  "branch": "codex/btc-absorption-exhaustion",
+  "binary_sha256": "65DAE42AB693D3CB4925CAFABDE3F217283565F5CFE608BF871BF8CF3A2B35D7",
+  "binary_note": "Release binary built from the final production implementation. Subsequent edits were cfg(test) regressions, the replay example, and documentation.",
+  "checks": [
+    {
+      "command": "cargo fmt --all -- --check",
+      "result": "passed"
+    },
+    {
+      "command": "cargo clippy --workspace --all-targets --all-features -- -D warnings",
+      "environment": "CARGO_TARGET_DIR=target/orderflow-build",
+      "result": "passed"
+    },
+    {
+      "command": "cargo test --workspace --release --target-dir target/orderflow-build -q",
+      "result": "passed",
+      "passed": 353,
+      "ignored_existing_manual_benchmarks": 10,
+      "crates": {
+        "flowsurface": { "passed": 254, "ignored": 4 },
+        "flowsurface-data": { "passed": 83, "ignored": 6 },
+        "exchange": { "passed": 16, "ignored": 0 }
+      }
+    }
+  ],
+  "focused_regressions": [
+    "Later price rejection and opposing aggressive flow are required for confirmation",
+    "Continuation cancels observations; confirmed failure remains visible",
+    "A revisit more than five minutes later cannot reclassify a previous reaction",
+    "Execution gaps, explicit disconnects and overflowing seconds reset warm-up",
+    "Base and quote quantity conventions produce the same notional",
+    "Tape, price bands and event collections remain bounded",
+    "Old persisted configurations deserialize with defaults; unsafe numeric settings are normalized",
+    "Unsupported sources cannot enter the Binance detector",
+    "Four hours plus warm-up are requested with stable retry bounds",
+    "Partial history is not published and historical overlap replaces the live tape once",
+    "Queued live batches after replay cannot invert a BTree range or mutate published seconds",
+    "Indicator history bypasses the candle raw-trade store; disabled late pages are ignored",
+    "Re-enabling the indicator requests fresh history rather than reusing discarded coverage",
+    "Renko and TPO do not offer the new indicator"
+  ],
+  "native": {
+    "execution": "Copied release binary in an isolated FLOWSURFACE_DATA_PATH profile, using the existing native iced window",
+    "checks": [
+      "Candle pane: enable from indicator picker, automatic history, live updates and visible historical marks",
+      "Readable themed hover evidence with observation and confirmation timestamps",
+      "Compact pane settings, default absorption and optional experimental exhaustion",
+      "Switch 1m to 5m, zoom and disable/re-enable without losing stream ownership",
+      "Persist, close and restart with the selected indicator and configuration retained",
+      "Footprint pane: populated executions, available indicator, settings and complete dedicated history",
+      "Renko pane: normal bricks; new indicator absent from menu and no orderflow history request",
+      "TPO pane: startup and menu gating checked; new indicator absent and no orderflow history request"
+    ],
+    "limits": [
+      "TPO's unrelated partial historical profile and viewport were not fully qualified",
+      "The existing primary app, profile and dirty checkout were not replaced",
+      "No trading orders, signing path, or funded-live strategy was exercised",
+      "Historical success here used the existing recorder plus the scoped Binance gap-fill path; the entire recorder-disabled four-hour REST download was not separately exercised natively"
+    ],
+    "issue_found_and_fixed": "Initial native replay/live handoff exposed a reversed BTree range. A shared two-second publication watermark, range guard and immutable published seconds fixed it, with a regression test and subsequent successful native runs.",
+    "final_candidate_log_scan": "No PANIC, FATAL or ERROR entries in the isolated final candle, footprint, Renko and TPO logs",
+    "history_loads": [
+      {
+        "pane": "Candles, exhaustion enabled for visual inspection",
+        "from_ms": 1791420575000,
+        "to_ms": 1791435274999,
+        "duration_ms": 14700000,
+        "aggregate_executions": 249084,
+        "occupied_seconds": 14287,
+        "estimated_compact_bytes": 3811656,
+        "replay_ms": 9,
+        "total_ingest_us": 11894,
+        "max_page_ingest_us": 565,
+        "marks": 16
+      },
+      {
+        "pane": "Candles, final default absorption after re-enable",
+        "from_ms": 1791420960000,
+        "to_ms": 1791435659999,
+        "duration_ms": 14700000,
+        "aggregate_executions": 252663,
+        "occupied_seconds": 14310,
+        "estimated_compact_bytes": 3817008,
+        "replay_ms": 10,
+        "total_ingest_us": 12325,
+        "max_page_ingest_us": 639,
+        "marks": 1
+      },
+      {
+        "pane": "Footprint, default absorption",
+        "from_ms": 1791421119000,
+        "to_ms": 1791435818999,
+        "duration_ms": 14700000,
+        "aggregate_executions": 254745,
+        "occupied_seconds": 14325,
+        "estimated_compact_bytes": 3822408,
+        "replay_ms": 9,
+        "total_ingest_us": 12170,
+        "max_page_ingest_us": 608,
+        "marks": 0
+      }
+    ]
+  },
+  "resources": {
+    "architecture": "One-second summaries; no retained raw history and no duplicate UTC-day trade book. Existing connector and subscription de-duplication are reused.",
+    "limits": {
+      "retention_ms": 15000000,
+      "max_price_bands_per_second": 32,
+      "max_events": 512,
+      "max_pending_observations": 2
+    },
+    "same_binary_five_second_cpu_snapshots": {
+      "default_enabled": { "cpu_seconds": 0.78125, "private_bytes": 267939840, "working_set_bytes": 279470080 },
+      "disabled": { "cpu_seconds": 1.015625, "private_bytes": 263852032, "working_set_bytes": 277266432 }
+    },
+    "limits_of_measurement": "Short sequential snapshots are noisy and include rendering and network work. They show no obvious CPU regression, not a controlled performance guarantee. Compact-byte estimates include approximate tree overhead and are not total process memory. Staging temporarily holds a second compact tape during history loading. Exchange archives may use the existing disk cache."
+  },
+  "replay": {
+    "receipt": "orderflow-btc-replay-2026-10-08.json",
+    "days": 4,
+    "aggregate_executions": 4051539,
+    "eligible_marks": 32,
+    "target_before_stop_5m": 20,
+    "time_shifted_control_wins": 16,
+    "frozen_holdout_marks": 4,
+    "frozen_holdout_wins": 3,
+    "default_decision": "Exhaustion remains optional and experimental after weaker validation; confirmed absorption is enabled by default",
+    "qualification": "Small selected event study, publication delay included, with fees, slippage and fill quality unmodeled; not proof of a stable edge or profitability"
+  },
+  "cleanup": {
+    "targets": [
+      { "relative_path": "target/orderflow-build", "files": 9061, "bytes": 3326208227, "removed": true, "method": "cargo clean --target-dir target/orderflow-build" },
+      { "relative_path": "target/orderflow-validation", "files": 41, "bytes": 319077297, "removed": true, "method": "Verified file paths, explicit file deletions, then empty directories" }
+    ],
+    "removed_bytes": 3645285524,
+    "retained": "Source, compact replay and verification receipts, isolated 31 MB release executable, launcher and one profile",
+    "scope": "Only temporary artifacts created in the managed implementation worktree were removed; primary checkout and existing caches untouched",
+    "review_note": "Automatic approval review blocked recursive Remove-Item cleanup commands. Cargo clean and checked individual file deletions succeeded."
+  }
+}

@@ -22,6 +22,21 @@ static TRADE_FETCH_MODE: RwLock<TradeFetchMode> = RwLock::new(TradeFetchMode::Of
 
 /// Maximum trades to request per Arrow IPC call to server.
 const ARROW_LIMIT: usize = 400_000;
+const ORDERFLOW_ARROW_LIMIT: usize = 50_000;
+const RENKO_ARROW_LIMIT: usize = 100_000;
+
+fn renko_history_gate() -> Arc<tokio::sync::Semaphore> {
+    static GATE: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+    GATE.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1)))
+        .clone()
+}
+
+// TRev has its own bounded scheduler; it cannot take Renko's history slot.
+fn trev_history_gate() -> Arc<tokio::sync::Semaphore> {
+    static GATE: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+    GATE.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1)))
+        .clone()
+}
 
 /// Keep historical trade ingestion responsive by yielding smaller work units
 /// to the iced update loop. A busy UTC day can contain millions of trades;
@@ -35,6 +50,30 @@ const TRADE_UI_CHUNK: usize = 10_000;
 const RECORDER_FINALITY_RETRY_DELAY: Duration = Duration::from_secs(4);
 const RECORDER_FINALITY_WINDOW_MS: u64 = 60_000;
 const RECORDER_FINALITY_MAX_GAP_MS: u64 = 5_000;
+
+fn orderflow_history_gate() -> Arc<tokio::sync::Semaphore> {
+    static GATE: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+    GATE.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1)))
+        .clone()
+}
+
+fn orderflow_page_extent(
+    trades: &[Trade],
+    raw_rows: usize,
+    last_ts: Option<UnixMs>,
+    limit: usize,
+) -> Result<(usize, Option<UnixMs>), AdapterError> {
+    if raw_rows < limit {
+        return Ok((trades.len(), None));
+    }
+    let last = last_ts.ok_or_else(|| {
+        AdapterError::ParseError("Orderflow history page is missing its timestamp cursor".into())
+    })?;
+    Ok((
+        trades.partition_point(|trade| trade.time < last),
+        Some(last),
+    ))
+}
 
 fn exchange_trade_gate(ticker_info: TickerInfo) -> Arc<tokio::sync::Semaphore> {
     static BINANCE: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
@@ -59,6 +98,21 @@ fn split_trade_batch(batch: Vec<Trade>) -> Vec<Vec<Trade>> {
             .map(<[Trade]>::to_vec)
             .collect()
     }
+}
+
+/// A SQL row limit can cut through one exchange millisecond. Defer that
+/// entire millisecond to the next page, instead of advancing past its tail.
+fn renko_page_extent(trades: &[Trade], limit: usize) -> (usize, Option<UnixMs>) {
+    if trades.len() < limit {
+        return (trades.len(), None);
+    }
+    let Some(last) = trades.last() else {
+        return (0, None);
+    };
+    (
+        trades.partition_point(|t| t.time < last.time),
+        Some(last.time),
+    )
 }
 
 /// Override the global trade-fetch mode at runtime.
@@ -271,6 +325,11 @@ impl RequestHandler {
         self.requests.remove(&id);
     }
 
+    pub fn drop_orderflow_requests(&mut self) {
+        self.requests
+            .retain(|_, request| !matches!(request.fetch_type, FetchRange::OrderflowTrades(..)));
+    }
+
     /// Mark a request as completed with no data — the source returned an
     /// empty result.  The range will never be retried.
     pub fn mark_no_data(&mut self, id: Uuid) {
@@ -281,6 +340,83 @@ impl RequestHandler {
         }
     }
 
+    pub(crate) fn completed_trade_prefix(
+        &self,
+        source: TickerInfo,
+        from: UnixMs,
+        to: UnixMs,
+    ) -> bool {
+        self.requests.values().any(|request| {
+            matches!(request.status, RequestStatus::Completed | RequestStatus::NoData)
+                && request.stream == Some(StreamKind::Trades { ticker_info: source })
+                && matches!(request.fetch_type, FetchRange::FootprintTrades(a, b) if a <= from && b >= to)
+        })
+    }
+
+    pub(crate) fn completed_main_trades(&self, keep: impl Fn(UnixMs, UnixMs) -> bool) -> Self {
+        Self {
+            requests: self.requests.iter().filter(|(_, request)| {
+                matches!(request.status, RequestStatus::Completed | RequestStatus::NoData)
+                    && matches!(request.fetch_type, FetchRange::FootprintTrades(from, to) if keep(from, to))
+            }).take(512).map(|(id, request)| (*id, request.clone())).collect(),
+        }
+    }
+
+    pub(crate) fn copy_completed_trade_prefix(
+        &mut self,
+        original: &Self,
+        source: TickerInfo,
+        from: UnixMs,
+        to: UnixMs,
+    ) {
+        let mut prefix = FetchRequest::new(
+            clamp_trade_window(FetchRange::FootprintTrades(from, to)),
+            Some(StreamKind::Trades {
+                ticker_info: source,
+            }),
+        );
+        if let Some(proof) = original.requests.values().find(|request| {
+            matches!(
+                request.status,
+                RequestStatus::Completed | RequestStatus::NoData
+            ) && request.contains(&prefix)
+        }) {
+            prefix.status = proof.status.clone();
+            self.requests.insert(Uuid::new_v4(), prefix);
+        }
+    }
+
+    pub(crate) fn restore_completed_requests(&mut self, cached: Self) {
+        self.requests.extend(cached.requests);
+    }
+
+    pub(crate) fn matches_range(&self, id: Uuid, range: FetchRange) -> bool {
+        self.requests
+            .get(&id)
+            .is_some_and(|request| request.fetch_type == range)
+    }
+
+    /// Partially delivered main-chart pages cannot be cached as complete bars.
+    pub(crate) fn incomplete_main_trade_ranges(&self) -> Vec<(UnixMs, UnixMs)> {
+        self.requests
+            .values()
+            .filter_map(|request| {
+                if matches!(
+                    request.status,
+                    RequestStatus::Completed | RequestStatus::NoData
+                ) {
+                    return None;
+                }
+                match request.fetch_type {
+                    FetchRange::FootprintTrades(from, to) | FetchRange::Trades(from, to) => {
+                        Some((from, to))
+                    }
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
     /// Drop kline/trade gap-fill requests but keep Footprint History backfills.
     /// Timeframe and tick-size changes must not re-download UTC-day trades.
     pub fn drop_non_footprint_history(&mut self) {
@@ -289,6 +425,7 @@ impl RequestHandler {
                 request.fetch_type,
                 FetchRange::FootprintHistoryTrades(..)
                     | FetchRange::FootprintHistoryOpenInterest(..)
+                    | FetchRange::OrderflowTrades(..)
             )
         });
     }
@@ -330,6 +467,12 @@ pub enum FetchRange {
     /// Complete executed-trade history for a visible Footprint chart range.
     /// Unlike generic seeds, this must not stop at a fixed trade-count cap.
     FootprintTrades(UnixMs, UnixMs),
+    /// Bounded execution replay for an independently selected BTC feed source.
+    OrderflowTrades(UnixMs, UnixMs),
+    /// Ordered Renko continuation, with small, paced server pages.
+    RenkoTrades(UnixMs, UnixMs),
+    /// TRev pane history, with complete ordered execution pages.
+    TrevTrades(UnixMs, UnixMs),
     /// Per-UTC-day trades requested by Footprint History / Daily Delta.
     FootprintHistoryTrades(UnixMs, UnixMs),
     /// Open-interest history requested exclusively by Footprint History.
@@ -339,7 +482,7 @@ pub enum FetchRange {
     TradesRecent(UnixMs, UnixMs),
 }
 
-#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Debug, Clone)]
 struct FetchRequest {
     fetch_type: FetchRange,
     stream: Option<StreamKind>,
@@ -374,6 +517,11 @@ impl FetchRequest {
             (FetchRange::FootprintTrades(s1, e1), FetchRange::FootprintTrades(s2, e2)) => {
                 e1 == e2 && s1 == s2
             }
+            (FetchRange::OrderflowTrades(s1, e1), FetchRange::OrderflowTrades(s2, e2))
+            | (FetchRange::RenkoTrades(s1, e1), FetchRange::RenkoTrades(s2, e2))
+            | (FetchRange::TrevTrades(s1, e1), FetchRange::TrevTrades(s2, e2)) => {
+                e1 == e2 && s1 == s2
+            }
             (
                 FetchRange::FootprintHistoryTrades(s1, e1),
                 FetchRange::FootprintHistoryTrades(s2, e2),
@@ -400,6 +548,9 @@ impl FetchRequest {
             | FetchRange::OpenInterest(from, to)
             | FetchRange::Trades(from, to)
             | FetchRange::FootprintTrades(from, to)
+            | FetchRange::OrderflowTrades(from, to)
+            | FetchRange::RenkoTrades(from, to)
+            | FetchRange::TrevTrades(from, to)
             | FetchRange::FootprintHistoryTrades(from, to)
             | FetchRange::FootprintHistoryOpenInterest(from, to)
             | FetchRange::TradesRecent(from, to) => Some((*from, *to)),
@@ -573,6 +724,9 @@ pub fn request_fetch(
         }
         FetchRange::Trades(from_time, to_time)
         | FetchRange::FootprintTrades(from_time, to_time)
+        | FetchRange::OrderflowTrades(from_time, to_time)
+        | FetchRange::RenkoTrades(from_time, to_time)
+        | FetchRange::TrevTrades(from_time, to_time)
         | FetchRange::FootprintHistoryTrades(from_time, to_time)
         | FetchRange::TradesRecent(from_time, to_time) => {
             let recent_first = matches!(fetch, FetchRange::TradesRecent(..));
@@ -588,8 +742,38 @@ pub fn request_fetch(
                         | Exchange::BybitLinear
                         | Exchange::BybitInverse
                 );
-                let mode = trade_fetch_mode();
-                let server = sources.server.clone();
+                let is_orderflow = matches!(fetch, FetchRange::OrderflowTrades(..));
+                if is_orderflow
+                    && data::aggregation::AggregateFeedId::for_seed_ticker(ticker_info.ticker)
+                        .is_none()
+                {
+                    return Task::done(FetchUpdate::Error {
+                        pane_id,
+                        req_id: Some(req_id),
+                        error: "Orderflow history requires a supported BTC perpetual feed.".into(),
+                    });
+                }
+                // Reuse Binance's complete, rate-limited history path even when
+                // general backfill is Off or a recorder has a coverage gap.
+                let mode = if is_orderflow && trade_fetch_mode() == TradeFetchMode::Off {
+                    TradeFetchMode::Exchange
+                } else {
+                    trade_fetch_mode()
+                };
+                if is_orderflow
+                    && ticker_info.exchange() != Exchange::BinanceLinear
+                    && mode != TradeFetchMode::Server
+                {
+                    return Task::done(FetchUpdate::Error { pane_id, req_id: Some(req_id), error: "Bybit and Hyperliquid orderflow history require Server backfill; live signals remain available.".into() });
+                }
+                let server = if is_orderflow {
+                    sources
+                        .server
+                        .clone()
+                        .filter(|_| mode == TradeFetchMode::Server)
+                } else {
+                    sources.server.clone()
+                };
                 let data_path = match ticker_info.exchange().venue() {
                     exchange::adapter::Venue::Binance => {
                         data::data_path(Some("market_data/binance/"))
@@ -635,7 +819,11 @@ pub fn request_fetch(
 
                 let is_complete_footprint = matches!(
                     fetch,
-                    FetchRange::FootprintTrades(..) | FetchRange::FootprintHistoryTrades(..)
+                    FetchRange::FootprintTrades(..)
+                        | FetchRange::FootprintHistoryTrades(..)
+                        | FetchRange::OrderflowTrades(..)
+                        | FetchRange::RenkoTrades(..)
+                        | FetchRange::TrevTrades(..)
                 );
                 let (task, handle) = Task::sip(
                     fetch_trades_paged(
@@ -652,6 +840,9 @@ pub fn request_fetch(
                         // chart seeds stay bounded because they only need a useful window.
                         trade_fetch_limits(is_complete_footprint),
                         is_complete_footprint,
+                        is_orderflow,
+                        matches!(fetch, FetchRange::RenkoTrades(..)),
+                        matches!(fetch, FetchRange::TrevTrades(..)),
                     ),
                     move |batch| {
                         let data = FetchedData::Trades {
@@ -780,6 +971,9 @@ fn fetch_is_dispatchable(
         }
         FetchRange::Trades(..)
         | FetchRange::FootprintTrades(..)
+        | FetchRange::OrderflowTrades(..)
+        | FetchRange::RenkoTrades(..)
+        | FetchRange::TrevTrades(..)
         | FetchRange::FootprintHistoryTrades(..)
         | FetchRange::TradesRecent(..) => select_trade_stream(stream, ready_streams).is_some(),
     }
@@ -1114,8 +1308,42 @@ fn fetch_trades_paged(
     recent_first: bool,
     limits: Option<FetchLimits>,
     fill_exchange_gaps: bool,
+    orderflow_fallback: bool,
+    paced_renko: bool,
+    paced_trev: bool,
 ) -> impl Straw<TradeFetchOutcome, Vec<Trade>, AdapterError> {
+    let paced_price_bars = paced_renko || paced_trev;
     sipper(async move |mut progress| {
+        // A full-day overlay must not multiply startup memory/network bursts
+        // when it is enabled on several panes at once.
+        let _orderflow_permit = if orderflow_fallback {
+            Some(
+                orderflow_history_gate()
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| {
+                        AdapterError::ParseError(
+                            "Orderflow history scheduler closed unexpectedly".into(),
+                        )
+                    })?,
+            )
+        } else {
+            None
+        };
+        // Each price-bar family has its own bounded history slot. Existing
+        // Renko requests keep their original scheduler and fetch policy.
+        let _price_history_permit = if paced_price_bars {
+            let gate = if paced_trev {
+                trev_history_gate()
+            } else {
+                renko_history_gate()
+            };
+            Some(gate.acquire_owned().await.map_err(|_| {
+                AdapterError::ParseError("Price-bar history scheduler closed unexpectedly".into())
+            })?)
+        } else {
+            None
+        };
         if recent_first {
             let batches = if let Some(client) = server {
                 fetch_recent_server_trade_batches(client, ticker_info, from_time, to_time).await?
@@ -1136,12 +1364,18 @@ fn fetch_trades_paged(
             return Ok(TradeFetchOutcome::complete(had_data));
         }
 
-        // Modes are deliberately exclusive. In Server mode, recorder gaps
+        // Ordinary modes are deliberately exclusive. In Server mode, recorder gaps
         // stay explicit and uncheckpointed; they must never trigger large
         // Binance/Bybit archive downloads onto the desktop. Direct exchange
         // history is available only when no recorder client is configured
-        // (TradeFetchMode::Exchange).
-        let exchange_available = server.is_none() && supports_exchange_trade_fetch(ticker_info);
+        // (TradeFetchMode::Exchange). The bounded orderflow request explicitly
+        // opts into Binance gap filling to supply 24 hours even with an
+        // incomplete recorder, without changing other indicators' policy.
+        let binance_fallback =
+            orderflow_fallback && ticker_info.exchange() == Exchange::BinanceLinear;
+        let exchange_available = (server.is_none() || binance_fallback)
+            && supports_exchange_trade_fetch(ticker_info)
+            && (!orderflow_fallback || binance_fallback);
 
         // Durable footprint-derived caches may advance only after the whole
         // requested interval is accounted for. The recorder proves the exact
@@ -1171,7 +1405,17 @@ fn fetch_trades_paged(
                             .into_iter()
                             .map(|segment| (UnixMs::new(segment.from), UnixMs::new(segment.to)))
                             .collect::<Vec<_>>();
-                        (stored, gaps, Vec::new())
+                        if exchange_available {
+                            (stored, Vec::new(), gaps)
+                        } else {
+                            (stored, gaps, Vec::new())
+                        }
+                    }
+                    Err(err) if binance_fallback => {
+                        log::warn!(
+                            "Orderflow recorder coverage unavailable; using Binance history: {err}"
+                        );
+                        (Vec::new(), Vec::new(), vec![(from_time, to_time)])
                     }
                     Err(err) => return Err(err),
                 }
@@ -1187,13 +1431,70 @@ fn fetch_trades_paged(
                     ));
                 };
                 let mut cursor = range_from;
+                let mut page_limit = if orderflow_fallback {
+                    ORDERFLOW_ARROW_LIMIT
+                } else if paced_price_bars {
+                    RENKO_ARROW_LIMIT
+                } else {
+                    ARROW_LIMIT
+                };
                 while cursor <= range_to {
                     let prev_cursor = cursor;
-                    let parsed = client
-                        .fetch_trades_arrow(ticker_info, cursor, range_to, ARROW_LIMIT)
-                        .await?;
+                    if orderflow_fallback {
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                    } else if paced_price_bars {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    let mut parsed = if paced_trev {
+                        client
+                            .fetch_trev_trades_arrow(ticker_info, cursor, range_to, page_limit)
+                            .await?
+                    } else {
+                        client
+                            .fetch_trades_arrow(ticker_info, cursor, range_to, page_limit)
+                            .await?
+                    };
                     if parsed.raw_row_count == 0 {
                         break;
+                    }
+                    let mut range_complete = false;
+                    if orderflow_fallback {
+                        let (keep, next) = orderflow_page_extent(
+                            &parsed.trades,
+                            parsed.raw_row_count,
+                            parsed.last_ts,
+                            page_limit,
+                        )?;
+                        if keep == 0 && next.is_some() {
+                            if page_limit >= ARROW_LIMIT {
+                                return Err(AdapterError::ParseError(
+                                    "Orderflow history cannot safely page an oversized trade millisecond".into()
+                                ));
+                            }
+                            page_limit = (page_limit * 2).min(ARROW_LIMIT);
+                            continue;
+                        }
+                        parsed.trades.truncate(keep);
+                        range_complete = next.is_none();
+                        cursor = next.unwrap_or(range_to);
+                        page_limit = ORDERFLOW_ARROW_LIMIT;
+                    } else if paced_price_bars {
+                        let (keep, next) = renko_page_extent(&parsed.trades, page_limit);
+                        if keep == 0 && next.is_some() {
+                            if page_limit >= ARROW_LIMIT {
+                                return Err(AdapterError::ParseError(
+                                    "Renko history cannot safely page an oversized trade millisecond".into()
+                                ));
+                            }
+                            page_limit = (page_limit * 2).min(ARROW_LIMIT);
+                            continue;
+                        }
+                        parsed.trades.truncate(keep);
+                        range_complete = next.is_none();
+                        cursor = next.unwrap_or(range_to);
+                        page_limit = RENKO_ARROW_LIMIT;
+                    } else {
+                        cursor = parsed.last_ts.map_or(cursor, |time| time.saturating_add(1));
                     }
                     if !parsed.trades.is_empty() {
                         had_data = true;
@@ -1201,7 +1502,9 @@ fn fetch_trades_paged(
                             progress.send(chunk).await;
                         }
                     }
-                    cursor = parsed.last_ts.map_or(cursor, |time| time.saturating_add(1));
+                    if range_complete {
+                        break;
+                    }
                     if cursor <= prev_cursor {
                         return Err(AdapterError::ParseError(
                             "server trade paging cursor did not advance".into(),
@@ -1596,6 +1899,75 @@ mod tests {
     }
 
     #[test]
+    fn orderflow_pages_preserve_every_timestamp_tie_without_duplicates() {
+        let trades: Vec<_> = [1, 2, 3, 3, 3, 3, 4, 4]
+            .into_iter()
+            .enumerate()
+            .map(|(id, time)| Trade {
+                time: UnixMs::new(time),
+                price: Price::from_f64(100_000.0 + id as f64),
+                qty: Qty::from_f64(1.0),
+                is_sell: false,
+            })
+            .collect();
+        let mut cursor = UnixMs::new(1);
+        let mut received = Vec::new();
+        loop {
+            let page: Vec<_> = trades
+                .iter()
+                .copied()
+                .filter(|t| t.time >= cursor)
+                .take(5)
+                .collect();
+            let (keep, next) =
+                orderflow_page_extent(&page, page.len(), page.last().map(|t| t.time), 5).unwrap();
+            received.extend_from_slice(&page[..keep]);
+            let Some(next) = next else { break };
+            assert!(next > cursor);
+            cursor = next;
+        }
+        assert_eq!(received.len(), trades.len());
+        assert!(
+            received
+                .iter()
+                .zip(&trades)
+                .all(|(actual, expected)| actual.price == expected.price)
+        );
+    }
+
+    #[test]
+    fn orderflow_paging_uses_raw_limits_and_rejects_missing_cursors() {
+        let trade = Trade {
+            time: UnixMs::new(2),
+            price: Price::from_f64(100_000.0),
+            qty: Qty::from_f64(1.0),
+            is_sell: false,
+        };
+        assert_eq!(
+            orderflow_page_extent(&[trade], 5, Some(UnixMs::new(3)), 5).unwrap(),
+            (1, Some(UnixMs::new(3)))
+        );
+        assert_eq!(
+            orderflow_page_extent(&[], 5, Some(UnixMs::new(3)), 5).unwrap(),
+            (0, Some(UnixMs::new(3)))
+        );
+        assert!(orderflow_page_extent(&[], 5, None, 5).is_err());
+        assert_eq!(
+            orderflow_page_extent(&[trade], 1, Some(trade.time), 5).unwrap(),
+            (1, None)
+        );
+    }
+
+    #[test]
+    fn orderflow_initial_fetches_share_one_memory_budget_slot() {
+        let gate = orderflow_history_gate();
+        let permit = gate.clone().try_acquire_owned().unwrap();
+        assert!(gate.clone().try_acquire_owned().is_err());
+        drop(permit);
+        assert!(gate.try_acquire_owned().is_ok());
+    }
+
+    #[test]
     fn equal_ranges_are_tracked_independently_per_source_stream() {
         let range = FetchRange::Kline(UnixMs::new(1_000), UnixMs::new(2_000));
         let binance = kline_stream(Exchange::BinanceLinear);
@@ -1950,6 +2322,50 @@ mod tests {
     }
 
     #[test]
+    fn renko_pages_preserve_every_execution_at_a_split_millisecond() {
+        let trades = [100, 101, 101, 101, 102].map(|time| Trade {
+            time: UnixMs::new(time),
+            price: Price::from_f64(100.0),
+            qty: Qty::from_f64(1.0),
+            is_sell: false,
+        });
+        let first_page = &trades[..3];
+        let (keep, next) = renko_page_extent(first_page, 3);
+        assert_eq!(next, Some(UnixMs::new(101)));
+        let mut received = first_page[..keep].to_vec();
+
+        // The server repeats the whole boundary millisecond, including the
+        // identical executions that did not fit on the previous page.
+        let second_page = trades
+            .iter()
+            .copied()
+            .filter(|trade| trade.time >= next.unwrap())
+            .collect::<Vec<_>>();
+        let (keep, next) = renko_page_extent(&second_page, 5);
+        assert_eq!(next, None);
+        received.extend_from_slice(&second_page[..keep]);
+        let identity = |trade: &Trade| (trade.time, trade.price, trade.qty, trade.is_sell);
+        assert_eq!(
+            received.iter().map(identity).collect::<Vec<_>>(),
+            trades.iter().map(identity).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn renko_page_retries_instead_of_skipping_an_oversized_millisecond() {
+        let trade = Trade {
+            time: UnixMs::new(100),
+            price: Price::from_f64(100.0),
+            qty: Qty::from_f64(1.0),
+            is_sell: false,
+        };
+        let trades = vec![trade; 5];
+        assert_eq!(renko_page_extent(&trades[..3], 3), (0, Some(trade.time)));
+        assert_eq!(renko_page_extent(&trades, 6), (5, None));
+        assert_eq!(renko_page_extent(&[], 3), (0, None));
+    }
+
+    #[test]
     fn newest_truthful_oi_observation_wins_each_minute() {
         let exchange = [
             OpenInterest::snapshot(UnixMs::new(60_000), 100.0),
@@ -2046,5 +2462,28 @@ mod tests {
         assert!(!server_range_may_have_data(UnixMs::new(999), earliest));
         assert!(server_range_may_have_data(UnixMs::new(1_000), earliest));
         assert!(server_range_may_have_data(UnixMs::new(0), None));
+    }
+
+    #[test]
+    fn trev_history_capacity_is_independent_from_renko() {
+        let renko = renko_history_gate();
+        let trev = trev_history_gate();
+        let _renko = renko.try_acquire().expect("Renko slot");
+        let _trev = trev
+            .try_acquire()
+            .expect("TRev must not borrow the Renko slot");
+        assert!(trev.try_acquire().is_err(), "TRev history remains bounded");
+        let mut requests = RequestHandler::default();
+        let range = FetchRange::TrevTrades(UnixMs::new(1), UnixMs::new(2));
+        assert!(requests.add_request(range, None).unwrap().is_some());
+        assert!(
+            requests
+                .add_request(
+                    FetchRange::RenkoTrades(UnixMs::new(1), UnixMs::new(2)),
+                    None
+                )
+                .unwrap()
+                .is_some()
+        );
     }
 }

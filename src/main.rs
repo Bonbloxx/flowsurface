@@ -89,6 +89,7 @@ fn main() {
 
 struct Flowsurface {
     main_window: window::Window,
+    main_window_spec: Option<WindowSpec>,
     sidebar: dashboard::Sidebar,
     layout_manager: LayoutManager,
     theme_editor: ThemeEditor,
@@ -121,6 +122,7 @@ enum Message {
     RestartRequested(Option<HashMap<window::Id, WindowSpec>>),
     SaveStateRequested(HashMap<window::Id, WindowSpec>),
     GoBack,
+    TimeframeShortcut(exchange::Timeframe),
     DataFolderRequested,
     OpenUrlRequested(Cow<'static, str>),
     ThemeSelected(iced_core::Theme),
@@ -159,6 +161,7 @@ impl Flowsurface {
 
         let mut state = Self {
             main_window: window::Window::new(main_window_id),
+            main_window_spec: saved_state.main_window,
             layout_manager: saved_state.layout_manager,
             theme_editor: ThemeEditor::new(saved_state.custom_theme),
             audio_stream,
@@ -255,6 +258,11 @@ impl Flowsurface {
                     self.main_window.id
                 );
                 log::logger().flush();
+                // Persist chart checkpoints during the session as well as on
+                // normal exit: Windows shutdown/crashes may skip CloseRequested.
+                // Keep the last saved window geometry while minimized. Normal
+                // saves/exit still collect fresh positions and sizes.
+                self.save_state_to_disk(&HashMap::new());
             }
             Message::WindowEvent(event) => match event {
                 window::Event::CloseRequested(window) => {
@@ -313,6 +321,23 @@ impl Flowsurface {
                 return window::collect_window_specs(active_windows, |windows| {
                     Message::RestartRequested(Some(windows))
                 });
+            }
+            Message::TimeframeShortcut(tf) => {
+                if self.confirm_dialog.is_none()
+                    && self.sidebar.active_menu().is_none()
+                    && let Some((window, pane)) = self.active_dashboard().focus
+                {
+                    return Task::done(Message::Dashboard {
+                        layout_id: None,
+                        event: dashboard::Message::Pane(
+                            window,
+                            dashboard::pane::Message::PaneEvent(
+                                pane,
+                                dashboard::pane::Event::TimeframeShortcut(tf),
+                            ),
+                        ),
+                    });
+                }
             }
             Message::GoBack => {
                 let main_window = self.main_window.id;
@@ -779,10 +804,20 @@ impl Flowsurface {
         let main_window_id = self.main_window.id;
 
         match event {
-            exchange::Event::Connected(_streams) => Task::none(),
+            exchange::Event::Connected(streams) => {
+                self.active_dashboard_mut()
+                    .trade_pace_connection(&streams, true, main_window_id);
+                Task::none()
+            }
             exchange::Event::ReplayRecovered(_streams, _from) => Task::none(),
-            exchange::Event::Disconnected(_streams, reason) => {
+            exchange::Event::Disconnected(streams, reason) => {
+                self.active_dashboard_mut()
+                    .trade_pace_connection(&streams, false, main_window_id);
+                self.active_dashboard_mut()
+                    .invalidate_cached_trade_continuity(&streams, main_window_id);
                 log::info!("a stream disconnected from WS: {reason:?}");
+                self.active_dashboard_mut()
+                    .orderflow_disconnected(&streams, main_window_id);
                 Task::none()
             }
             exchange::Event::DepthReceived(stream, update_t, depth) => self
@@ -935,11 +970,14 @@ impl Flowsurface {
             iced::time::every(std::time::Duration::from_secs(30)).map(Message::Heartbeat);
 
         let hotkeys = keyboard::listen().filter_map(|event| {
-            let keyboard::Event::KeyPressed { key, .. } = event else {
+            let keyboard::Event::KeyPressed { key, modifiers, .. } = event else {
                 return None;
             };
             match key {
                 keyboard::Key::Named(keyboard::key::Named::Escape) => Some(Message::GoBack),
+                keyboard::Key::Character(value) if modifiers.is_empty() => {
+                    timeframe_shortcut(value.as_str()).map(Message::TimeframeShortcut)
+                }
                 _ => None,
             }
         });
@@ -1468,6 +1506,9 @@ impl Flowsurface {
             .iter()
             .find(|(id, _)| **id == self.main_window.id)
             .map(|(_, spec)| *spec);
+        if main_window_spec.is_some() {
+            self.main_window_spec = main_window_spec;
+        }
 
         let audio_cfg = data::AudioStream::from(&self.audio_stream);
 
@@ -1475,7 +1516,7 @@ impl Flowsurface {
             layouts,
             self.theme.clone(),
             self.theme_editor.custom_theme.clone().map(data::Theme),
-            main_window_spec,
+            self.main_window_spec,
             self.timezone,
             self.sidebar.state.clone(),
             self.ui_scale_factor,
@@ -1513,5 +1554,18 @@ impl Flowsurface {
         *self = new_state;
 
         close_windows.chain(init_task)
+    }
+}
+
+fn timeframe_shortcut(key: &str) -> Option<exchange::Timeframe> {
+    use exchange::Timeframe;
+    match key {
+        "1" => Some(Timeframe::M1),
+        "2" => Some(Timeframe::M5),
+        "3" => Some(Timeframe::M15),
+        "4" => Some(Timeframe::H1),
+        "5" => Some(Timeframe::H4),
+        "6" => Some(Timeframe::D1),
+        _ => None,
     }
 }

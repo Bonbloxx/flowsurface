@@ -1,0 +1,10 @@
+{
+  "absorption": true,
+  "band_ticks": 50,
+  "exhaustion": false,
+  "min_absorption_usd": 250000.0,
+  "rejection_bands": 3.0,
+  "sensitivity": 2.0,
+  "show_observed": false,
+  "window_seconds": 15
+}
